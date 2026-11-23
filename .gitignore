@@ -17,6 +17,8 @@ data/cache/
 *.7z
 
 # Checkpoints & exported models
+aethertts_exp/
+aethertts_work/
 checkpoints/
 exp/
 outputs/

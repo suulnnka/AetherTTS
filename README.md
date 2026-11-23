@@ -23,21 +23,28 @@
 
 ## 仓库目录与文档导航
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/suulnnka/AetherTTS/blob/main/notebooks/AetherTTS_Colab_Phase1_Experiment.ipynb) — 直接在 Google Colab 打开 Phase 1 五主干流式对比实验 Notebook
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/suulnnka/AetherTTS/blob/main/notebooks/AetherTTS_Colab_Phase1_Experiment.ipynb) — 在 Google Colab 打开（自动云盘高频断点备份）；自建 RTX 4090 / Linux 服务器可直接打开同一 Notebook 或用 `scripts/run_phase1_local.py` 后台运行（全部文件纯本地保存）。
+
+```bash
+# 自建 RTX 4090 服务器推荐用法（纯本地保存，配合 tmux 离线挂机）：
+python scripts/run_phase1_local.py --profile standard_phase1 --dataset bznsyp --root ./aethertts_exp
+```
 
 ```text
 AetherTTS/
-├── README.md                              # 项目总览与路线图（当前文件）
+├── README.md                                    # 项目总览与路线图（当前文件）
 ├── notebooks/
-│   └── AetherTTS_Colab_Phase1_Experiment.ipynb  # Google Colab 端到端实验（云盘缓存数据、训练 E0-E4、流式测试、备份云盘与多维打分）
+│   └── AetherTTS_Colab_Phase1_Experiment.ipynb  # Phase 1 五主干流式实验（Colab 云盘高频备份 + 自建 4090 纯本地双兼容）
+├── scripts/
+│   └── run_phase1_local.py                      # 自建 Linux GPU / RTX 4090 命令行无界面启动器（直接执行上述 Notebook）
 ├── data/
-│   ├── datasets.yaml                      # 训练/前端/评测/蒸馏教师资源结构化清单（含已核实链接与协议）
-│   └── README.md                          # 严控体量的单音色数据策略与商用许可分级
+│   ├── datasets.yaml                            # 训练/前端/评测/蒸馏教师资源结构化清单（含已核实链接与协议）
+│   └── README.md                                # 严控体量的单音色数据策略与商用许可分级
 └── docs/
-    ├── 01_architecture_overview.md        # AetherTTS 8M-12M 单音色单步流式整体架构与算力预算
-    ├── 02_streaming_lookahead_survey.md   # 流式输入 + 有限右前瞻深度调研（SWA / Mamba-SSM / RWKV 对比与实验矩阵）
-    ├── 03_teacher_distillation_pipeline.md # 商用友好大模型教师离线造数与两段式特征/对抗蒸馏方案
-    └── 04_evaluation_protocol.md          # 四维客观自动评测 + 50 句黄金人工盲听质量评价体系
+    ├── 01_architecture_overview.md              # AetherTTS 8M-12M 单音色单步流式整体架构与算力预算
+    ├── 02_streaming_lookahead_survey.md         # 流式输入 + 有限右前瞻深度调研（SWA / Mamba-SSM / RWKV 对比与实验矩阵）
+    ├── 03_teacher_distillation_pipeline.md      # 商用友好大模型教师离线造数与两段式特征/对抗蒸馏方案
+    └── 04_evaluation_protocol.md                # 四维客观自动评测 + 50 句黄金人工盲听质量评价体系
 ```
 
 ---
