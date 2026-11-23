@@ -1,0 +1,47 @@
+# Raw and processed datasets (never commit audio/archives)
+data/raw/
+data/processed/
+data/distilled/
+data/cache/
+*.wav
+*.flac
+*.mp3
+*.ogg
+*.pcm
+*.tar
+*.tar.gz
+*.tar.bz2
+*.tgz
+*.zip
+*.rar
+*.7z
+
+# Checkpoints & exported models
+checkpoints/
+exp/
+outputs/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.mnn
+*.ncnn.bin
+*.gguf
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Logs & editors
+logs/
+wandb/
+runs/
+.DS_Store
+.vscode/
+.idea/

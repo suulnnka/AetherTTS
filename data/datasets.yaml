@@ -1,0 +1,322 @@
+# AetherTTS 训练、前端、评测与蒸馏资源清单
+# 说明：
+#   - commercial_ok: true 表示协议本身允许商业用途（但仍需遵守署名 CC BY 或相同方式共享 SA 等具体条款）
+#   - commercial_ok: false 表示仅限学术研究/非商用基线验证，正式商用模型训练前必须严格排除
+#   - 所有下载链接均已于 2026-11 核实
+
+schema_version: 1
+target_sample_rate: 24000
+target_speakers: 1
+training_budget_hours:
+  phase1_ablation_max: 12        # Phase 1 主干对比实验严格 <= 12h，保证单卡小时级快速迭代
+  phase2_single_voice_target: 22 # Phase 2 正式单音色双语黄金集严格控制在 20-25h
+  optional_vocoder_warmup_max: 20 # 如需声码器抽样预热，严禁全量拉取大库，总抽样 <= 20h
+
+# ==============================================================================
+# 1. 商用友好训练语料（Commercial-Friendly Core Training Corpora）
+# ==============================================================================
+commercial_train:
+  - id: aishell3
+    name: AISHELL-3
+    languages: [zh]
+    hours: 85
+    speakers: 218
+    sample_rate: 44100
+    audio_quality: studio_clean
+    license: Apache-2.0
+    commercial_ok: true
+    annotations: [text, pinyin_with_tone, speaker_meta]
+    urls:
+      primary: https://openslr.org/93/
+      huggingface: https://huggingface.co/datasets/SMIIP-lab/AISHELL-3
+      official: http://www.aishelltech.com/aishell_3
+    recommended_usage: >
+      中文商用核心底料。包含 218 名普通话母语者、44.1 kHz 高保真录音及人工校验拼音声调标注。
+      适合多说话人中文声学预训练，也可筛选音质最佳的 1-2 名标准普通话女声/男声作为主音色种子。
+
+  - id: hifi_tts
+    name: Hi-Fi Multi-Speaker English TTS Dataset (Hi-Fi TTS)
+    languages: [en]
+    hours: 291.6
+    speakers: 10
+    sample_rate: 44100
+    audio_quality: studio_clean
+    license: CC-BY-4.0
+    commercial_ok: true
+    annotations: [text, normalized_text, clean_other_split]
+    urls:
+      primary: https://www.openslr.org/109/
+    recommended_usage: >
+      英文商用首选精品底料。每位说话人拥有 17-40+ 小时 44.1 kHz 高清干净音频，
+      优先使用 clean 子集，非常适合训练 Siri 级别的清晰英文发音与声码器高频细节。
+
+  - id: libritts_r
+    name: LibriTTS-R
+    languages: [en]
+    hours: 585
+    speakers: 2456
+    sample_rate: 24000
+    audio_quality: restored_clean
+    license: CC-BY-4.0
+    commercial_ok: true
+    annotations: [text, normalized_text]
+    urls:
+      primary: https://www.openslr.org/141/
+      modelscope: https://www.modelscope.cn/datasets/pengzhendong/libritts_r
+      project_page: https://google.github.io/df-conformer/librittsr/
+    recommended_usage: >
+      原生 24 kHz 经过语音修复的英文大规模多说话人 TTS 语料，优先选取 train-clean-100 / train-clean-360
+      用于扩充英文音素组合覆盖率与韵律多样性。
+
+  - id: ljspeech
+    name: LJSpeech-1.1
+    languages: [en]
+    hours: 24
+    speakers: 1
+    sample_rate: 22050
+    audio_quality: clean_single_speaker
+    license: Public-Domain
+    commercial_ok: true
+    annotations: [text, normalized_text]
+    urls:
+      primary: https://keithito.com/LJ-Speech-Dataset/
+      direct_archive: https://data.keithito.com/data/speech/LJSpeech-1.1.tar.bz2
+      huggingface: https://huggingface.co/datasets/keithito/lj_speech
+    recommended_usage: >
+      经典单人英文 24 小时干净语料（公有领域）。非常适合 Phase 1 快速验证网络架构、
+      流式右前瞻对比实验与对齐稳定性（收敛快、排错成本低）。
+
+  - id: vctk
+    name: CSTR VCTK Corpus v0.92
+    languages: [en]
+    hours: 44
+    speakers: 109
+    sample_rate: 48000
+    audio_quality: studio_clean
+    license: CC-BY-4.0
+    commercial_ok: true
+    annotations: [text]
+    urls:
+      primary: https://datashare.ed.ac.uk/handle/10283/3443
+    recommended_usage: >
+      48 kHz 录音棚多口音英文语料，可补充英文高频声码器训练与多说话人泛化。
+
+  - id: emilia_yodas
+    name: Emilia-YODAS (Subset of Emilia-Large)
+    languages: [en, zh, de, fr, ja, ko]
+    hours: 114000
+    speakers: multi_wild
+    sample_rate: 24000
+    audio_quality: in_the_wild_filtered
+    license: CC-BY-4.0
+    commercial_ok: true
+    annotations: [asr_text, dnsmos, language_id]
+    urls:
+      primary: https://huggingface.co/datasets/amphion/Emilia-Dataset
+    recommended_usage: >
+      注意：仅限 Emilia-YODAS 子集采用 CC BY 4.0（同仓库的原始 Emilia 子集为 CC BY-NC 4.0，商用严禁混用）。
+      适合大规模自然口语预训练（需二次按 DNSMOS/UTMOS 严格筛出高干净度片段），其中文体量较英文少。
+
+  - id: ascend
+    name: ASCEND (A Spontaneous Chinese-English Dataset)
+    languages: [zh, en, zh-en-cs]
+    hours: 10.62
+    speakers: 23
+    sample_rate: 16000
+    audio_quality: quiet_classroom_conversational
+    license: CC-BY-SA-4.0
+    commercial_ok: true
+    license_caveat: "ShareAlike (SA) 条款：衍生数据集需以相同协议共享；使用前请法务确认模型权重边界"
+    annotations: [text, language_tag]
+    urls:
+      primary: https://huggingface.co/datasets/CAiRE/ASCEND
+      github: https://github.com/HLTCHKUST/ASCEND
+    recommended_usage: >
+      真实中英自发混读对话语料（含港/台/大陆多口音，16 kHz）。因采样率和口音不统一，
+      不建议直接作为主音色声学底料，建议优先用作中英混读文本语料参考、前端切分测试与混读评测集。
+
+# ==============================================================================
+# 2. 学术研究与对照参考语料（Research / Non-Commercial Reference Only）
+# ==============================================================================
+research_reference:
+  - id: databaker_csmsc
+    name: DataBaker CSMSC (标贝中文标准女声 / BZNSYP)
+    languages: [zh]
+    hours: 12
+    speakers: 1
+    sample_rate: 48000
+    audio_quality: studio_gold
+    license: Non-Commercial-Academic
+    commercial_ok: false
+    annotations: [text, pinyin_with_tone, "prosody_#1_#2_#3_#4", phoneme_interval]
+    urls:
+      official: https://www.data-baker.com/data/index/TNtts/
+      huggingface_mirror: https://huggingface.co/openspeech/BZNSYP
+    recommended_usage: >
+      中文单人 TTS 调研阶段黄金基线！48 kHz 广播级录音且自带人工 #1/#2/#3/#4 韵律边界与音素时间边界。
+      极其适合 Phase 1 验证中文模型上限、韵律预测与流式右前瞻消融实验（正式商用不可直接采用，除非向标贝购买商用授权）。
+
+  - id: emilia_original
+    name: Emilia (Original 101k Hours)
+    languages: [zh, en, de, fr, ja, ko]
+    hours: 101000
+    speakers: multi_wild
+    sample_rate: 24000
+    audio_quality: in_the_wild_filtered
+    license: CC-BY-NC-4.0
+    commercial_ok: false
+    annotations: [asr_text, dnsmos, language_id]
+    urls:
+      primary: https://huggingface.co/datasets/amphion/Emilia-Dataset
+      modelscope: https://www.modelscope.ai/datasets/modelscope/Emilia-Dataset
+    recommended_usage: >
+      非商用研究阶段的大规模中英自然口语与混读预训练语料，覆盖丰富的对话语气与副语言停顿。
+
+  - id: wenetspeech4tts
+    name: WenetSpeech4TTS
+    languages: [zh]
+    hours: 12800
+    speakers: multi_wild
+    sample_rate: 16000
+    audio_quality: enhanced_multi_tier
+    license: CC-BY-NC-4.0 (Non-Commercial)
+    commercial_ok: false
+    annotations: [asr_text, quality_tier]
+    urls:
+      primary: https://huggingface.co/datasets/Wenetspeech4TTS/WenetSpeech4TTS
+    recommended_usage: >
+      仅限非商用调研，如使用建议只取 Premium（~945h）高质子集。
+
+  - id: cs_dialogue
+    name: BAAI CS-Dialogue
+    languages: [zh, en, zh-en-cs]
+    hours: 104
+    speakers: multi_conversational
+    sample_rate: 16000
+    audio_quality: conversational
+    license: CC-BY-NC-SA-4.0
+    commercial_ok: false
+    annotations: [text, dialogue_turns]
+    urls:
+      primary: https://huggingface.co/datasets/BAAI/CS-Dialogue
+    recommended_usage: >
+      104 小时真实中英混读多轮对话。非商用研究阶段可用于提取真实中英混读文本分布、韵律停顿分析及混读测试集。
+
+  - id: magicdata_zh
+    name: MAGICDATA Mandarin Chinese Read Speech (SLR68)
+    languages: [zh]
+    hours: 755
+    speakers: 1080
+    sample_rate: 16000
+    audio_quality: mobile_quiet
+    license: CC-BY-NC-ND-4.0
+    commercial_ok: false
+    annotations: [text, segmented_text]
+    urls:
+      primary: https://www.openslr.org/68/
+    recommended_usage: >
+      包含大量智能家居控制、音乐检索、交互问答领域文本，非常适合参考构建语音助手领域的评测/蒸馏文本集。
+
+  - id: esd
+    name: Emotional Speech Dataset (ESD)
+    languages: [zh, en]
+    hours: 29
+    speakers: 20
+    sample_rate: 16000
+    audio_quality: studio_clean
+    license: Research-Only (Application Required)
+    commercial_ok: false
+    annotations: [text, emotion_5_classes]
+    urls:
+      primary: https://github.com/HLTSingapore/Emotional-Speech-Data
+    recommended_usage: >
+      中英平行 5 情绪语料（10 中文 + 10 英文说话人），仅限后续若拓展情感控制时的科研参考。
+
+# ==============================================================================
+# 3. 文本前端（TN / 多音字 / 词典）数据与工具
+# ==============================================================================
+frontend_resources:
+  - id: cpp_polyphone
+    name: CPP (Chinese Polyphone with Pinyin, g2pM)
+    languages: [zh]
+    size: "99,000+ sentences"
+    license: Apache-2.0
+    commercial_ok: true
+    urls:
+      primary: https://github.com/kakaobrain/g2pm
+      g2pw_ref: https://github.com/GitYCC/g2pW
+    recommended_usage: >
+      用于训练/蒸馏轻量化（~1M-2M）流式中文多音字消歧前端，解决中文 TTS 读错多音字的核心痛点。
+
+  - id: wetextprocessing
+    name: WeTextProcessing (TN / ITN)
+    languages: [zh, en]
+    license: Apache-2.0
+    commercial_ok: true
+    urls:
+      primary: https://github.com/wenet-e2e/WeTextProcessing
+    recommended_usage: >
+      基于 WFST 的中英文本正则化规则参考（数字、日期、金额、百分比、单位、符号），后续需改造成流式前瞻版本。
+
+  - id: cmudict
+    name: CMU Pronouncing Dictionary (CMUdict)
+    languages: [en]
+    size: "134,000+ words"
+    license: BSD-2-Clause
+    commercial_ok: true
+    urls:
+      primary: https://github.com/cmusphinx/cmudict
+    recommended_usage: >
+      英文核心发音词典（ARPAbet 音素 + 重音标记），搭配轻量 OOV G2P 处理未登录词与缩写。
+
+# ==============================================================================
+# 4. 评测基准（Evaluation Benchmarks）
+# ==============================================================================
+evaluation:
+  - id: seed_tts_eval
+    name: Seed-TTS-Eval
+    languages: [zh, en]
+    license: Research-Benchmark
+    urls:
+      primary: https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval
+    recommended_usage: >
+      行业通用中英文及中文困难样本（zh/hardcase.lst）客观评测集，用于衡量 CER/WER、UTMOS 与说话人相似度。
+
+# ==============================================================================
+# 5. 离线教师蒸馏模型（Apache 2.0 商用友好教师，用于合成单音色中英混读语料）
+# ==============================================================================
+distillation_teachers:
+  - id: qwen3_tts
+    name: Qwen3-TTS (0.6B / 1.7B)
+    languages: [zh, en, zh-en-cs, multi]
+    license: Apache-2.0
+    commercial_ok: true
+    urls:
+      github: https://github.com/QwenLM/Qwen3-TTS
+      hf_1_7b: https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base
+      hf_0_6b: https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base
+    recommended_usage: >
+      中英自然对话感与混读极强。可用于离线生成单人高一致性“纯中文 + 纯英文 + 中英混读”蒸馏数据集，
+      但生成后务必经过 ASR 过滤（尤其数字/编号/地址类文本）。
+
+  - id: cosyvoice3
+    name: Fun-CosyVoice 2 / 3 (0.5B)
+    languages: [zh, en, zh-en-cs, multi]
+    license: Apache-2.0
+    commercial_ok: true
+    urls:
+      github: https://github.com/QwenAudio/CosyVoice
+      hf_v2: https://huggingface.co/FunAudioLLM/CosyVoice2-0.5B
+    recommended_usage: >
+      中英混读稳定性高、音色保真度好，可作为离线造数的另一主力教师，或与 Qwen3-TTS 交叉验证筛选最优样本。
+
+  - id: kokoro_82m
+    name: Kokoro-82M
+    languages: [en, zh, multi]
+    license: Apache-2.0
+    commercial_ok: true
+    urls:
+      github: https://github.com/hexgrad/kokoro
+      paradee_ref: https://github.com/sahilmahendrakar/paradee
+    recommended_usage: >
+      英文音质极佳且与 AetherTTS 目标结构同源；可用于验证 Paradee 式特征/时长/F0 联合蒸馏实验管线。
