@@ -34,7 +34,7 @@ python scripts/run_phase1_local.py --profile standard_phase1 --dataset bznsyp --
 AetherTTS/
 ├── README.md                                    # 项目总览与路线图（当前文件）
 ├── notebooks/
-│   └── AetherTTS_Colab_Phase1_Experiment.ipynb  # Phase 1 五主干流式实验（Colab 云盘高频备份 + 自建 4090 纯本地双兼容）
+│   └── AetherTTS_Colab_Phase1_Experiment.ipynb  # Phase 1 六主干流式实验（Colab 云盘高频备份 + 自建 4090 纯本地双兼容）
 ├── scripts/
 │   └── run_phase1_local.py                      # 自建 Linux GPU / RTX 4090 命令行无界面启动器（直接执行上述 Notebook）
 ├── data/
@@ -42,7 +42,7 @@ AetherTTS/
 │   └── README.md                                # 严控体量的单音色数据策略与商用许可分级
 └── docs/
     ├── 01_architecture_overview.md              # AetherTTS 8M-12M 单音色单步流式整体架构与算力预算
-    ├── 02_streaming_lookahead_survey.md         # 流式输入 + 有限右前瞻深度调研（SWA / Mamba-SSM / RWKV 对比与实验矩阵）
+    ├── 02_streaming_lookahead_survey.md         # 流式输入 + 有限右前瞻深度调研（SWA / Mamba-SSM / 线性注意力 / 门控 DeltaNet 对比与实验矩阵）
     ├── 03_teacher_distillation_pipeline.md      # 商用友好大模型教师离线造数与两段式特征/对抗蒸馏方案
     └── 04_evaluation_protocol.md                # 四维客观自动评测 + 50 句黄金人工盲听质量评价体系
 ```
@@ -54,10 +54,10 @@ AetherTTS/
 - [x] **Phase 0：技术调研与数据清单**
   - 锁定「10M–15M 魔改 Kokoro 单步直出 + 有限右前瞻流式」总体方向
   - 整理并核实商用友好与学术对照中英双语/混读数据集地址（[`data/datasets.yaml`](data/datasets.yaml)）
-  - 制定流式输入主干（SWA / Mamba-SSM / RWKV / Conv+GRU 基线）控制变量实验矩阵（[`docs/02_streaming_lookahead_survey.md`](docs/02_streaming_lookahead_survey.md)）
+  - 制定流式输入主干（SWA / Mamba-SSM / 线性注意力 / 门控 DeltaNet / Conv+GRU 基线）控制变量实验矩阵（[`docs/02_streaming_lookahead_survey.md`](docs/02_streaming_lookahead_survey.md)）
 - [ ] **Phase 1：数据管线与主干对比实验（下一步）**
   - 实现统一中英混读前端（TN + G2P + 轻量多音字/韵律）与 24 kHz 预处理/强制对齐管线
-  - 在相同参数预算与相同右前瞻窗口下，对比验证 SWA、Mamba/SSM、RWKV 与因果卷积基线的音质、边界一致性与 CPU 速度
+  - 在相同右前瞻窗口下，对比验证 SWA、Mamba/SSM、线性注意力、门控 DeltaNet 与因果卷积基线的音质、边界一致性与 CPU 速度
   - 选出综合最优的流式主干定型
 - [ ] **Phase 2：双语精品音色训练、教师蒸馏与量化验证**
   - 执行教师模型离线造数（补齐单音色中英混读短板）与训练期 SLM/MPD 对抗训练

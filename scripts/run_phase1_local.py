@@ -22,7 +22,8 @@ def parse_args():
     p.add_argument("--profile", default="standard_phase1", choices=["quick_smoke", "standard_phase1", "full_quality"], help="Experiment duration/data budget profile.")
     p.add_argument("--dataset", default="bznsyp", choices=["bznsyp", "ljspeech", "custom_bilingual"], help="Training dataset source.")
     p.add_argument("--vocoder", default="both", choices=["both", "pretrained_vocos", "causal_vocos_lite"], help="Vocoder mode.")
-    p.add_argument("--models", default="", help="Optional comma-separated subset of models, e.g. E1_conv_unigru_L4,E2_swa_L4")
+    p.add_argument("--models", default="", help="Optional comma-separated subset of models, e.g. E1_conv_unigru_L4,E2_swa_L4,E5_gated_deltanet_L4")
+    p.add_argument("--vocoder-lookahead", type=int, default=None, help="CausalVocosLite 集中式右前瞻帧数（默认沿用 Notebook 内的 2 帧；0 表示关闭前瞻）.")
     p.add_argument("--backup-steps", type=int, default=1000, help="Save resumable latest.pt every N acoustic steps (default: 1000).")
     p.add_argument("--backup-minutes", type=float, default=8.0, help="Also force-save latest.pt every M minutes (default: 8.0).")
     p.add_argument("--skip-pip", action="store_true", help="Skip automatic pip install of missing dependencies.")
@@ -45,6 +46,8 @@ def main():
     os.environ["AETHER_BACKUP_MINUTES"] = str(args.backup_minutes)
     if args.models:
         os.environ["AETHER_MODELS"] = args.models
+    if args.vocoder_lookahead is not None:
+        os.environ["AETHER_VOCODER_LOOKAHEAD"] = str(args.vocoder_lookahead)
     if args.skip_pip:
         os.environ["AETHER_SKIP_PIP"] = "1"
 

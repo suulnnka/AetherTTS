@@ -81,6 +81,16 @@
   * 在 **4M–6M 参数**、**音素级序列（典型句子 15–80 音素）** 这个尺度下，**简单的 1 层 $L$-Lookahead 卷积 + 因果 ConvNeXt + 1–2 层单向 GRU** 往往出人意料地强，且在 ARM CPU 上速度极快、零导出坑。
   * 只有把它设为严格 Baseline，我们才能在实验阶段客观回答：**“引入 SWA / Mamba / RWKV 到底带来了多大的韵律/长句收益？值不值得多付那一点算力或工程复杂度？”**
 
+### 候选 5：门控 DeltaNet（线性注意力 + Delta Rule 写入 + 状态门控）
+
+* **工作原理**：逐头维护状态矩阵 $S_t \in \mathbb{R}^{K\times V}$，输出 $o_t = S_t^\top \hat q_t$（$\hat q,\hat k$ 为 L2 归一化后的 query/key），$O(1)$ 状态、$O(T)$ 计算的线性注意力。
+  * **Delta Rule 写入**：$S_t = \alpha_t\,(S_{t-1} + \beta_t\,\hat k_t\,(v_t - S_{t-1}^\top \hat k_t)^\top)$，写入前先擦除旧状态中沿当前 key 方向的分量，$\beta_t \in (0,1)$ 控制写入强度。
+  * **标量状态门控**：$\alpha_t \in (0,1)$ 对整个状态做逐帧遗忘。
+* **右前瞻**：与 E3/E4 相同，集中在底层 $L$ 步前瞻层，DeltaNet 自身严格因果。
+* **训练并行**：块内用 WY 表示把 Delta Rule 写成单位下三角线性方程组（三角求逆用倍增全并行），块间只递推状态；推理逐步递推，二者数学等价。
+* **嵌入式 ARM CPU 适配性**：与 E4 同级，推理单步是若干小矩阵向量乘加逐元素运算。
+* **定位**：E4 是逐通道衰减的线性注意力（WKV 形式），E5 在此基础上验证 Delta Rule 写入与状态门控的收益。
+
 ---
 
 ## 3. 四类主干核心特性速查表
@@ -132,7 +142,8 @@
 | `E1` | Causal ConvNeXt + Uni-GRU（基线） | $O(1)$ | 0 / 4 / 8 音素 | 建立极简基线 + 量化右前瞻收益 |
 | `E2` | Sliding Window Attention + Causal ConvNeXt | $W = 48$ | 4 / 8 音素 | 验证有界注意力在长句和韵律上的优势 |
 | `E3` | 底层 $L$-Lookahead + 因果 Mamba / SSM | $O(1)$ | 4 / 8 音素 | 验证 SSM 无限左记忆对长段落一致性的提升与 CPU 耗时 |
-| `E4` | 底层 $L$-Lookahead + 因果 RWKV (WKV) | $O(1)$ | 4 / 8 音素 | 验证线性注意力在音质与 ARM CPU 速度上的综合平衡 |
+| `E4` | 底层 $L$-Lookahead + 因果线性注意力（WKV 形式） | $O(1)$ | 4 / 8 音素 | 验证线性注意力在音质与 ARM CPU 速度上的综合平衡 |
+| `E5` | 底层 $L$-Lookahead + 门控 DeltaNet | $O(1)$ | 4 / 8 音素 | 验证 Delta Rule 写入 + 状态门控相对 E4 的收益与 CPU 耗时 |
 
 ### 评测指标（定型决策依据）
 1. **可懂度**：中文 CER / 英文 WER / 中英混读 MER（使用 Whisper / SenseVoice 自动评测）+ 多音字专项准确率。
