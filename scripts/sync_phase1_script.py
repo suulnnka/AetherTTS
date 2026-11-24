@@ -42,6 +42,7 @@ _AP.add_argument("--vocoder", default="both", choices=["both", "pretrained_vocos
 _AP.add_argument("--models", default="", help="Optional comma-separated subset, e.g. E1_conv_unigru_L8,E3_chunk_attn_C4_L8,E4_gated_deltanet_L8")
 _AP.add_argument("--frame-lookahead", type=int, default=None, help="声学 frame_decoder 首层集中式右前瞻帧数（默认 2 帧；0 表示关闭）.")
 _AP.add_argument("--vocoder-lookahead", type=int, default=None, help="CausalVocosLite 集中式右前瞻帧数（默认 2 帧；0 表示关闭前瞻）.")
+_AP.add_argument("--batch-size", type=int, default=None, help="可选覆写声学训练 batch_size（如 RTX 4090 覆写为 64）.")
 _AP.add_argument("--backup-steps", type=int, default=1000)
 _AP.add_argument("--backup-minutes", type=float, default=8.0)
 _AP.add_argument("--skip-pip", action="store_true")
@@ -64,6 +65,8 @@ if _ARGS.frame_lookahead is not None:
     _os.environ["AETHER_FRAME_LOOKAHEAD"] = str(_ARGS.frame_lookahead)
 if _ARGS.vocoder_lookahead is not None:
     _os.environ["AETHER_VOCODER_LOOKAHEAD"] = str(_ARGS.vocoder_lookahead)
+if _ARGS.batch_size is not None:
+    _os.environ["AETHER_BATCH_SIZE"] = str(_ARGS.batch_size)
 if _ARGS.skip_pip:
     _os.environ["AETHER_SKIP_PIP"] = "1"
 SELFTEST = _ARGS.selftest
@@ -168,9 +171,31 @@ def _run_step_profile():
         _acc_store(acc, "bwd+opt", time.perf_counter() - tb0)
         _acc_store(acc, "e2e", time.perf_counter() - t0)
     n = max(1, PROFILE_STEPS)
-    print(f"[Profile] model={exp_name} batch={pids.shape[0]} T={pids.shape[1]} F={mels.shape[-1]} | 每步平均耗时:")
+    print(f"[Profile] model={exp_name} batch={pids.shape[0]} T={pids.shape[1]} F={mels.shape[-1]} | 每步平均耗时 ({n / max(acc['e2e'], 1e-6):.2f} it/s):")
     for k in ("h2d", "fwd(含对齐)", "bwd+opt", "e2e"):
         print(f"  {k:12s}: {acc[k] / n * 1000:8.1f} ms")
+    if bb_type == "chunk_attn":
+        text_mask = torch.arange(pids.shape[1], device=pids.device)[None, :] < t_lens[:, None]
+        x_in = model.embed_text(pids, lids, text_mask).detach()
+        def _bench_bb(fn, runs=5):
+            for _ in range(2):
+                with torch.amp.autocast("cuda", dtype=AMP_DTYPE, enabled=(DEVICE.type == "cuda")):
+                    fn(x_in, mask=text_mask).sum().backward()
+            model.backbone.zero_grad(set_to_none=True)
+            if DEVICE.type == "cuda":
+                torch.cuda.synchronize()
+            t_b = time.perf_counter()
+            for _ in range(runs):
+                with torch.amp.autocast("cuda", dtype=AMP_DTYPE, enabled=(DEVICE.type == "cuda")):
+                    fn(x_in, mask=text_mask).sum().backward()
+                model.backbone.zero_grad(set_to_none=True)
+            if DEVICE.type == "cuda":
+                torch.cuda.synchronize()
+            return (time.perf_counter() - t_b) / runs * 1000.0
+        ms_par = _bench_bb(model.backbone.forward)
+        ms_seq = _bench_bb(model.backbone._forward_sequential)
+        print(f"  {'bb(parallel)':14s}: {ms_par:8.1f} ms  (fwd+bwd)")
+        print(f"  {'bb(seq_ref)':14s}: {ms_seq:8.1f} ms  (fwd+bwd) -> backbone 提速 {ms_seq / max(ms_par, 1e-6):.2f}x")
     with torch.no_grad():
         text_mask = torch.arange(pids.shape[1], device=pids.device)[None, :] < t_lens[:, None]
         x_emb = model.embed_text(pids, lids, text_mask)

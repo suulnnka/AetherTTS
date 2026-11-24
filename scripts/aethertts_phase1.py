@@ -24,6 +24,7 @@ _AP.add_argument("--vocoder", default="both", choices=["both", "pretrained_vocos
 _AP.add_argument("--models", default="", help="Optional comma-separated subset, e.g. E1_conv_unigru_L8,E3_chunk_attn_C4_L8,E4_gated_deltanet_L8")
 _AP.add_argument("--frame-lookahead", type=int, default=None, help="声学 frame_decoder 首层集中式右前瞻帧数（默认 2 帧；0 表示关闭）.")
 _AP.add_argument("--vocoder-lookahead", type=int, default=None, help="CausalVocosLite 集中式右前瞻帧数（默认 2 帧；0 表示关闭前瞻）.")
+_AP.add_argument("--batch-size", type=int, default=None, help="可选覆写声学训练 batch_size（如 RTX 4090 覆写为 64）.")
 _AP.add_argument("--backup-steps", type=int, default=1000)
 _AP.add_argument("--backup-minutes", type=float, default=8.0)
 _AP.add_argument("--skip-pip", action="store_true")
@@ -46,6 +47,8 @@ if _ARGS.frame_lookahead is not None:
     _os.environ["AETHER_FRAME_LOOKAHEAD"] = str(_ARGS.frame_lookahead)
 if _ARGS.vocoder_lookahead is not None:
     _os.environ["AETHER_VOCODER_LOOKAHEAD"] = str(_ARGS.vocoder_lookahead)
+if _ARGS.batch_size is not None:
+    _os.environ["AETHER_BATCH_SIZE"] = str(_ARGS.batch_size)
 if _ARGS.skip_pip:
     _os.environ["AETHER_SKIP_PIP"] = "1"
 SELFTEST = _ARGS.selftest
@@ -173,8 +176,8 @@ PROFILE_PRESETS = {
     "quick_smoke": {
         "max_train_hours": 2.0,
         "val_utts": 40,
-        "vocoder_stage1_steps": 2000,
-        "vocoder_stage2_steps": 1000,
+        "vocoder_stage1_steps": 1000,
+        "vocoder_stage2_steps": 2000,
         "acoustic_steps": 3000,
         "batch_size": 16,
         "eval_max_utts": 12,
@@ -182,8 +185,8 @@ PROFILE_PRESETS = {
     "standard_phase1": {
         "max_train_hours": 8.0,
         "val_utts": 80,
-        "vocoder_stage1_steps": 12000,
-        "vocoder_stage2_steps": 6000,
+        "vocoder_stage1_steps": 4000,
+        "vocoder_stage2_steps": 14000,
         "acoustic_steps": 15000,
         "batch_size": 32 if GPU_MEM_GB >= 22 else (24 if GPU_MEM_GB >= 18 else 16),
         "eval_max_utts": 25,
@@ -191,8 +194,8 @@ PROFILE_PRESETS = {
     "full_quality": {
         "max_train_hours": 20.0,
         "val_utts": 100,
-        "vocoder_stage1_steps": 35000,
-        "vocoder_stage2_steps": 15000,
+        "vocoder_stage1_steps": 8000,
+        "vocoder_stage2_steps": 42000,
         "acoustic_steps": 40000,
         "batch_size": 32 if GPU_MEM_GB >= 22 else 16,
         "eval_max_utts": 50,
@@ -228,6 +231,9 @@ CFG = {
     "vocoder_lookahead": int(os.environ.get("AETHER_VOCODER_LOOKAHEAD", "2")),
     **PROFILE_PRESETS[EXPERIMENT_PROFILE],
 }
+_bs_override = os.environ.get("AETHER_BATCH_SIZE", "").strip()
+if _bs_override:
+    CFG["batch_size"] = int(_bs_override)
 
 # 所有产物目录共用的后缀（数据集_档位_架构版本；声学与评测额外区分 frame/vocoder 前瞻消融）
 CFG["run_suffix"] = f"{CFG['dataset_source']}_{CFG['profile']}_{ARCH_TAG}"
@@ -951,6 +957,11 @@ def apply_rope(x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
     return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).flatten(-2)
 
 
+def _apply_rope_with_cache(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x[..., 0::2], x[..., 1::2]
+    return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).flatten(-2)
+
+
 class OfflineBiTransformerBackbone(nn.Module):
     def __init__(self, d_model: int = 256, n_layers: int = 4, n_heads: int = 4, d_ff: int = 896):
         super().__init__()
@@ -1100,7 +1111,8 @@ class SWABackbone(nn.Module):
 class ChunkLookaheadLayer(nn.Module):
     """单层分块深前瞻注意力 + 因果 ConvNeXt：
     在当前 [commit_chunk C + lookahead L] 窗口内做完整双向自注意力，同时因果读取长度 <= W 的历史 KV Cache；
-    算完仅提交前 commit_len 个 token 的 KV 与卷积缓存，彻底丢弃 lookahead token 的状态，保证多层堆叠零前瞻膨胀。"""
+    算完仅提交前 commit_len 个 token 的 KV 与卷积缓存，彻底丢弃 lookahead token 的状态，保证多层堆叠零前瞻膨胀。
+    训练期通过 forward_windows 实现层主序零 chunk 循环全并行（Attention + ConvNeXt 同步向量化），与流式 forward_chunk 100% 数学等价。"""
 
     def __init__(self, d_model: int = 256, n_heads: int = 4, window_size: int = 48):
         super().__init__()
@@ -1112,6 +1124,23 @@ class ChunkLookaheadLayer(nn.Module):
         self.qkv = nn.Linear(d_model, d_model * 3, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.conv = CausalConvNeXtBlock(d_model, kernel_size=5, mult=2)
+        # 非持久化 RoPE 三角查表缓存（预建 512 步，零 state_dict 改动，兼容旧 a4 checkpoint 且对 torch.compile 友好）
+        _pos = torch.arange(512, dtype=torch.float32)
+        _inv = 1.0 / (10000.0 ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
+        _freqs = torch.outer(_pos, _inv)
+        self.register_buffer("_rope_cos", _freqs.cos(), persistent=False)
+        self.register_buffer("_rope_sin", _freqs.sin(), persistent=False)
+
+    def _get_rope(self, needed_len: int, device: torch.device, dtype: torch.dtype):
+        if self._rope_cos.shape[0] < needed_len or self._rope_cos.device != device:
+            cap = max(needed_len, self._rope_cos.shape[0], 512)
+            with torch.inference_mode(False), torch.no_grad():
+                pos = torch.arange(cap, device=device, dtype=torch.float32)
+                inv_freq = 1.0 / (10000.0 ** (torch.arange(0, self.head_dim, 2, device=device, dtype=torch.float32) / self.head_dim))
+                freqs = torch.outer(pos, inv_freq)
+                self._rope_cos = freqs.cos()
+                self._rope_sin = freqs.sin()
+        return self._rope_cos[:needed_len].to(dtype), self._rope_sin[:needed_len].to(dtype)
 
     def init_state(self, batch_size: int, device, dtype):
         return {
@@ -1121,13 +1150,26 @@ class ChunkLookaheadLayer(nn.Module):
             "conv": self.conv.init_state(batch_size, device, dtype),
         }
 
-    def forward_chunk(self, x_win: torch.Tensor, state: dict, commit_len: int, win_mask: torch.Tensor = None):
+    def forward_chunk(self, x_win: torch.Tensor, state: dict, commit_len: int, win_mask: torch.Tensor = None, output_commit_only: bool = False):
         B, M, D = x_win.shape
-        qkv = self.qkv(self.norm1(x_win)).reshape(B, M, 3, self.n_heads, self.head_dim)
-        q, k, v = qkv.permute(2, 0, 3, 1, 4)
-        pos = torch.arange(state["pos"], state["pos"] + M, device=x_win.device)
-        q = apply_rope(q, pos)
-        k = apply_rope(k, pos)
+        xn = self.norm1(x_win)
+        # 末层剪枝：前瞻位置的输出与卷积状态都会被丢弃，只需计算完整 M 步 K/V，而 Q/Attn/out_proj/ConvNeXt 仅算前 commit_len 步
+        if output_commit_only and commit_len < M and type(self.qkv) is nn.Linear:
+            w_q, w_kv = self.qkv.weight.split([D, 2 * D], dim=0)
+            q = F.linear(xn[:, :commit_len, :], w_q).reshape(B, commit_len, self.n_heads, self.head_dim).transpose(1, 2)
+            kv = F.linear(xn, w_kv).reshape(B, M, 2, self.n_heads, self.head_dim)
+            k, v = kv.permute(2, 0, 3, 1, 4)
+        else:
+            qkv = self.qkv(xn).reshape(B, M, 3, self.n_heads, self.head_dim)
+            q, k, v = qkv.permute(2, 0, 3, 1, 4)
+            if output_commit_only and commit_len < M:
+                q = q[:, :, :commit_len, :]
+        q_len = q.shape[2]
+        cos, sin = self._get_rope(state["pos"] + M, x_win.device, q.dtype)
+        cos_m = cos[state["pos"] : state["pos"] + M][None, None, :, :]
+        sin_m = sin[state["pos"] : state["pos"] + M][None, None, :, :]
+        q = _apply_rope_with_cache(q, cos_m[:, :, :q_len, :], sin_m[:, :, :q_len, :])
+        k = _apply_rope_with_cache(k, cos_m, sin_m)
         k_all = torch.cat([state["k"], k], dim=2)
         v_all = torch.cat([state["v"], v], dim=2)
 
@@ -1138,11 +1180,11 @@ class ChunkLookaheadLayer(nn.Module):
                 [torch.ones(B, past_len, device=x_win.device, dtype=torch.bool), win_mask],
                 dim=1,
             )
-            scores = scores.masked_fill(~key_valid[:, None, None, :], -1e9)
-        out = torch.matmul(torch.softmax(scores, dim=-1), v_all).transpose(1, 2).reshape(B, M, D)
-        h = x_win + self.out_proj(out)
+            scores = scores.masked_fill(~key_valid[:, None, None, :], torch.finfo(scores.dtype).min)
+        out = torch.matmul(torch.softmax(scores, dim=-1), v_all).transpose(1, 2).reshape(B, q_len, D)
+        h = x_win[:, :q_len, :] + self.out_proj(out)
 
-        # 局部因果 ConvNeXt：用完整 [commit + lookahead] 计算输出，但仅把 commit_len 段写入下一块卷积状态
+        # 局部因果 ConvNeXt：仅将 commit_len 段写入下一块卷积状态（因果卷积不依赖右侧被裁掉的 lookahead）
         pad_left = self.conv.dwconv.pad_left
         buf = torch.cat([state["conv"], h.transpose(1, 2)], dim=-1)
         conv_out = self.conv.dwconv.conv(buf).transpose(1, 2)
@@ -1153,12 +1195,81 @@ class ChunkLookaheadLayer(nn.Module):
         new_v = torch.cat([state["v"], v[:, :, :commit_len, :]], dim=2)[:, :, -self.window_size:, :]
         return h_out, {"k": new_k, "v": new_v, "pos": state["pos"] + commit_len, "conv": new_conv}
 
+    def forward_windows(
+        self,
+        x_win: torch.Tensor,
+        win_mask: torch.Tensor,
+        past_valid: torch.Tensor,
+        cos_win: torch.Tensor,
+        sin_win: torch.Tensor,
+        chunk_size: int,
+        output_commit_only: bool = False,
+    ) -> torch.Tensor:
+        """层主序全窗口零循环并行前向（Attention + ConvNeXt 同步向量化，与逐块 forward_chunk 数学等价）。"""
+        B, N, M, D = x_win.shape
+        C, W = chunk_size, self.window_size
+        H, dh = self.n_heads, self.head_dim
+        q_len = C if (output_commit_only and C < M) else M
+
+        xn = self.norm1(x_win)
+        if output_commit_only and C < M and type(self.qkv) is nn.Linear:
+            w_q, w_kv = self.qkv.weight.split([D, 2 * D], dim=0)
+            q = F.linear(xn[:, :, :C, :], w_q).reshape(B, N, C, H, dh).permute(0, 1, 3, 2, 4)
+            kv = F.linear(xn, w_kv).reshape(B, N, M, 2, H, dh)
+            k = kv[:, :, :, 0].permute(0, 1, 3, 2, 4)
+            v = kv[:, :, :, 1].permute(0, 1, 3, 2, 4)
+        else:
+            qkv = self.qkv(xn).reshape(B, N, M, 3, H, dh)
+            q = qkv[:, :, :q_len, 0].permute(0, 1, 3, 2, 4)
+            k = qkv[:, :, :, 1].permute(0, 1, 3, 2, 4)
+            v = qkv[:, :, :, 2].permute(0, 1, 3, 2, 4)
+
+        cos_b = cos_win[None, :, None, :, :].to(q.dtype)
+        sin_b = sin_win[None, :, None, :, :].to(q.dtype)
+        q = _apply_rope_with_cache(q, cos_b[:, :, :, :q_len, :], sin_b[:, :, :, :q_len, :])
+        k = _apply_rope_with_cache(k, cos_b, sin_b)
+
+        # 用 F.pad + unfold 零循环组装全部 N 个窗口的历史 KV Cache（仅含前序窗口已提交的前 C 步）
+        if W > 0:
+            k_commit = k[:, :, :, :C, :].permute(0, 2, 1, 3, 4).reshape(B, H, N * C, dh)
+            v_commit = v[:, :, :, :C, :].permute(0, 2, 1, 3, 4).reshape(B, H, N * C, dh)
+            end_p = W + (N - 1) * C
+            k_past = F.pad(k_commit, (0, 0, W, 0))[:, :, :end_p, :].unfold(2, W, C).permute(0, 2, 1, 4, 3)
+            v_past = F.pad(v_commit, (0, 0, W, 0))[:, :, :end_p, :].unfold(2, W, C).permute(0, 2, 1, 4, 3)
+            k_all = torch.cat([k_past, k], dim=3)
+            v_all = torch.cat([v_past, v], dim=3)
+            key_valid = torch.cat([past_valid[None, :, :].expand(B, -1, -1), win_mask], dim=2)
+        else:
+            k_all, v_all, key_valid = k, v, win_mask
+
+        # B*N 个窗口合并为单次 SDPA（每个窗口至少有 1 个 True key，前反向严格无 NaN）
+        out = F.scaled_dot_product_attention(
+            q.reshape(B * N, H, q_len, dh),
+            k_all.reshape(B * N, H, W + M, dh),
+            v_all.reshape(B * N, H, W + M, dh),
+            attn_mask=key_valid.reshape(B * N, 1, 1, W + M),
+        )
+        out = out.transpose(1, 2).reshape(B, N, q_len, D)
+        h = x_win[:, :, :q_len, :] + self.out_proj(out)
+
+        # Conv state 仅依赖注意力后的已提交 h[:, :, :C, :]，同样 F.pad + unfold 零循环全并行
+        pad_left = self.conv.dwconv.pad_left
+        if pad_left > 0:
+            h_commit = h[:, :, :C, :].reshape(B, N * C, D)
+            end_c = pad_left + (N - 1) * C
+            conv_state = F.pad(h_commit, (0, 0, pad_left, 0))[:, :end_c, :].unfold(1, pad_left, C)
+            buf = torch.cat([conv_state, h.transpose(2, 3)], dim=3).reshape(B * N, D, pad_left + q_len)
+        else:
+            buf = h.transpose(2, 3).reshape(B * N, D, q_len)
+        conv_out = self.conv.dwconv.conv(buf).transpose(1, 2).reshape(B, N, q_len, D)
+        return h + self.conv.pw2(F.gelu(self.conv.pw1(self.conv.norm(conv_out))))
+
 
 class ChunkLookaheadBackbone(nn.Module):
     """E3 主力流式输入主干：5 层深双向分块前瞻注意力（C=4, L=8, W=48）。
     - 相比 E2（1 层浅层 Conv 前瞻 + 上层严格因果），全部 5 层均可对 [C + L] 未来窗口做深层双向交互；
     - 每次仅提交 C 步状态、丢弃 L 步前瞻 KV，总前瞻严格锁死且天然适配流式前端的“暂定前瞻纠错”；
-    - 训练期与流式推理共用同一 _run_window 路径，实现 100% 数学等价。"""
+    - 训练期走层主序全窗口零循环并行 forward（+ 末层 commit_len 剪枝），流式推理走 _run_window，二者 100% 数学等价。"""
 
     def __init__(self, d_model: int = 256, chunk_size: int = 4, lookahead: int = 8, n_layers: int = 5, n_heads: int = 4, window_size: int = 48):
         super().__init__()
@@ -1171,12 +1282,14 @@ class ChunkLookaheadBackbone(nn.Module):
     def _run_window(self, win: torch.Tensor, layer_states: list, commit_len: int, win_mask: torch.Tensor = None):
         h = win
         new_layers = []
-        for l, st in zip(self.layers, layer_states):
-            h, nst = l.forward_chunk(h, st, commit_len=commit_len, win_mask=win_mask)
+        last_idx = len(self.layers) - 1
+        for idx, (l, st) in enumerate(zip(self.layers, layer_states)):
+            h, nst = l.forward_chunk(h, st, commit_len=commit_len, win_mask=win_mask, output_commit_only=(idx == last_idx))
             new_layers.append(nst)
         return h[:, :commit_len, :], new_layers
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+    def _forward_sequential(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        """逐块串行参考路径（供 --selftest 数学等价门禁与性能基准对照）。"""
         B, T, _ = x.shape
         layer_states = [l.init_state(B, x.device, x.dtype) for l in self.layers]
         emits = []
@@ -1187,6 +1300,44 @@ class ChunkLookaheadBackbone(nn.Module):
             h_commit, layer_states = self._run_window(x[:, s:e, :], layer_states, commit_len=c_len, win_mask=win_mask)
             emits.append(h_commit)
         return torch.cat(emits, dim=1) if emits else x[:, :0, :]
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        B, T, D = x.shape
+        if T == 0:
+            return x[:, :0, :]
+        C, L = self.chunk_size, self.lookahead
+        M = C + L
+        N = (T + C - 1) // C
+        T_pad = (N - 1) * C + M
+        pad_r = T_pad - T
+        x_pad = F.pad(x, (0, 0, 0, pad_r)) if pad_r > 0 else x
+        if mask is None:
+            mask_pad = (torch.arange(T_pad, device=x.device)[None, :] < T).expand(B, -1)
+        else:
+            mask_pad = F.pad(mask, (0, pad_r), value=False) if pad_r > 0 else mask
+
+        x_win = x_pad.unfold(1, M, C).transpose(2, 3).contiguous()
+        win_mask = mask_pad.unfold(1, M, C).contiguous()
+
+        W = self.layers[0].window_size
+        if W > 0:
+            chunk_starts = torch.arange(N, device=x.device)[:, None] * C
+            past_valid = (chunk_starts - W + torch.arange(W, device=x.device)[None, :]) >= 0
+        else:
+            past_valid = torch.zeros(N, 0, device=x.device, dtype=torch.bool)
+
+        cos_all, sin_all = self.layers[0]._get_rope(T_pad, x.device, x.dtype)
+        cos_win = cos_all[:T_pad].unfold(0, M, C).transpose(1, 2).contiguous()
+        sin_win = sin_all[:T_pad].unfold(0, M, C).transpose(1, 2).contiguous()
+
+        h = x_win
+        last_idx = len(self.layers) - 1
+        for idx, layer in enumerate(self.layers):
+            h = layer.forward_windows(
+                h, win_mask, past_valid, cos_win, sin_win,
+                chunk_size=C, output_commit_only=(idx == last_idx),
+            )
+        return h[:, :, :C, :].reshape(B, N * C, D)[:, :T, :]
 
     def init_state(self, batch_size: int, device, dtype):
         return {
@@ -1736,15 +1887,21 @@ class StreamingISTFTHead(nn.Module):
         frames = self._frames_to_time(x)
         pad = self.n_fft - self.hop_length
         total_len = n_frames * self.hop_length + pad
-        out = torch.zeros(B, total_len, device=x.device, dtype=torch.float32)
-        env = torch.zeros(B, total_len, device=x.device, dtype=torch.float32)
-        w2 = (self.window ** 2)[None, :]
-        for m in range(n_frames):
-            st = m * self.hop_length
-            out[:, st : st + self.n_fft] += frames[:, m, :]
-            env[:, st : st + self.n_fft] += w2
+        # 用 F.fold 一次性向量化 OLA（消除 n_frames 次 Python 循环，与流式 forward_step 逐样本等价）
+        out = F.fold(
+            frames.transpose(1, 2),
+            output_size=(1, total_len),
+            kernel_size=(1, self.n_fft),
+            stride=(1, self.hop_length),
+        ).reshape(B, total_len)
+        w2 = (self.window ** 2).view(1, self.n_fft, 1).expand(1, self.n_fft, n_frames)
+        env = F.fold(
+            w2,
+            output_size=(1, total_len),
+            kernel_size=(1, self.n_fft),
+            stride=(1, self.hop_length),
+        ).reshape(1, total_len)
         # centre=True 约定（与 torch.istft 一致）：OLA 缓冲区下标 n_fft//2 对应采样时刻 0，输出与 mel 帧网格逐样本对齐。
-        # 旧实现按 pad//2 对称裁剪，输出整体晚 128 采样点（5.33 ms），波形域损失里预测与真值是错位的
         left_trim = self.n_fft // 2
         return out[:, left_trim : left_trim + n_frames * self.hop_length] / env[:, left_trim : left_trim + n_frames * self.hop_length].clamp(min=1e-6)
 
@@ -1825,14 +1982,21 @@ class CausalVocosLite(nn.Module):
         return wav, state
 
 
+def _apply_wn(module: nn.Module) -> nn.Module:
+    wn = getattr(nn.utils.parametrizations, "weight_norm", None) or nn.utils.weight_norm
+    return wn(module)
+
+
 class PeriodDisc(nn.Module):
     def __init__(self, period: int):
         super().__init__()
         self.period = period
         self.convs = nn.ModuleList([
-            nn.Conv2d(1, 32, (5, 1), (3, 1), (2, 0)), nn.Conv2d(32, 64, (5, 1), (3, 1), (2, 0)),
-            nn.Conv2d(64, 128, (5, 1), (3, 1), (2, 0)), nn.Conv2d(128, 256, (5, 1), (3, 1), (2, 0)),
-            nn.Conv2d(256, 1, (3, 1), 1, (1, 0)),
+            _apply_wn(nn.Conv2d(1, 32, (5, 1), (3, 1), (2, 0))),
+            _apply_wn(nn.Conv2d(32, 64, (5, 1), (3, 1), (2, 0))),
+            _apply_wn(nn.Conv2d(64, 128, (5, 1), (3, 1), (2, 0))),
+            _apply_wn(nn.Conv2d(128, 256, (5, 1), (3, 1), (2, 0))),
+            _apply_wn(nn.Conv2d(256, 1, (3, 1), 1, (1, 0))),
         ])
 
     def forward(self, x: torch.Tensor):
@@ -1855,9 +2019,11 @@ class SpecDisc(nn.Module):
         self.n_fft, self.hop = n_fft, hop
         self.register_buffer("win", torch.hann_window(n_fft))
         self.convs = nn.ModuleList([
-            nn.Conv2d(1, 32, (3, 9), (1, 1), (1, 4)), nn.Conv2d(32, 64, (3, 9), (1, 2), (1, 4)),
-            nn.Conv2d(64, 128, (3, 9), (1, 2), (1, 4)), nn.Conv2d(128, 128, (3, 3), (1, 1), (1, 1)),
-            nn.Conv2d(128, 1, (3, 3), (1, 1), (1, 1)),
+            _apply_wn(nn.Conv2d(1, 32, (3, 9), (1, 1), (1, 4))),
+            _apply_wn(nn.Conv2d(32, 64, (3, 9), (1, 2), (1, 4))),
+            _apply_wn(nn.Conv2d(64, 128, (3, 9), (1, 2), (1, 4))),
+            _apply_wn(nn.Conv2d(128, 128, (3, 3), (1, 1), (1, 1))),
+            _apply_wn(nn.Conv2d(128, 1, (3, 3), (1, 1), (1, 1))),
         ])
 
     def forward(self, x: torch.Tensor):
@@ -1966,11 +2132,50 @@ def run_chunkwise_numerical_and_grad_tests():
     print(f"  [PASS] {'GDN Log-Space Chunk Scan':26s} | T={T} (>2×{SCAN_CHUNK}) | 强遗忘前向等价 & 反向全有限")
 
 
+def run_chunk_attn_parallel_and_grad_tests():
+    """验证 ChunkLookaheadBackbone 零 chunk 循环并行 forward 与逐块串行 _forward_sequential 的前向与反向梯度等价性。"""
+    torch.manual_seed(7)
+    bb = ChunkLookaheadBackbone(d_model=64, chunk_size=4, lookahead=8, n_layers=5, n_heads=4, window_size=16)
+    T_lens = [35, 19, 3]  # 覆盖滑窗截断 (>W)、非整除长度、以及 T < C 极端短句
+    B, T, D = len(T_lens), max(T_lens), 64
+    mask = torch.arange(T)[None, :] < torch.tensor(T_lens)[:, None]
+    x_base = torch.randn(B, T, D) * mask[:, :, None].float()
+
+    # 1) 变长批前向 + 反向梯度等价
+    x_par = x_base.clone().requires_grad_(True)
+    y_par = bb.forward(x_par, mask=mask)
+    loss_par = (y_par.pow(2) * mask[:, :, None].float()).sum()
+    loss_par.backward()
+    grads_par = {n: p.grad.clone() for n, p in bb.named_parameters()}
+    xgrad_par = x_par.grad.clone()
+
+    bb.zero_grad(set_to_none=True)
+    x_seq = x_base.clone().requires_grad_(True)
+    y_seq = bb._forward_sequential(x_seq, mask=mask)
+    loss_seq = (y_seq.pow(2) * mask[:, :, None].float()).sum()
+    loss_seq.backward()
+
+    fwd_diff = ((y_par.detach() - y_seq.detach()) * mask[:, :, None].float()).abs().max().item()
+    xgrad_diff = ((xgrad_par - x_seq.grad) * mask[:, :, None].float()).abs().max().item()
+    pgrad_diff = max((grads_par[n] - p.grad).abs().max().item() for n, p in bb.named_parameters())
+    assert torch.isfinite(y_par).all() and torch.isfinite(xgrad_par).all(), "ChunkAttn parallel non-finite output/grad"
+    assert fwd_diff < 1e-5, f"ChunkAttn parallel fwd mismatch: {fwd_diff}"
+    assert xgrad_diff < 1e-4 and pgrad_diff < 1e-4, f"ChunkAttn parallel grad mismatch: x={xgrad_diff}, p={pgrad_diff}"
+
+    # 2) 无 mask 单句路径等价
+    with torch.no_grad():
+        x_single = torch.randn(1, 35, D)
+        diff_nomask = (bb.forward(x_single) - bb._forward_sequential(x_single)).abs().max().item()
+        assert diff_nomask < 1e-5, f"ChunkAttn no-mask fwd mismatch: {diff_nomask}"
+    print(f"  [PASS] {'ChunkAttn Parallel/Grad':26s} | Fwd: {fwd_diff:.2e} | xGrad: {xgrad_diff:.2e} | pGrad: {pgrad_diff:.2e}")
+
+
 def run_architecture_and_streaming_tests():
     print("=" * 72)
     print("参数量检查 & 流式↔离线等价 + 零前瞻膨胀 + 强遗忘梯度硬门禁 (误差 < 1e-4)")
     print("=" * 72)
     run_chunkwise_numerical_and_grad_tests()
+    run_chunk_attn_parallel_and_grad_tests()
 
     with torch.no_grad():
         T = 75  # > 2 * SCAN_CHUNK (32)，覆盖多块递推、滑窗截断与非整除尾块
@@ -2678,11 +2883,38 @@ class VocoderDataset(Dataset):
         return mel_seg, wav_seg
 
 
+class BucketBatchSampler:
+    """按 mel 帧长加微扰分桶的批采样器：每轮减少 30-40% 右填充，同时加速 chunk_attn 与 CPU Viterbi 对齐。"""
+
+    def __init__(self, entries, batch_size: int, drop_last: bool = True, seed: int = 42, jitter: float = 0.15):
+        self.lengths = [int(e.get("n_frames", 1)) for e in entries]
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.seed = seed
+        self.jitter = jitter
+        self.epoch = 0
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        self.epoch += 1
+        noisy = [(l * (1.0 + rng.uniform(-self.jitter, self.jitter)), i) for i, l in enumerate(self.lengths)]
+        noisy.sort(key=lambda x: x[0])
+        order = [i for _, i in noisy]
+        batches = [order[k : k + self.batch_size] for k in range(0, len(order), self.batch_size)]
+        if self.drop_last and batches and len(batches[-1]) < self.batch_size:
+            batches.pop()
+        rng.shuffle(batches)
+        yield from batches
+
+    def __len__(self):
+        return len(self.lengths) // self.batch_size if self.drop_last else (len(self.lengths) + self.batch_size - 1) // self.batch_size
+
+
 train_loader = DataLoader(
     AcousticDataset(DATASET_META["train"]),
-    batch_size=CFG["batch_size"], shuffle=True,
+    batch_sampler=BucketBatchSampler(DATASET_META["train"], batch_size=CFG["batch_size"], drop_last=True, seed=CFG["seed"]),
     num_workers=CFG["num_workers"], pin_memory=torch.cuda.is_available(),
-    collate_fn=acoustic_collate, drop_last=True,
+    collate_fn=acoustic_collate,
 )
 val_loader = DataLoader(
     AcousticDataset(DATASET_META["val"]),
@@ -2736,9 +2968,31 @@ def _run_step_profile():
         _acc_store(acc, "bwd+opt", time.perf_counter() - tb0)
         _acc_store(acc, "e2e", time.perf_counter() - t0)
     n = max(1, PROFILE_STEPS)
-    print(f"[Profile] model={exp_name} batch={pids.shape[0]} T={pids.shape[1]} F={mels.shape[-1]} | 每步平均耗时:")
+    print(f"[Profile] model={exp_name} batch={pids.shape[0]} T={pids.shape[1]} F={mels.shape[-1]} | 每步平均耗时 ({n / max(acc['e2e'], 1e-6):.2f} it/s):")
     for k in ("h2d", "fwd(含对齐)", "bwd+opt", "e2e"):
         print(f"  {k:12s}: {acc[k] / n * 1000:8.1f} ms")
+    if bb_type == "chunk_attn":
+        text_mask = torch.arange(pids.shape[1], device=pids.device)[None, :] < t_lens[:, None]
+        x_in = model.embed_text(pids, lids, text_mask).detach()
+        def _bench_bb(fn, runs=5):
+            for _ in range(2):
+                with torch.amp.autocast("cuda", dtype=AMP_DTYPE, enabled=(DEVICE.type == "cuda")):
+                    fn(x_in, mask=text_mask).sum().backward()
+            model.backbone.zero_grad(set_to_none=True)
+            if DEVICE.type == "cuda":
+                torch.cuda.synchronize()
+            t_b = time.perf_counter()
+            for _ in range(runs):
+                with torch.amp.autocast("cuda", dtype=AMP_DTYPE, enabled=(DEVICE.type == "cuda")):
+                    fn(x_in, mask=text_mask).sum().backward()
+                model.backbone.zero_grad(set_to_none=True)
+            if DEVICE.type == "cuda":
+                torch.cuda.synchronize()
+            return (time.perf_counter() - t_b) / runs * 1000.0
+        ms_par = _bench_bb(model.backbone.forward)
+        ms_seq = _bench_bb(model.backbone._forward_sequential)
+        print(f"  {'bb(parallel)':14s}: {ms_par:8.1f} ms  (fwd+bwd)")
+        print(f"  {'bb(seq_ref)':14s}: {ms_seq:8.1f} ms  (fwd+bwd) -> backbone 提速 {ms_seq / max(ms_par, 1e-6):.2f}x")
     with torch.no_grad():
         text_mask = torch.arange(pids.shape[1], device=pids.device)[None, :] < t_lens[:, None]
         x_emb = model.embed_text(pids, lids, text_mask)
@@ -2777,6 +3031,20 @@ def train_or_load_causal_vocoder():
     s2_steps = CFG["vocoder_stage2_steps"]
     total_steps = s1_steps + s2_steps
 
+    voc_warmup = min(500, max(100, total_steps // 20))
+    def _voc_lr_lambda(s):
+        if s < voc_warmup:
+            return float(s + 1) / float(voc_warmup)
+        prog = float(s - voc_warmup) / float(max(1, total_steps - voc_warmup))
+        return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * min(1.0, prog)))
+
+    def _disc_lr_lambda(s):
+        prog = float(s) / float(max(1, s2_steps))
+        return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * min(1.0, prog)))
+
+    sched_g = torch.optim.lr_scheduler.LambdaLR(opt_g, _voc_lr_lambda)
+    sched_d = torch.optim.lr_scheduler.LambdaLR(opt_d, _disc_lr_lambda)
+
     final_storage = VOC_STORAGE_DIR / "final.pt"
     latest_storage = VOC_STORAGE_DIR / "latest.pt"
     done_storage = VOC_STORAGE_DIR / ".done"
@@ -2795,10 +3063,21 @@ def train_or_load_causal_vocoder():
         print(f"[Mid-Run Resume] 检测到未完结声码器断点，正在恢复: {latest_storage}")
         ckpt = torch.load(latest_storage, map_location=DEVICE, weights_only=False)
         voc.load_state_dict(ckpt["voc"])
-        disc.load_state_dict(ckpt["disc"])
         opt_g.load_state_dict(ckpt["opt_g"])
-        opt_d.load_state_dict(ckpt["opt_d"])
+        try:
+            disc.load_state_dict(ckpt["disc"])
+            opt_d.load_state_dict(ckpt["opt_d"])
+        except Exception as e:
+            print(f"  [Warn] 判别器结构已升级（weight_norm），重新初始化判别器并保留生成器权重: {e}")
         step = int(ckpt["step"])
+        if "sched_g" in ckpt:
+            sched_g.load_state_dict(ckpt["sched_g"])
+        else:
+            sched_g.last_epoch = step
+        if "sched_d" in ckpt:
+            sched_d.load_state_dict(ckpt["sched_d"])
+        else:
+            sched_d.last_epoch = max(0, step - s1_steps)
         print(f"  -> 从 step={step}/{total_steps} 无缝继续训练！")
 
     voc_loader = DataLoader(
@@ -2814,7 +3093,11 @@ def train_or_load_causal_vocoder():
 
     def _backup_voc(cur_step: int, is_final: bool = False):
         nonlocal last_backup_t
-        payload = {"step": cur_step, "voc": voc.state_dict(), "disc": disc.state_dict(), "opt_g": opt_g.state_dict(), "opt_d": opt_d.state_dict()}
+        payload = {
+            "step": cur_step, "voc": voc.state_dict(), "disc": disc.state_dict(),
+            "opt_g": opt_g.state_dict(), "opt_d": opt_d.state_dict(),
+            "sched_g": sched_g.state_dict(), "sched_d": sched_d.state_dict(),
+        }
         atomic_torch_save(payload, latest_local)
         sync_file_to_storage(latest_local, latest_storage)
         if is_final:
@@ -2833,7 +3116,6 @@ def train_or_load_causal_vocoder():
                 mel_seg = mel_seg.to(DEVICE, non_blocking=True)
                 wav_gt = wav_gt.to(DEVICE, non_blocking=True)
                 in_gan = step >= s1_steps
-                spec_weight = 5.0 if in_gan else 15.0
 
                 wav_pred = voc(mel_seg)
                 L_min = min(wav_pred.shape[-1], wav_gt.shape[-1])
@@ -2842,23 +3124,31 @@ def train_or_load_causal_vocoder():
                 if in_gan:
                     opt_d.zero_grad(set_to_none=True)
                     ro, fo, _, _ = disc(wav_gt, wav_pred.detach())
-                    loss_d = sum(torch.mean((r - 1.0) ** 2) + torch.mean(f ** 2) for r, f in zip(ro, fo)) / len(ro)
+                    # 按 HiFi-GAN / Vocos 标准跨判别器求和，避免被除小 7x/35x 后被频谱损失淹没
+                    loss_d = sum(torch.mean((r - 1.0) ** 2) + torch.mean(f ** 2) for r, f in zip(ro, fo))
                     loss_d.backward()
                     torch.nn.utils.clip_grad_norm_(disc.parameters(), 1.0)
                     opt_d.step()
+                    sched_d.step()
 
                 opt_g.zero_grad(set_to_none=True)
                 loss_stft = multi_res_stft_loss(wav_pred, wav_gt)
                 loss_mel = F.l1_loss(mel_gpu(wav_pred), mel_gpu(wav_gt))
-                loss_g = spec_weight * (loss_stft + loss_mel)
                 if in_gan:
                     _, fo, rfmaps, ffmaps = disc(wav_gt, wav_pred)
-                    loss_adv = sum(torch.mean((f - 1.0) ** 2) for f in fo) / len(fo)
-                    loss_fm = sum(F.l1_loss(ff, rf.detach()) for rf_l, ff_l in zip(rfmaps, ffmaps) for rf, ff in zip(rf_l, ff_l)) / (len(rfmaps) * 5)
-                    loss_g = loss_g + loss_adv + 2.0 * loss_fm
+                    loss_adv = sum(torch.mean((f - 1.0) ** 2) for f in fo)
+                    loss_fm = sum(
+                        F.l1_loss(ff, rf.detach())
+                        for rf_l, ff_l in zip(rfmaps, ffmaps)
+                        for rf, ff in zip(rf_l[:-1], ff_l[:-1])
+                    )
+                    loss_g = 2.0 * loss_stft + 30.0 * loss_mel + loss_adv + 2.0 * loss_fm
+                else:
+                    loss_g = 15.0 * (loss_stft + loss_mel)
                 loss_g.backward()
                 torch.nn.utils.clip_grad_norm_(voc.parameters(), 1.0)
                 opt_g.step()
+                sched_g.step()
 
                 step += 1
                 pbar.update(1)
@@ -3337,11 +3627,25 @@ except Exception as e:
     print(f"[Warn] Resemblyzer unavailable: {e}")
 
 WHISPER_MODEL = None
+WHISPER_MODEL_NAME = "small" if CFG["profile"] == "quick_smoke" else "large-v3-turbo"
+WHISPER_ON_CUDA = False
 try:
     from faster_whisper import WhisperModel
-    w_name = "small" if CFG["profile"] == "quick_smoke" else "large-v3-turbo"
-    print(f"[Eval] 加载 Faster-Whisper ({w_name})...")
-    WHISPER_MODEL = WhisperModel(w_name, device="cuda" if torch.cuda.is_available() else "cpu", compute_type="float16" if torch.cuda.is_available() else "int8")
+    if torch.cuda.is_available():
+        try:
+            print(f"[Eval] 加载 Faster-Whisper ({WHISPER_MODEL_NAME}, CUDA float16)...")
+            _wm = WhisperModel(WHISPER_MODEL_NAME, device="cuda", compute_type="float16")
+            # 实测 0.2s 静音前向，提前触发 ctranslate2 的 libcublas.so.12 / cudnn 延迟加载校验
+            list(_wm.transcribe(np.zeros(3200, dtype=np.float32), language="zh", beam_size=1)[0])
+            WHISPER_MODEL = _wm
+            WHISPER_ON_CUDA = True
+        except Exception as e_cuda:
+            print(f"[Warn] Faster-Whisper CUDA 不可用 ({e_cuda})，自动回退 CPU int8（避免 MER 全 NaN）...")
+            WHISPER_MODEL = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type="int8")
+            WHISPER_ON_CUDA = False
+    else:
+        print(f"[Eval] 加载 Faster-Whisper ({WHISPER_MODEL_NAME}, CPU int8)...")
+        WHISPER_MODEL = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type="int8")
 except Exception as e:
     print(f"[Warn] Faster-Whisper unavailable: {e}")
 
@@ -3398,6 +3702,7 @@ def detect_seam_click(wav_np: np.ndarray, seams: list, sr: int = 24000) -> float
 
 
 def compute_asr_error(wav_or_path, ref_text: str, sr: int = 24000) -> float:
+    global WHISPER_MODEL, WHISPER_ON_CUDA
     if WHISPER_MODEL is None:
         return float("nan")
     try:
@@ -3413,8 +3718,20 @@ def compute_asr_error(wav_or_path, ref_text: str, sr: int = 24000) -> float:
         w16 = librosa.resample(wav_np, orig_sr=sr, target_sr=16000) if sr != 16000 else wav_np
         w16 = np.ascontiguousarray(w16, dtype=np.float32)
         lang = "zh" if re.search(r"[\u4e00-\u9fff]", ref_text) else "en"
-        segs, _ = WHISPER_MODEL.transcribe(w16, language=lang, beam_size=1)
-        return compute_mixed_error_rate(ref_text, "".join(s.text for s in segs))
+        try:
+            segs, _ = WHISPER_MODEL.transcribe(w16, language=lang, beam_size=1)
+            hyp = "".join(s.text for s in segs)
+        except Exception as e_run:
+            if WHISPER_ON_CUDA:
+                print(f"[Warn] Faster-Whisper CUDA 推理失败 ({e_run})，切换 CPU int8 重试...")
+                from faster_whisper import WhisperModel
+                WHISPER_MODEL = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type="int8")
+                WHISPER_ON_CUDA = False
+                segs, _ = WHISPER_MODEL.transcribe(w16, language=lang, beam_size=1)
+                hyp = "".join(s.text for s in segs)
+            else:
+                raise
+        return compute_mixed_error_rate(ref_text, hyp)
     except Exception as e:
         print(f"[Warn] ASR scoring failed ({e}), returning NaN.")
         return float("nan")

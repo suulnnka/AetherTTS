@@ -25,6 +25,7 @@ def parse_args():
     p.add_argument("--models", default="", help="Optional comma-separated subset of models, e.g. E1_conv_unigru_L8,E3_chunk_attn_C4_L8,E4_gated_deltanet_L8")
     p.add_argument("--frame-lookahead", type=int, default=None, help="声学 frame_decoder 首层集中式右前瞻帧数（默认沿用 Notebook 内的 2 帧；0 表示关闭）.")
     p.add_argument("--vocoder-lookahead", type=int, default=None, help="CausalVocosLite 集中式右前瞻帧数（默认沿用 Notebook 内的 2 帧；0 表示关闭前瞻）.")
+    p.add_argument("--batch-size", type=int, default=None, help="可选覆写声学训练 batch_size（如 RTX 4090 覆写为 64）.")
     p.add_argument("--backup-steps", type=int, default=1000, help="Save resumable latest.pt every N acoustic steps (default: 1000).")
     p.add_argument("--backup-minutes", type=float, default=8.0, help="Also force-save latest.pt every M minutes (default: 8.0).")
     p.add_argument("--skip-pip", action="store_true", help="Skip automatic pip install of missing dependencies.")
@@ -51,6 +52,8 @@ def main():
         os.environ["AETHER_FRAME_LOOKAHEAD"] = str(args.frame_lookahead)
     if args.vocoder_lookahead is not None:
         os.environ["AETHER_VOCODER_LOOKAHEAD"] = str(args.vocoder_lookahead)
+    if args.batch_size is not None:
+        os.environ["AETHER_BATCH_SIZE"] = str(args.batch_size)
     if args.skip_pip:
         os.environ["AETHER_SKIP_PIP"] = "1"
 
