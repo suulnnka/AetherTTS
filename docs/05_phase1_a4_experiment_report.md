@@ -109,6 +109,42 @@ python scripts/aethertts_phase1.py --profile full_quality --dataset bznsyp \
 - 注意：batch 目前无环境变量/CLI 覆写入口，如需 batch 64 需在 notebook 的 `PROFILE_PRESETS`
   中调整（改动单一真相源后运行 `python scripts/sync_phase1_script.py` 同步脚本）。
 
+### 5.2 不破坏流式等价的 E3 提速路线（待实现）
+
+针对 5.1 中"E3 逐 chunk 训练 forward 慢"的问题，先厘清**什么会破坏等价、什么不会**：
+
+| 方案 | 是否破坏训练↔流式等价 | 说明 |
+| --- | --- | --- |
+| 训练改全序列稠密双向 attention（E0 式），推理仍分块 | ❌ 破坏 | 训练目标函数与部署计算图是两个不同函数 |
+| **两段式课程：粗/稠密预训练 → 用精确分块路径精调** | ✅ 不破坏 | 最终部署的就是被充分训练的分块图；预训练只改变初始化（流式 ASR/TTS 文献标准做法） |
+| **层主序批量重排（下述①）** | ✅ 不破坏 | 逐元素数学等价的纯实现优化 |
+
+**① 层主序窗口批量化（推荐，预计 2.5–4× 提速）**
+
+现状：`forward` 按 `for chunk → for layer` 双重循环逐窗口执行（T/4 × 5 层 ≈ 75 次小 kernel
+串行发射）。依赖结构分析表明可以重排为 `for layer → 一次批量 attention + 轻量 conv/FFN 扫描`：
+
+- 每层注意力的输入 = 上一层输出 + KV cache；而 KV cache 存的是**层输入的线性投影**，
+  与本层注意力结果无关 → 同层全部 chunk 窗口可叠入 batch 维，做**一次**块对角 mask 的
+  批量 attention（窗口 [C+L]=12 查询 × [cache W=48 + 12] 键）；
+- 唯一的同类层跨窗口依赖是 conv state，但其存的是 `h`（注意力后、FFN **前**的值），
+  不依赖本窗口 conv/FFN 计算 → 先批量算完整层 h，再对窗口序列跑轻量 conv+FFN 扫描即可，
+  数值逐元素等价；
+- 预期 E3 从 3.07 → 7–10 it/s，full_quality 40k 步从 ~3.6h 压缩到 **~1.2–1.6h**。
+
+**② E0→E3 热启动（可选，砍收敛步数）**
+
+E0（离线双向 Transformer）每步快 4–5 倍且已训至 val mel 0.585；其 phoneme/lang embedding、
+时长/F0/Energy 预测器、帧解码器、前 4 层 qkv/out_proj/FFN 与 E3 形状兼容，可复制初始化，
+再用精确分块路径精调。收益是减少所需总步数（属 5.2 表中"两段式课程"的合法变体）。
+
+**验证与落地流程**
+
+1. ①的重排 forward 用现有门禁验证：`--selftest` 的流式等价（容差 1e-4，批量 matmul
+   kernel 选择可能带来远小于容差的浮点重排差异）+ 零前瞻泄漏门禁 + 训练 loss 曲线对照；
+2. 所有改动落在 notebook（单一真相源）→ `python scripts/sync_phase1_script.py` 同步；
+3. 建议实现顺序：先 ①（无训练动态风险）跑通门禁 → full_quality 单跑验证 → 再评估是否加 ②。
+
 ## 6. 产物位置
 
 ```
