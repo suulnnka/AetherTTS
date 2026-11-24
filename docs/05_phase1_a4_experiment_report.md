@@ -153,7 +153,32 @@ aethertts_exp/
 ├── vocoder/causal_vocos_lite_bznsyp_standard_phase1_a4_L2/
 ├── eval_samples/bznsyp_standard_phase1_a4_fL2_vL2/   # 每模型 offline/streaming/pretrained_vocos + GT
 ├── reports/bznsyp_standard_phase1_a4_fL2_vL2/        # leaderboard.csv/json、per_sample、图表、盲听表
-├── cache/bznsyp_v2_max8.0h/        # 特征缓存（full_quality 需另建 max20h 缓存）
+├── cache/bznsyp_v2_max8.0h/        # 特征缓存（a5 升级为 v3 共享特征池 bznsyp_v3_pool）
 └── datasets/raw/BZNSYP.tar.bz2    # 原始压缩包（2.35GB，已验证完整）
 runs/E3_chunk_attn_C4_L8_*_a4_fL2/previews/           # E3 训练全程试听（step_1500→15000）
+```
+
+---
+
+## 7. 全代码深度审计与 `a5` 路线收敛（2026-11-24 已落地）
+
+在启动 `full_quality` 长跑前，对 `a4` 全链路进行了系统性代码与物理审计，确认除步数预算外还存在 **5 项结构性瓶颈与实锤 Bug**，已全部在 `a5` 版本修复并**正式锁定唯一默认路线 `E3_chunk_attn_C4_L8`**（`E0/E1/E2/E4` 对照类归档保留）：
+
+1. **修复声码器电音的真正物理根因（`SpecDisc` 轴向颠倒 + 稳态元音相位漂移 + 原始 Mel 补零爆炸）**：
+   - 旧版 `SpecDisc` 对 `torch.stft` 输出 `(B, F, T)` 未做 `.transpose(1, 2)` 就送入 `Conv2d((3, 9), stride=(1, 2))`，导致频率轴感受野仅 **11 个 bin（129 Hz）**，连标贝女声（`F0=237 Hz`）的两条相邻谐波都无法同时看到；现已转置为 `(B, 1, T, F)` 幂律压缩谱（73-bin 谐波感受野），并补齐 `PeriodDisc(11)`。
+   - 新增帧率包裹相位谐波振荡器 `CausalHarmonicSource`（`float64` $\phi_0 \bmod 1$ 积分 + 12 阶谐波正余弦注入）与内置 `mel_mean/mel_std` 归一化，根治稳态元音 STFT 相位漂移电音与首尾补 `0.0` 能量脉冲（流式↔离线误差 `3.4e-6`）。
+2. **打通「声学 → GTA 预测谱 → 声码器」闭环精调**：
+   - 训练顺序调整为先训 `E3` 声学模型，自动导出与真声波形逐样本对齐的 **GTA 预测 Mel**，在声码器 Stage 2 按 50% 比例混合真声 Mel 与 GTA Mel 对抗精调，消除开环拼接失配。
+3. **完备中英音系与韵律前端（`v3`）**：
+   - 区分 `i / ii / iii`、补齐 `yan->ian / iou / uei / uen / ve` 省写还原（20,901 个 CJK 汉字 `0 <unk>`）、显式建模 `zh_er_coda` 儿化韵尾、“一/不/叠字”与双音节韵律步三声变调；逐字符解析标贝儿化句保留 100% 句中逗号停顿与 `#1–#3` 韵律边界，用 `boundary_ids` 替代抢占连读辅音帧的词间 `<sp>`。
+4. **声学 `F0+UV` 浊音感知建模 + 2D 共振峰结构损失 + 时长梯度隔离**：
+   - 联合预测 `(f0, uv_logit)`，仅在浊音帧计算 `loss_f0` 并将清音帧基频嵌入置零；新增频率轴共振峰差分 + 时间轴瞬态差分损失；对 `dur_predictor` 输入施加 `0.1x` Stop-Gradient 缩放并平滑软硬对齐退火。
+5. **真 $O(1)$ 超长流式局部相对 RoPE + 首包 6 帧动态低延迟调度**：
+   - `ChunkLookaheadLayer` 缓存未旋转 K 并在 `[0 .. W+M)` 局部窗口施加相对 RoPE（实测 `T=605` 连续流式表容量恒定 128、误差 `1.19e-6`）；流式声码器首包 6 帧（64 ms）即刻出声、稳态 16 帧保吞吐；修复综合评分截断失真与剥离 `aligner` 后的端到端 INT8 体积/误差校验。
+
+### `a5` 推荐执行命令（RTX 4090）
+
+```bash
+python scripts/aethertts_phase1.py --selftest --skip-pip
+python scripts/aethertts_phase1.py --profile full_quality --dataset bznsyp --batch-size 64 --root ./aethertts_exp --skip-pip
 ```

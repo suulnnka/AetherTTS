@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-从 notebooks/AetherTTS_Colab_Phase1_Experiment.ipynb 确定性生成独立 Python 运行器
-scripts/aethertts_phase1.py，保证 Notebook 与独立脚本永远保持单一真相源、零架构漂移。
+从 notebooks/AetherTTS_Colab_Phase1_Experiment.ipynb 确定性生成：
+  1. scripts/aethertts_lib.py    — 无副作用纯定义库（前端 / DSP / ChunkAttn 主干 / Aligner / 声学模型 / 谐波源因果声码器），供诊断与推理直接 import
+  2. scripts/aethertts_phase1.py — 独立 Python CLI 训练与评测运行器（无需 Notebook / 无 exec-cell）
+
+保证 Notebook、独立训练脚本与诊断工具永远保持单一真相源、零架构漂移。
 
 用法：
-    python scripts/sync_phase1_script.py          # 重新生成 scripts/aethertts_phase1.py
+    python scripts/sync_phase1_script.py          # 重新生成 scripts/aethertts_lib.py 与 scripts/aethertts_phase1.py
     python scripts/sync_phase1_script.py --check  # 仅校验是否已同步，不同步时以非零退出
 """
 import argparse
@@ -15,38 +18,92 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 NB_PATH = REPO_ROOT / "notebooks" / "AetherTTS_Colab_Phase1_Experiment.ipynb"
 OUT_PATH = REPO_ROOT / "scripts" / "aethertts_phase1.py"
+LIB_PATH = REPO_ROOT / "scripts" / "aethertts_lib.py"
+
+LIB_HEADER = '''#!/usr/bin/env python3
+"""
+AetherTTS Phase 1 (a5) — 纯模型与前端基础设施定义库（import 零副作用）。
+
+由 scripts/sync_phase1_script.py 从 notebooks/AetherTTS_Colab_Phase1_Experiment.ipynb
+的 Cell 3 与 Cell 5 确定性生成（请勿手改本文件，修改 Notebook 后运行 sync_phase1_script.py 即可同步）。
+"""
+import json
+import math
+import os
+import random
+import shutil
+import signal
+import sys
+import tarfile
+import time
+import warnings
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import torch
+
+ENV_MODE = os.environ.get("AETHER_ENV_MODE", "local")
+IS_COLAB = (ENV_MODE == "colab")
+IS_LOCAL = (ENV_MODE == "local")
+IS_KAGGLE = (ENV_MODE == "kaggle")
+STORAGE_ROOT = Path(os.environ.get("AETHER_ROOT", "./aethertts_exp")).expanduser().resolve()
+LOCAL_WORK = STORAGE_ROOT
+DRIVE_ROOT = STORAGE_ROOT
+CFG = {
+    "seed": 42,
+    "sample_rate": 24000,
+    "n_fft": 1024,
+    "hop_length": 256,
+    "win_length": 1024,
+    "n_mels": 100,
+    "min_audio_sec": 0.8,
+    "max_audio_sec": 12.0,
+    "d_model": 256,
+    "k_left": 3,
+    "swa_window": 48,
+    "chunk_attn_size": 4,
+    "stream_text_chunk": 4,
+    "stream_mel_first_chunk": 6,
+    "stream_mel_chunk": 16,
+    "frame_lookahead": int(os.environ.get("AETHER_FRAME_LOOKAHEAD", "2")),
+    "vocoder_lookahead": int(os.environ.get("AETHER_VOCODER_LOOKAHEAD", "2")),
+    "profile": os.environ.get("AETHER_PROFILE", "standard_phase1"),
+    "dataset_source": os.environ.get("AETHER_DATASET", "bznsyp"),
+}
+'''
 
 HEADER = '''#!/usr/bin/env python3
 """
-AetherTTS Phase 1 — 独立 Python 运行器（无需 Notebook / 无 exec-cell）。
+AetherTTS Phase 1 (a5) — 独立 Python 运行器（无需 Notebook / 无 exec-cell）。
 
 由 scripts/sync_phase1_script.py 从 notebooks/AetherTTS_Colab_Phase1_Experiment.ipynb
 确定性 1:1 生成（请勿手改本文件，修改 Notebook 后运行 sync_phase1_script.py 即可同步）。
 
-与 Notebook / scripts/run_phase1_local.py 共享同一套 a4 流式输入架构代码（含 E0 离线、E1 L0/L8、
-E2 SWA、E3 5 层深双向分块前瞻 ChunkLookaheadBackbone、E4 标准门控 DeltaNet、音素内多尺度相位、
-帧解码器 2 帧前瞻、声码器 2 帧前瞻及批向量化 Beta-Binomial/Viterbi 对齐），可随时无缝互相续训。
+默认聚焦唯一主力路线 E3_chunk_attn_C4_L8（5 层深双向分块前瞻 ChunkLookaheadBackbone + 局部窗口相对 RoPE +
+音素边界与完备中英音系前端 + 浊音感知 F0/UV + 2D 共振峰结构损失 + 声学->声码器 GTA 闭环精调 + 帧率谐波源 CausalVocosLite），
+同时保留 E0/E1/E2/E4 代码供归档对照（可通过 --models 显式指定）。
 
 用法：
-    python scripts/aethertts_phase1.py --profile standard_phase1 --dataset bznsyp --root ./aethertts_exp
-    python scripts/aethertts_phase1.py --selftest          # 验证向量化对齐逐位等价 + 流式/零前瞻膨胀/梯度门禁
+    python scripts/aethertts_phase1.py --profile full_quality --dataset bznsyp --root ./aethertts_exp
+    python scripts/aethertts_phase1.py --selftest          # 验证前端零 UNK + 向量化对齐 + 长流式局部 RoPE + 声码器谐波源流式等价门禁
     python scripts/aethertts_phase1.py --profile-steps 20  # 打印单步训练耗时分解后退出
 """
 import argparse
 
-_AP = argparse.ArgumentParser(description="AetherTTS Phase 1 standalone runner (synced from notebook).")
+_AP = argparse.ArgumentParser(description="AetherTTS Phase 1 (a5) standalone runner (synced from notebook).")
 _AP.add_argument("--root", default="./aethertts_exp", help="Local directory for datasets, checkpoints, samples, reports.")
 _AP.add_argument("--profile", default="standard_phase1", choices=["quick_smoke", "standard_phase1", "full_quality"])
 _AP.add_argument("--dataset", default="bznsyp", choices=["bznsyp", "ljspeech", "custom_bilingual"])
 _AP.add_argument("--vocoder", default="both", choices=["both", "pretrained_vocos", "causal_vocos_lite"])
-_AP.add_argument("--models", default="", help="Optional comma-separated subset, e.g. E1_conv_unigru_L8,E3_chunk_attn_C4_L8,E4_gated_deltanet_L8")
+_AP.add_argument("--models", default="", help="Optional comma-separated model override (default: only E3_chunk_attn_C4_L8).")
 _AP.add_argument("--frame-lookahead", type=int, default=None, help="声学 frame_decoder 首层集中式右前瞻帧数（默认 2 帧；0 表示关闭）.")
 _AP.add_argument("--vocoder-lookahead", type=int, default=None, help="CausalVocosLite 集中式右前瞻帧数（默认 2 帧；0 表示关闭前瞻）.")
 _AP.add_argument("--batch-size", type=int, default=None, help="可选覆写声学训练 batch_size（如 RTX 4090 覆写为 64）.")
+_AP.add_argument("--gta-prob", type=float, default=None, help="声码器 Stage 2 混入声学 GTA 预测 Mel 的概率（默认 0.5；0 表示关闭）.")
 _AP.add_argument("--backup-steps", type=int, default=1000)
 _AP.add_argument("--backup-minutes", type=float, default=8.0)
 _AP.add_argument("--skip-pip", action="store_true")
-_AP.add_argument("--selftest", action="store_true", help="Run aligner bit-equality + streaming/zero-explosion/gradient gates, then exit.")
+_AP.add_argument("--selftest", action="store_true", help="Run frontend/aligner/long-streaming/vocoder gates, then exit.")
 _AP.add_argument("--profile-steps", type=int, default=0, help="If >0, time N training steps component-wise, print breakdown, then exit.")
 _ARGS = _AP.parse_args()
 
@@ -67,6 +124,8 @@ if _ARGS.vocoder_lookahead is not None:
     _os.environ["AETHER_VOCODER_LOOKAHEAD"] = str(_ARGS.vocoder_lookahead)
 if _ARGS.batch_size is not None:
     _os.environ["AETHER_BATCH_SIZE"] = str(_ARGS.batch_size)
+if _ARGS.gta_prob is not None:
+    _os.environ["AETHER_GTA_PROB"] = str(_ARGS.gta_prob)
 if _ARGS.skip_pip:
     _os.environ["AETHER_SKIP_PIP"] = "1"
 SELFTEST = _ARGS.selftest
@@ -119,7 +178,7 @@ if SELFTEST:
 
 SELFTEST_EXIT_BLOCK = '''
 if SELFTEST:
-    print("[SelfTest] 架构、零前瞻膨胀、多块流式等价与强遗忘梯度门禁全部通过，退出 --selftest 模式。")
+    print("[SelfTest] 前端音系、长流式局部 RoPE、零前瞻膨胀、谐波源因果声码器及保留主干门禁全部通过，退出 --selftest 模式。")
     import sys as _sys
     _sys.exit(0)
 '''
@@ -143,21 +202,21 @@ def _run_step_profile():
         frame_lookahead=CFG["frame_lookahead"],
     ).to(DEVICE).train()
     opt = torch.optim.AdamW(model.parameters(), lr=CFG["lr_acoustic"])
-    pids_all, lids_all, tl_all, mels_all, f0_all, e_all, ml_all = next(iter(train_loader))
+    pids_all, lids_all, bids_all, tl_all, mels_all, f0_all, e_all, uv_all, ml_all = next(iter(train_loader))
     acc, n_warm = {}, 2
     for it in range(PROFILE_STEPS + n_warm):
         if it == n_warm:
             acc = {}
         t0 = time.perf_counter()
-        pids, lids, t_lens = pids_all.to(DEVICE), lids_all.to(DEVICE), tl_all.to(DEVICE)
-        mels, f0s, es, m_lens = mels_all.to(DEVICE), f0_all.to(DEVICE), e_all.to(DEVICE), ml_all.to(DEVICE)
+        pids, lids, bids, t_lens = pids_all.to(DEVICE), lids_all.to(DEVICE), bids_all.to(DEVICE), tl_all.to(DEVICE)
+        mels, f0s, es, uvs, m_lens = mels_all.to(DEVICE), f0_all.to(DEVICE), e_all.to(DEVICE), uv_all.to(DEVICE), ml_all.to(DEVICE)
         if DEVICE.type == "cuda":
             torch.cuda.synchronize()
         _acc_store(acc, "h2d", time.perf_counter() - t0)
         opt.zero_grad(set_to_none=True)
         tf0 = time.perf_counter()
         with torch.amp.autocast("cuda", dtype=AMP_DTYPE, enabled=(DEVICE.type == "cuda")):
-            out = model.forward_train(pids, lids, t_lens, mels, f0s, es, m_lens, step_ratio=0.5)
+            out = model.forward_train(pids, lids, t_lens, mels, f0s, es, m_lens, step_ratio=0.5, boundary_ids=bids, uv_gt=uvs)
             loss = out["loss"]
         if DEVICE.type == "cuda":
             torch.cuda.synchronize()
@@ -176,7 +235,7 @@ def _run_step_profile():
         print(f"  {k:12s}: {acc[k] / n * 1000:8.1f} ms")
     if bb_type == "chunk_attn":
         text_mask = torch.arange(pids.shape[1], device=pids.device)[None, :] < t_lens[:, None]
-        x_in = model.embed_text(pids, lids, text_mask).detach()
+        x_in = model.embed_text(pids, lids, text_mask, boundary_ids=bids).detach()
         def _bench_bb(fn, runs=5):
             for _ in range(2):
                 with torch.amp.autocast("cuda", dtype=AMP_DTYPE, enabled=(DEVICE.type == "cuda")):
@@ -198,9 +257,10 @@ def _run_step_profile():
         print(f"  {'bb(seq_ref)':14s}: {ms_seq:8.1f} ms  (fwd+bwd) -> backbone 提速 {ms_seq / max(ms_par, 1e-6):.2f}x")
     with torch.no_grad():
         text_mask = torch.arange(pids.shape[1], device=pids.device)[None, :] < t_lens[:, None]
-        x_emb = model.embed_text(pids, lids, text_mask)
+        mel_mask = torch.arange(mels.shape[-1], device=pids.device)[None, :] < m_lens[:, None]
+        x_emb = model.embed_text(pids, lids, text_mask, boundary_ids=bids)
         prior = build_beta_binomial_log_prior(t_lens, m_lens, pids.shape[1], mels.shape[-1])
-        attn_logprob, _ = model.aligner(mels, x_emb, text_mask, attn_log_prior=prior)
+        attn_logprob, _ = model.aligner(mels, x_emb, text_mask, attn_log_prior=prior, mel_mask=mel_mask)
         for tag, fn in (("viterbi(fast)", viterbi_monotonic_alignment), ("viterbi(ref)", viterbi_monotonic_alignment_ref),
                         ("prior(fast)", lambda a, b, c, d: build_beta_binomial_log_prior(a, b, c, d)),
                         ("prior(ref)", lambda a, b, c, d: build_beta_binomial_log_prior_ref(a, b, c, d))):
@@ -215,27 +275,60 @@ def _run_step_profile():
 _run_step_profile()
 '''
 
-# 单元重排：把 Cell 5 (模型) 和 Cell 6 (门禁) 提前到 Cell 4 (数据下载) 之前，使 --selftest 无需下载数据
+# 单元重排：
+# 1) 把 Cell 5 (模型) 和 Cell 6 (门禁) 提前到 Cell 4 (数据下载) 之前，使 --selftest 无需下载数据；
+# 2) 先跑 Cell 8 (声学模型 E3 训练)，再跑 Cell 9 (导出 GTA Mel + 因果谐波源声码器闭环训练)！
 CELL_PLAN = [
     ("cc414d72", "Cell 1: 环境识别与全局配置"),
     ("328dae20", "Cell 2: 依赖安装"),
-    ("609ce47a", "Cell 3: 基础设施（Mel/F0/前端）"),
-    ("da9fbbaa", "Cell 5: 核心模型（E0-E4 流式输入主干 + 向量化对齐 + 有限前瞻帧解码器/声码器）"),
-    ("7f900006", "Cell 6: 训练前硬门禁（零前瞻膨胀 + 多块流式等价 + 强遗忘梯度校验）"),
-    ("439d2250", "Cell 4: 数据下载与预处理"),
+    ("609ce47a", "Cell 3: 基础设施（Mel/F0+UV/中英音系与韵律前端）"),
+    ("da9fbbaa", "Cell 5: 核心模型（ChunkLookaheadBackbone 主力 + 保留主干 + 浊音感知声学模型 + 谐波源因果声码器）"),
+    ("7f900006", "Cell 6: 训练前硬门禁（前端音系 + 长流式局部 RoPE + 零前瞻膨胀 + 声码器流式等价）"),
+    ("439d2250", "Cell 4: 数据下载与 v3 预处理"),
     ("09610ad7", "Cell 7: DataLoader"),
-    ("2df0111e", "Cell 8: 声码器训练"),
-    ("1f7a318d", "Cell 9: 声学主干训练"),
-    ("86b0212b", "Cell 10: 评测音频合成"),
-    ("9b7913a1", "Cell 11: 自动打分与 CPU 基准"),
-    ("65e43d36", "Cell 12: 可视化与盲听表"),
+    ("1f7a318d", "Cell 8: 声学主干训练（默认唯一主力 E3_chunk_attn_C4_L8）"),
+    ("2df0111e", "Cell 9: GTA 预测谱导出与谐波源因果声码器闭环训练"),
+    ("86b0212b", "Cell 10: 评测音频合成（含动态低延迟首包流式调度）"),
+    ("9b7913a1", "Cell 11: 自动打分、全链路 INT8 校验与 CPU 基准"),
+    ("65e43d36", "Cell 12: 可视化与试听打分表"),
     ("41ac40af", "Cell 13: 可选教师造数（默认跳过）"),
 ]
 
+LIB_CELLS = [
+    ("609ce47a", "Cell 3: 基础设施（Mel/F0+UV/中英音系与韵律前端）"),
+    ("da9fbbaa", "Cell 5: 核心模型（ChunkLookaheadBackbone 主力 + 保留主干 + 浊音感知声学模型 + 谐波源因果声码器）"),
+]
+
+
+def _load_nb_cells() -> dict:
+    nb = json.loads(NB_PATH.read_text(encoding="utf-8"))
+    return {c.get("id"): "".join(c.get("source", [])) for c in nb["cells"] if c["cell_type"] == "code"}
+
+
+def render_lib() -> str:
+    by_id = _load_nb_cells()
+    parts = [LIB_HEADER.rstrip("\n")]
+    for cid, title in LIB_CELLS:
+        if cid not in by_id:
+            raise KeyError(f"Notebook missing expected code cell id={cid!r} ({title})")
+        code = by_id[cid].rstrip("\n")
+        # 库模块被 import 时静默初始化，不打印前端演示日志
+        code = code.replace(
+            'if True:  # FRONTEND_DEMO_PRINT',
+            'if __name__ == "__main__":  # FRONTEND_DEMO_PRINT',
+        )
+        banner = (
+            "\n\n# " + "#" * 77 + "\n"
+            f"# {title}\n"
+            "# " + "#" * 77 + "\n"
+        )
+        parts.append(banner + code)
+    parts.append("\n")
+    return "".join(parts)
+
 
 def render_script() -> str:
-    nb = json.loads(NB_PATH.read_text(encoding="utf-8"))
-    by_id = {c.get("id"): "".join(c.get("source", [])) for c in nb["cells"] if c["cell_type"] == "code"}
+    by_id = _load_nb_cells()
     parts = [HEADER.rstrip("\n")]
     for cid, title in CELL_PLAN:
         if cid not in by_id:
@@ -264,18 +357,28 @@ def render_script() -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--check", action="store_true", help="Exit non-zero if scripts/aethertts_phase1.py is out of sync.")
+    ap.add_argument("--check", action="store_true", help="Exit non-zero if generated scripts are out of sync.")
     args = ap.parse_args()
-    rendered = render_script()
+    rendered_script = render_script()
+    rendered_lib = render_lib()
     if args.check:
-        current = OUT_PATH.read_text(encoding="utf-8") if OUT_PATH.exists() else ""
-        if current != rendered:
-            print(f"[OUT OF SYNC] {OUT_PATH} differs from {NB_PATH}. Run: python scripts/sync_phase1_script.py", file=sys.stderr)
+        cur_script = OUT_PATH.read_text(encoding="utf-8") if OUT_PATH.exists() else ""
+        cur_lib = LIB_PATH.read_text(encoding="utf-8") if LIB_PATH.exists() else ""
+        if cur_script != rendered_script or cur_lib != rendered_lib:
+            print(
+                f"[OUT OF SYNC] {OUT_PATH.name} or {LIB_PATH.name} differs from {NB_PATH.name}. "
+                f"Run: python scripts/sync_phase1_script.py",
+                file=sys.stderr,
+            )
             sys.exit(1)
-        print(f"[OK] {OUT_PATH} is 100% in sync with {NB_PATH}.")
+        print(f"[OK] {OUT_PATH.name} and {LIB_PATH.name} are 100% in sync with {NB_PATH.name}.")
         return
-    OUT_PATH.write_text(rendered, encoding="utf-8")
-    print(f"[Synced] Generated {OUT_PATH} ({len(rendered.splitlines())} lines) from {NB_PATH}.")
+    LIB_PATH.write_text(rendered_lib, encoding="utf-8")
+    OUT_PATH.write_text(rendered_script, encoding="utf-8")
+    print(
+        f"[Synced] Generated {LIB_PATH.name} ({len(rendered_lib.splitlines())} lines) and "
+        f"{OUT_PATH.name} ({len(rendered_script.splitlines())} lines) from {NB_PATH.name}."
+    )
 
 
 if __name__ == "__main__":

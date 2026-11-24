@@ -22,10 +22,11 @@ def parse_args():
     p.add_argument("--profile", default="standard_phase1", choices=["quick_smoke", "standard_phase1", "full_quality"], help="Experiment duration/data budget profile.")
     p.add_argument("--dataset", default="bznsyp", choices=["bznsyp", "ljspeech", "custom_bilingual"], help="Training dataset source.")
     p.add_argument("--vocoder", default="both", choices=["both", "pretrained_vocos", "causal_vocos_lite"], help="Vocoder mode.")
-    p.add_argument("--models", default="", help="Optional comma-separated subset of models, e.g. E1_conv_unigru_L8,E3_chunk_attn_C4_L8,E4_gated_deltanet_L8")
+    p.add_argument("--models", default="", help="Optional comma-separated model override (default: only E3_chunk_attn_C4_L8).")
     p.add_argument("--frame-lookahead", type=int, default=None, help="声学 frame_decoder 首层集中式右前瞻帧数（默认沿用 Notebook 内的 2 帧；0 表示关闭）.")
     p.add_argument("--vocoder-lookahead", type=int, default=None, help="CausalVocosLite 集中式右前瞻帧数（默认沿用 Notebook 内的 2 帧；0 表示关闭前瞻）.")
     p.add_argument("--batch-size", type=int, default=None, help="可选覆写声学训练 batch_size（如 RTX 4090 覆写为 64）.")
+    p.add_argument("--gta-prob", type=float, default=None, help="声码器 Stage 2 混入声学 GTA 预测 Mel 的概率（默认 0.5；0 表示关闭）.")
     p.add_argument("--backup-steps", type=int, default=1000, help="Save resumable latest.pt every N acoustic steps (default: 1000).")
     p.add_argument("--backup-minutes", type=float, default=8.0, help="Also force-save latest.pt every M minutes (default: 8.0).")
     p.add_argument("--skip-pip", action="store_true", help="Skip automatic pip install of missing dependencies.")
@@ -54,6 +55,8 @@ def main():
         os.environ["AETHER_VOCODER_LOOKAHEAD"] = str(args.vocoder_lookahead)
     if args.batch_size is not None:
         os.environ["AETHER_BATCH_SIZE"] = str(args.batch_size)
+    if args.gta_prob is not None:
+        os.environ["AETHER_GTA_PROB"] = str(args.gta_prob)
     if args.skip_pip:
         os.environ["AETHER_SKIP_PIP"] = "1"
 
