@@ -2,33 +2,32 @@
 """
 AetherTTS Phase 1 — 独立 Python 运行器（无需 Notebook / 无 exec-cell）。
 
-从 notebooks/AetherTTS_Colab_Phase1_Experiment.ipynb 1:1 移植，并针对自建 4090 上的
-CPU 瓶颈做了两处「逐位等价」的热路径向量化（消除逐样本 Python 循环）：
+由 scripts/sync_phase1_script.py 从 notebooks/AetherTTS_Colab_Phase1_Experiment.ipynb
+确定性 1:1 生成（请勿手改本文件，修改 Notebook 后运行 sync_phase1_script.py 即可同步）。
 
-  1. viterbi_monotonic_alignment      批向量化单调 Viterbi（参考实现保留为 *_ref）
-  2. build_beta_binomial_log_prior    批向量化 Beta-Binomial 对角先验（参考实现保留为 *_ref）
-
-两者与 notebook 参考实现逐位一致（--selftest 可随时验证），因此 checkpoint、目录结构与
-scripts/run_phase1_local.py 完全兼容：notebook 跑到一半的断点可以直接用本脚本精确续训，
-反之亦然。
+与 Notebook / scripts/run_phase1_local.py 共享同一套 a4 流式输入架构代码（含 E0 离线、E1 L0/L8、
+E2 SWA、E3 5 层深双向分块前瞻 ChunkLookaheadBackbone、E4 标准门控 DeltaNet、音素内多尺度相位、
+帧解码器 2 帧前瞻、声码器 2 帧前瞻及批向量化 Beta-Binomial/Viterbi 对齐），可随时无缝互相续训。
 
 用法：
     python scripts/aethertts_phase1.py --profile standard_phase1 --dataset bznsyp --root ./aethertts_exp
-    python scripts/aethertts_phase1.py --selftest          # 验证向量化与参考实现逐位等价 + 架构门禁
+    python scripts/aethertts_phase1.py --selftest          # 验证向量化对齐逐位等价 + 流式/零前瞻膨胀/梯度门禁
     python scripts/aethertts_phase1.py --profile-steps 20  # 打印单步训练耗时分解后退出
 """
 import argparse
 
-_AP = argparse.ArgumentParser(description="AetherTTS Phase 1 standalone runner (no notebook).")
+_AP = argparse.ArgumentParser(description="AetherTTS Phase 1 standalone runner (synced from notebook).")
 _AP.add_argument("--root", default="./aethertts_exp", help="Local directory for datasets, checkpoints, samples, reports.")
 _AP.add_argument("--profile", default="standard_phase1", choices=["quick_smoke", "standard_phase1", "full_quality"])
 _AP.add_argument("--dataset", default="bznsyp", choices=["bznsyp", "ljspeech", "custom_bilingual"])
 _AP.add_argument("--vocoder", default="both", choices=["both", "pretrained_vocos", "causal_vocos_lite"])
-_AP.add_argument("--models", default="", help="Optional comma-separated subset, e.g. E1_conv_unigru_L4,E2_swa_L4")
+_AP.add_argument("--models", default="", help="Optional comma-separated subset, e.g. E1_conv_unigru_L8,E3_chunk_attn_C4_L8,E4_gated_deltanet_L8")
+_AP.add_argument("--frame-lookahead", type=int, default=None, help="声学 frame_decoder 首层集中式右前瞻帧数（默认 2 帧；0 表示关闭）.")
+_AP.add_argument("--vocoder-lookahead", type=int, default=None, help="CausalVocosLite 集中式右前瞻帧数（默认 2 帧；0 表示关闭前瞻）.")
 _AP.add_argument("--backup-steps", type=int, default=1000)
 _AP.add_argument("--backup-minutes", type=float, default=8.0)
 _AP.add_argument("--skip-pip", action="store_true")
-_AP.add_argument("--selftest", action="store_true", help="Run bit-equality selftest of vectorized hot paths + architecture gates, then exit.")
+_AP.add_argument("--selftest", action="store_true", help="Run aligner bit-equality + streaming/zero-explosion/gradient gates, then exit.")
 _AP.add_argument("--profile-steps", type=int, default=0, help="If >0, time N training steps component-wise, print breakdown, then exit.")
 _ARGS = _AP.parse_args()
 
@@ -43,11 +42,14 @@ _os.environ["AETHER_BACKUP_STEPS"] = str(_ARGS.backup_steps)
 _os.environ["AETHER_BACKUP_MINUTES"] = str(_ARGS.backup_minutes)
 if _ARGS.models:
     _os.environ["AETHER_MODELS"] = _ARGS.models
+if _ARGS.frame_lookahead is not None:
+    _os.environ["AETHER_FRAME_LOOKAHEAD"] = str(_ARGS.frame_lookahead)
+if _ARGS.vocoder_lookahead is not None:
+    _os.environ["AETHER_VOCODER_LOOKAHEAD"] = str(_ARGS.vocoder_lookahead)
 if _ARGS.skip_pip:
     _os.environ["AETHER_SKIP_PIP"] = "1"
 SELFTEST = _ARGS.selftest
 PROFILE_STEPS = _ARGS.profile_steps
-
 
 # #############################################################################
 # Cell 1: 环境识别与全局配置
@@ -134,11 +136,12 @@ VOCODER_MODE = os.environ.get("AETHER_VOCODER", "both")
 
 # 要训练和评测的模型列表：(实验名, 主干类型, 文本右前瞻音素数 L)
 ALL_EXPERIMENTS = [
-    ("E0_offline_bitransformer", "offline_transformer", 0),
-    ("E1_conv_unigru_L4",        "conv_gru",            4),
-    ("E2_swa_L4",                "swa",                 4),
-    ("E3_ssm_mamba_L4",          "ssm",                 4),
-    ("E4_rwkv_L4",               "rwkv",                4),
+    ("E0_offline_bitransformer", "offline_transformer", 0),  # 离线全双向 Transformer（理论音质天花板）
+    ("E1_conv_unigru_L0",        "conv_gru",            0),  # 0 前瞻严格因果基线（测无右前瞻下界）
+    ("E1_conv_unigru_L8",        "conv_gru",            8),  # 极简端侧基线 + 8 音素（~4 汉字）浅前瞻（对比 L=0 测前瞻净收益）
+    ("E2_swa_L8",                "swa",                 8),  # 1 层 8 音素浅前瞻 + 滑窗 SWA (W=48)（与 E3 同预算浅前瞻对照）
+    ("E3_chunk_attn_C4_L8",      "chunk_attn",          8),  # 主力冲冠：5 层深双向分块前瞻 (C=4, L=8, W=48，丢弃前瞻 KV 零膨胀)
+    ("E4_gated_deltanet_L8",     "gdn",                 8),  # O(1) 状态族独苗：8 音素浅前瞻 + 标准门控 DeltaNet
 ]
 _filter_models = os.environ.get("AETHER_MODELS", "").strip()
 if _filter_models:
@@ -146,6 +149,10 @@ if _filter_models:
     EXPERIMENTS = [e for e in ALL_EXPERIMENTS if e[0] in _wanted]
 else:
     EXPERIMENTS = ALL_EXPERIMENTS
+
+# 架构版本号：模型结构一旦变更就递增，并写入声码器 / 声学模型 / 评测音频 / 报告 / INT8 的全部产物目录名，
+# 防止新代码静默续训或加载旧架构的 checkpoint（旧目录原样保留，可做修复前后对比）
+ARCH_TAG = "a4"
 
 # 断点续训与高频备份策略（支持环境变量覆写）
 SKIP_IF_DONE = True                                                        # 仅当存在 .done 完结标记时才跳过；未完结则自动从 latest.pt 精确续训
@@ -204,7 +211,8 @@ CFG = {
     "d_model": 256,
     "k_left": 3,
     "swa_window": 48,
-    "stream_text_chunk": 3,
+    "chunk_attn_size": 4,       # E3 分块深前瞻注意力每次提交的音素数 C（≈ 2 汉字）
+    "stream_text_chunk": 4,     # 流式评测/测速默认每次喂入 4 音素（≈ 2 汉字，与 C=4 对齐）
     "stream_mel_chunk": 16,
     "lr_acoustic": 4e-4,
     "lr_vocoder": 2e-4,
@@ -213,8 +221,18 @@ CFG = {
     "dataset_source": DATASET_SOURCE,
     "vocoder_mode": VOCODER_MODE,
     "num_workers": NUM_WORKERS,
+    # 帧级解码器首层集中式右前瞻帧数（默认 2 帧 ≈ 21 ms，补齐元音->辅音协同发音过渡；0 表示关闭）
+    "frame_lookahead": int(os.environ.get("AETHER_FRAME_LOOKAHEAD", "2")),
+    # 声码器集中式右前瞻帧数（仅 embed 层看右边，其余层严格因果）。iSTFT 每帧合成窗以当前帧为中心，
+    # 右半窗 512 采样点正好是 2 帧；零前瞻等于让网络凭过去的 mel 预测未来半个窗
+    "vocoder_lookahead": int(os.environ.get("AETHER_VOCODER_LOOKAHEAD", "2")),
     **PROFILE_PRESETS[EXPERIMENT_PROFILE],
 }
+
+# 所有产物目录共用的后缀（数据集_档位_架构版本；声学与评测额外区分 frame/vocoder 前瞻消融）
+CFG["run_suffix"] = f"{CFG['dataset_source']}_{CFG['profile']}_{ARCH_TAG}"
+CFG["acoustic_suffix"] = f"{CFG['run_suffix']}_fL{CFG['frame_lookahead']}"
+CFG["eval_suffix"] = f"{CFG['acoustic_suffix']}_vL{CFG['vocoder_lookahead']}"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 AMP_DTYPE = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
@@ -229,6 +247,7 @@ if os.environ.get("HF_ENDPOINT"):
     print(f"HF Endpoint   : {os.environ['HF_ENDPOINT']}")
 print(f"Profile       : {EXPERIMENT_PROFILE} | max_train_hours={CFG['max_train_hours']}h | batch={CFG['batch_size']} | steps={CFG['acoustic_steps']}")
 print(f"Backup Cadence: every {BACKUP_EVERY_STEPS} steps or {BACKUP_EVERY_MINUTES:.1f} min (+ milestone every {SAVE_MILESTONE_EVERY} steps + SIGTERM/Ctrl+C emergency save)")
+print(f"Arch / LA     : {ARCH_TAG} | chunk_C={CFG['chunk_attn_size']} | frame_LA={CFG['frame_lookahead']}f | vocoder_LA={CFG['vocoder_lookahead']}f")
 print(f"Models        : {[x[0] for x in EXPERIMENTS]}")
 print("=" * 72)
 
@@ -731,7 +750,7 @@ for demo in ["你好，请问今天北京的天气怎么样？", "Hello world, h
     print(f"  {demo} -> {len(pids)} phonemes")
 
 # #############################################################################
-# Cell 5: 模型（含向量化对齐热路径）
+# Cell 5: 核心模型（E0-E4 流式输入主干 + 向量化对齐 + 有限前瞻帧解码器/声码器）
 # #############################################################################
 # ==============================================================================
 # 5.1 集中式有限右前瞻层 & 严格因果 ConvNeXt 块（100% 数值等价流式缓存）
@@ -796,6 +815,37 @@ class CausalConv1d(nn.Module):
         return out, new_state
 
 
+class LookaheadConv1d(nn.Module):
+    """k_left 步左上下文 + lookahead 步有限右前瞻的 Conv1d（集中式前瞻：只允许这一层看右边）。
+    流式时需攒够 lookahead 帧未来输入才吐出当前帧；is_final 时右侧补零，与离线 F.pad 逐样本等价。"""
+
+    def __init__(self, in_ch: int, out_ch: int, k_left: int, lookahead: int, groups: int = 1):
+        super().__init__()
+        self.k_left = k_left
+        self.lookahead = lookahead
+        self.kernel_size = k_left + 1 + lookahead
+        self.in_ch = in_ch
+        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size=self.kernel_size, groups=groups)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(F.pad(x, (self.k_left, self.lookahead)))
+
+    def init_state(self, batch_size: int, device, dtype):
+        # 初始只有 k_left 帧左上下文； lookahead 帧待处理输入是流式开始后才攒出来的，不能预先占位（否则开头多吐 lookahead 帧）
+        return torch.zeros(batch_size, self.in_ch, self.k_left, device=device, dtype=dtype)
+
+    def forward_step(self, x: torch.Tensor, state: torch.Tensor, is_final: bool = False):
+        buf = torch.cat([state, x], dim=-1) if x.shape[-1] > 0 else state
+        if is_final and self.lookahead > 0:
+            buf = F.pad(buf, (0, self.lookahead))
+        n_emit = buf.shape[-1] - self.kernel_size + 1
+        if n_emit <= 0:
+            return torch.zeros(buf.shape[0], self.conv.out_channels, 0, device=buf.device, dtype=buf.dtype), buf
+        keep_len = self.k_left + self.lookahead
+        new_state = buf[:, :, -keep_len:] if keep_len > 0 else buf[:, :, :0]
+        return self.conv(buf), new_state
+
+
 class CausalConvNeXtBlock(nn.Module):
     def __init__(self, d_model: int, kernel_size: int = 5, mult: int = 3):
         super().__init__()
@@ -821,7 +871,75 @@ class CausalConvNeXtBlock(nn.Module):
 
 
 # ==============================================================================
-# 5.2 五大序列主干（E0 离线双向 / E1 Conv+UniGRU / E2 SWA / E3 SSM / E4 RWKV）
+# 5.1b 门控 DeltaNet（E4）训练期 log 空间分块并行（与逐步递推数学等价；推理期走逐步递推）
+# ==============================================================================
+SCAN_CHUNK = 32  # 分块块长（音素步数）：块内全并行、块间只递推状态
+
+
+def pad_to_chunk(x: torch.Tensor, chunk: int = SCAN_CHUNK, value: float = 0.0) -> torch.Tensor:
+    """沿 dim=1（时间）右填充到 chunk 的整数倍；填充值须取对应递推的结合律单位元"""
+    pad = (-x.shape[1]) % chunk
+    return F.pad(x, (0, 0) * (x.dim() - 2) + (0, pad), value=value) if pad else x
+
+
+def unit_lower_tri_inverse(N: torch.Tensor) -> torch.Tensor:
+    """求 (I - N)^{-1}，N 为严格下三角（幂零）。S_m = Σ_{j<m} N^j，倍增 S_{2m} = S_m + N^m·S_m，共 ceil(log2(L)) 步全并行。"""
+    L = N.shape[-1]
+    P, A = N, torch.eye(L, device=N.device, dtype=N.dtype).expand_as(N)
+    for _ in range(max(1, math.ceil(math.log2(L)))):
+        A = A + P @ A
+        P = P @ P
+    return A
+
+
+def gated_delta_rule_chunkwise(q, k, v, beta, log_alpha, S_init, chunk: int = SCAN_CHUNK):
+    """标准门控 DeltaNet（Yang et al., ICLR 2025）的 log 空间分块并行形式，与 gated_delta_rule_recurrent 数学等价：
+        S_t = α_t (I - β_t k_t k_t^T) S_{t-1} + β_t k_t v_t^T = α_t S_{t-1} + β_t k_t (v_t - α_t S_{t-1}^T k_t)^T
+    记 log_G_t = Σ_{i<=t} log α_i <= 0，块内：
+        (I + T) W = R，  T_{n,i} = β_n exp(log_G_n - log_G_i)(k_n·k_i)  (i < n)，  R_n = β_n (v_n - G_n S_0^T k_n)
+        O = G ⊙ (Q S_0) + [tril(Q K^T ⊙ exp(log_G_n - log_G_i))] W，  S_L = G_L S_0 + K^T diag(exp(log_G_L - log_G)) W
+    全程在 log 空间先 mask 后 exp，彻底杜绝强遗忘下 G/G 的 0/0 与 inf*0 NaN。
+    入参布局：q,k (B,T,H,K)，v (B,T,H,V)，beta/log_alpha (B,T,H)；S (B,H,K,V)。"""
+    T = q.shape[1]
+    q, k, v, beta, log_alpha = (pad_to_chunk(t, chunk) for t in (q, k, v, beta, log_alpha))
+    S, ys = S_init, []
+    for s0 in range(0, q.shape[1], chunk):
+        qc, kc, vc = (t[:, s0:s0 + chunk].transpose(1, 2) for t in (q, k, v))                          # (B,H,L,K) / (B,H,L,V)
+        bc, la = beta[:, s0:s0 + chunk].transpose(1, 2), log_alpha[:, s0:s0 + chunk].transpose(1, 2)   # (B,H,L)
+        L = qc.shape[2]
+        tri = torch.ones(L, L, device=q.device, dtype=torch.bool)
+        strict_mask = torch.tril(tri, diagonal=-1)
+        causal_mask = torch.tril(tri)
+        log_G = torch.cumsum(la, dim=-1)                                                # (B,H,L) <= 0
+        G = log_G.exp()                                                                 # (B,H,L) ∈ (0, 1]
+        log_ratio = log_G[..., :, None] - log_G[..., None, :]                           # 下三角 <= 0
+        ratio_strict = torch.where(strict_mask, log_ratio, torch.zeros_like(log_ratio)).exp() * strict_mask
+        ratio_causal = torch.where(causal_mask, log_ratio, torch.zeros_like(log_ratio)).exp() * causal_mask
+        tail_ratio = (log_G[..., -1:] - log_G).exp()                                    # (B,H,L) <= 0 -> ∈ (0, 1]
+        T_mat = bc[..., None] * torch.einsum("bhik,bhjk->bhij", kc, kc) * ratio_strict
+        R = bc[..., None] * (vc - G[..., None] * torch.einsum("bhik,bhkv->bhiv", kc, S))
+        W = unit_lower_tri_inverse(-T_mat) @ R
+        y = G[..., None] * torch.einsum("bhik,bhkv->bhiv", qc, S) \
+            + (torch.einsum("bhik,bhjk->bhij", qc, kc) * ratio_causal) @ W
+        S = G[..., -1][..., None, None] * S + torch.einsum("bhik,bhi,bhiv->bhkv", kc, tail_ratio, W)
+        ys.append(y)
+    return torch.cat(ys, dim=2).transpose(1, 2)[:, :T], S
+
+
+def gated_delta_rule_recurrent(q, k, v, beta, log_alpha, S):
+    """标准门控 DeltaNet 逐步递推（流式推理 + 等价性参考）：
+        S_t = α_t S_{t-1} + β_t k_t (v_t - α_t S_{t-1}^T k_t)^T，  o_t = S_t^T q_t"""
+    ys = []
+    for t in range(q.shape[1]):
+        a, b = torch.exp(log_alpha[:, t])[..., None, None], beta[:, t][..., None, None]
+        S_dec = a * S
+        S = S_dec + b * torch.einsum("bhk,bhv->bhkv", k[:, t], v[:, t] - torch.einsum("bhk,bhkv->bhv", k[:, t], S_dec))
+        ys.append(torch.einsum("bhkv,bhk->bhv", S, q[:, t]))
+    return torch.stack(ys, dim=1), S
+
+
+# ==============================================================================
+# 5.2 五类序列主干（E0 离线双向 / E1 Conv+UniGRU / E2 SWA 浅前瞻 / E3 分块深前瞻注意力 / E4 门控 DeltaNet）
 # ==============================================================================
 def apply_rope(x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
     dh = x.shape[-1]
@@ -979,179 +1097,204 @@ class SWABackbone(nn.Module):
         return h, {"la": la_st, "layers": new_layers}
 
 
-class SelectiveSSMBlock(nn.Module):
-    def __init__(self, d_model: int = 256, expand: int = 2, d_state: int = 16, d_conv: int = 4):
+class ChunkLookaheadLayer(nn.Module):
+    """单层分块深前瞻注意力 + 因果 ConvNeXt：
+    在当前 [commit_chunk C + lookahead L] 窗口内做完整双向自注意力，同时因果读取长度 <= W 的历史 KV Cache；
+    算完仅提交前 commit_len 个 token 的 KV 与卷积缓存，彻底丢弃 lookahead token 的状态，保证多层堆叠零前瞻膨胀。"""
+
+    def __init__(self, d_model: int = 256, n_heads: int = 4, window_size: int = 48):
         super().__init__()
         self.d_model = d_model
-        self.d_inner = d_model * expand
-        self.d_state = d_state
-        self.dt_rank = max(16, d_model // 16)
-        self.norm = nn.LayerNorm(d_model)
-        self.in_proj = nn.Linear(d_model, self.d_inner * 2)
-        self.conv = CausalConv1d(self.d_inner, self.d_inner, kernel_size=d_conv, groups=self.d_inner)
-        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + 2 * d_state, bias=False)
-        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
-        A = torch.arange(1, d_state + 1, dtype=torch.float32).unsqueeze(0).repeat(self.d_inner, 1)
-        self.A_log = nn.Parameter(torch.log(A))
-        self.D_skip = nn.Parameter(torch.ones(self.d_inner))
-        self.out_proj = nn.Linear(self.d_inner, d_model)
-
-    def _scan(self, x_silu: torch.Tensor, h_init: torch.Tensor):
-        B_sz, T, _ = x_silu.shape
-        dt_raw, B_mat, C_mat = torch.split(self.x_proj(x_silu), [self.dt_rank, self.d_state, self.d_state], dim=-1)
-        dt = F.softplus(self.dt_proj(dt_raw)).float()
-        A = -torch.exp(self.A_log.float())
-        B_f, C_f, x_f = B_mat.float(), C_mat.float(), x_silu.float()
-        h = h_init.float()
-        ys = []
-        for t in range(T):
-            dt_t = dt[:, t, :].unsqueeze(-1)
-            dA_t = torch.exp(dt_t * A.unsqueeze(0))
-            dBx_t = (dt_t * x_f[:, t, :].unsqueeze(-1)) * B_f[:, t, :].unsqueeze(1)
-            h = dA_t * h + dBx_t
-            ys.append(torch.sum(h * C_f[:, t, :].unsqueeze(1), dim=-1) + self.D_skip.float() * x_f[:, t, :])
-        return torch.stack(ys, dim=1).to(x_silu.dtype), h
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_b, z = self.in_proj(self.norm(x)).chunk(2, dim=-1)
-        x_c = F.silu(self.conv(x_b.transpose(1, 2)).transpose(1, 2))
-        h0 = torch.zeros(x.shape[0], self.d_inner, self.d_state, device=x.device, dtype=torch.float32)
-        y, _ = self._scan(x_c, h0)
-        return x + self.out_proj(y * F.silu(z))
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.window_size = window_size
+        self.norm1 = nn.LayerNorm(d_model)
+        self.qkv = nn.Linear(d_model, d_model * 3, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.conv = CausalConvNeXtBlock(d_model, kernel_size=5, mult=2)
 
     def init_state(self, batch_size: int, device, dtype):
-        return {"conv": self.conv.init_state(batch_size, device, dtype), "h": torch.zeros(batch_size, self.d_inner, self.d_state, device=device, dtype=torch.float32)}
+        return {
+            "k": torch.zeros(batch_size, self.n_heads, 0, self.head_dim, device=device, dtype=dtype),
+            "v": torch.zeros(batch_size, self.n_heads, 0, self.head_dim, device=device, dtype=dtype),
+            "pos": 0,
+            "conv": self.conv.init_state(batch_size, device, dtype),
+        }
 
-    def forward_step(self, x: torch.Tensor, state: dict):
-        if x.shape[1] == 0:
-            return x, state
-        x_b, z = self.in_proj(self.norm(x)).chunk(2, dim=-1)
-        x_c, new_conv = self.conv.forward_step(x_b.transpose(1, 2), state["conv"])
-        y, new_h = self._scan(F.silu(x_c.transpose(1, 2)), state["h"])
-        return x + self.out_proj(y * F.silu(z)), {"conv": new_conv, "h": new_h}
+    def forward_chunk(self, x_win: torch.Tensor, state: dict, commit_len: int, win_mask: torch.Tensor = None):
+        B, M, D = x_win.shape
+        qkv = self.qkv(self.norm1(x_win)).reshape(B, M, 3, self.n_heads, self.head_dim)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4)
+        pos = torch.arange(state["pos"], state["pos"] + M, device=x_win.device)
+        q = apply_rope(q, pos)
+        k = apply_rope(k, pos)
+        k_all = torch.cat([state["k"], k], dim=2)
+        v_all = torch.cat([state["v"], v], dim=2)
+
+        scores = torch.matmul(q, k_all.transpose(-2, -1)) * (self.head_dim ** -0.5)
+        if win_mask is not None:
+            past_len = state["k"].shape[2]
+            key_valid = torch.cat(
+                [torch.ones(B, past_len, device=x_win.device, dtype=torch.bool), win_mask],
+                dim=1,
+            )
+            scores = scores.masked_fill(~key_valid[:, None, None, :], -1e9)
+        out = torch.matmul(torch.softmax(scores, dim=-1), v_all).transpose(1, 2).reshape(B, M, D)
+        h = x_win + self.out_proj(out)
+
+        # 局部因果 ConvNeXt：用完整 [commit + lookahead] 计算输出，但仅把 commit_len 段写入下一块卷积状态
+        pad_left = self.conv.dwconv.pad_left
+        buf = torch.cat([state["conv"], h.transpose(1, 2)], dim=-1)
+        conv_out = self.conv.dwconv.conv(buf).transpose(1, 2)
+        h_out = h + self.conv.pw2(F.gelu(self.conv.pw1(self.conv.norm(conv_out))))
+        new_conv = buf[:, :, commit_len : commit_len + pad_left] if pad_left > 0 else state["conv"]
+
+        new_k = torch.cat([state["k"], k[:, :, :commit_len, :]], dim=2)[:, :, -self.window_size:, :]
+        new_v = torch.cat([state["v"], v[:, :, :commit_len, :]], dim=2)[:, :, -self.window_size:, :]
+        return h_out, {"k": new_k, "v": new_v, "pos": state["pos"] + commit_len, "conv": new_conv}
 
 
-class SelectiveSSMBackbone(nn.Module):
-    def __init__(self, d_model: int = 256, k_left: int = 3, lookahead: int = 4, n_layers: int = 5):
+class ChunkLookaheadBackbone(nn.Module):
+    """E3 主力流式输入主干：5 层深双向分块前瞻注意力（C=4, L=8, W=48）。
+    - 相比 E2（1 层浅层 Conv 前瞻 + 上层严格因果），全部 5 层均可对 [C + L] 未来窗口做深层双向交互；
+    - 每次仅提交 C 步状态、丢弃 L 步前瞻 KV，总前瞻严格锁死且天然适配流式前端的“暂定前瞻纠错”；
+    - 训练期与流式推理共用同一 _run_window 路径，实现 100% 数学等价。"""
+
+    def __init__(self, d_model: int = 256, chunk_size: int = 4, lookahead: int = 8, n_layers: int = 5, n_heads: int = 4, window_size: int = 48):
         super().__init__()
         self.is_streaming = True
-        self.lookahead_layer = CentralizedLookaheadBlock(d_model, k_left=k_left, lookahead=lookahead, mult=2)
-        self.layers = nn.ModuleList([SelectiveSSMBlock(d_model, expand=2, d_state=16, d_conv=4) for _ in range(n_layers)])
+        self.d_model = d_model
+        self.chunk_size = chunk_size
+        self.lookahead = lookahead
+        self.layers = nn.ModuleList([ChunkLookaheadLayer(d_model, n_heads=n_heads, window_size=window_size) for _ in range(n_layers)])
+
+    def _run_window(self, win: torch.Tensor, layer_states: list, commit_len: int, win_mask: torch.Tensor = None):
+        h = win
+        new_layers = []
+        for l, st in zip(self.layers, layer_states):
+            h, nst = l.forward_chunk(h, st, commit_len=commit_len, win_mask=win_mask)
+            new_layers.append(nst)
+        return h[:, :commit_len, :], new_layers
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        h = self.lookahead_layer(x)
-        for l in self.layers:
-            h = l(h)
-        return h
+        B, T, _ = x.shape
+        layer_states = [l.init_state(B, x.device, x.dtype) for l in self.layers]
+        emits = []
+        for s in range(0, T, self.chunk_size):
+            c_len = min(self.chunk_size, T - s)
+            e = min(T, s + self.chunk_size + self.lookahead)
+            win_mask = mask[:, s:e] if mask is not None else None
+            h_commit, layer_states = self._run_window(x[:, s:e, :], layer_states, commit_len=c_len, win_mask=win_mask)
+            emits.append(h_commit)
+        return torch.cat(emits, dim=1) if emits else x[:, :0, :]
 
     def init_state(self, batch_size: int, device, dtype):
-        return {"la": self.lookahead_layer.init_state(batch_size, device, dtype), "layers": [l.init_state(batch_size, device, dtype) for l in self.layers]}
+        return {
+            "buf": torch.zeros(batch_size, 0, self.d_model, device=device, dtype=dtype),
+            "layers": [l.init_state(batch_size, device, dtype) for l in self.layers],
+        }
+
+    def forward_committed_with_lookahead(self, x_commit: torch.Tensor, x_lookahead: torch.Tensor, state: dict):
+        """Phase 2 流式前端原生接口：显式区分已确认提交音素与暂定前瞻音素（前瞻永不写入缓存，下一拍可被前端无损修正）。"""
+        c_len = x_commit.shape[1]
+        if c_len == 0:
+            return x_commit, state
+        win = torch.cat([x_commit, x_lookahead], dim=1) if x_lookahead.shape[1] > 0 else x_commit
+        h_commit, new_layers = self._run_window(win, state["layers"], commit_len=c_len)
+        return h_commit, {"buf": state["buf"], "layers": new_layers}
 
     def forward_step(self, x_new: torch.Tensor, state: dict, is_final: bool = False):
-        h, la_st = self.lookahead_layer.forward_step(x_new, state["la"], is_final=is_final)
-        if h.shape[1] == 0:
-            return h, {"la": la_st, "layers": state["layers"]}
-        new_layers = []
-        for l, st in zip(self.layers, state["layers"]):
-            h, nst = l.forward_step(h, st)
-            new_layers.append(nst)
-        return h, {"la": la_st, "layers": new_layers}
+        buf = torch.cat([state["buf"], x_new], dim=1) if x_new.shape[1] > 0 else state["buf"]
+        layer_states = state["layers"]
+        emits = []
+        while buf.shape[1] >= self.chunk_size + self.lookahead:
+            win = buf[:, :self.chunk_size + self.lookahead, :]
+            h_commit, layer_states = self._run_window(win, layer_states, commit_len=self.chunk_size)
+            emits.append(h_commit)
+            buf = buf[:, self.chunk_size:, :]
+        if is_final:
+            while buf.shape[1] > 0:
+                c_len = min(self.chunk_size, buf.shape[1])
+                win = buf[:, :c_len + self.lookahead, :]
+                h_commit, layer_states = self._run_window(win, layer_states, commit_len=c_len)
+                emits.append(h_commit)
+                buf = buf[:, c_len:, :]
+        out = torch.cat(emits, dim=1) if emits else torch.zeros(buf.shape[0], 0, self.d_model, device=buf.device, dtype=buf.dtype)
+        return out, {"buf": buf, "layers": layer_states}
 
 
-class RWKVBlock(nn.Module):
-    def __init__(self, d_model: int = 256, n_heads: int = 4, ffn_mult: int = 2):
+class GatedDeltaNetBlock(nn.Module):
+    """标准门控 DeltaNet（Yang et al., ICLR 2025）：4-tap 因果短卷积 + 线性注意力 + Delta Rule 写入 + 标量状态门控。
+    逐头状态 S ∈ R^{K×V}：
+        S_t = α_t (I - β_t k_t k_t^T) S_{t-1} + β_t k_t v_t^T
+            = α_t S_{t-1} + β_t k_t (v_t - α_t S_{t-1}^T k_t)^T，  o_t = S_t^T q_t   （q、k 经短卷积+SiLU 后 L2 归一化）
+    与 E4 的逐通道衰减累加线性注意力相比，写入前先按 α_t 遗忘旧状态并沿 k_t 方向擦除冗余分量；
+    训练期 log 空间分块并行、推理期逐步递推，二者数学等价且强遗忘下数值稳定。"""
+
+    def __init__(self, d_model: int = 256, n_heads: int = 4, ffn_hidden: int = 384, d_conv: int = 4):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.norm1 = nn.LayerNorm(d_model)
-        self.mu_r = nn.Parameter(torch.full((1, 1, d_model), 0.5))
-        self.mu_k = nn.Parameter(torch.full((1, 1, d_model), 0.5))
-        self.mu_v = nn.Parameter(torch.full((1, 1, d_model), 0.5))
-        self.mu_w = nn.Parameter(torch.full((1, 1, d_model), 0.5))
-        self.mu_g = nn.Parameter(torch.full((1, 1, d_model), 0.5))
-        self.receptance = nn.Linear(d_model, d_model, bias=False)
-        self.key = nn.Linear(d_model, d_model, bias=False)
-        self.value = nn.Linear(d_model, d_model, bias=False)
-        self.gate = nn.Linear(d_model, d_model, bias=False)
-        self.w_base = nn.Parameter(torch.full((n_heads, self.head_dim), -1.0))
-        self.w_lora1 = nn.Linear(d_model, 32, bias=False)
-        self.w_lora2 = nn.Linear(32, d_model, bias=True)
-        self.u_bonus = nn.Parameter(torch.zeros(n_heads, self.head_dim))
-        self.head_norm = nn.GroupNorm(n_heads, d_model)
+        self.qkv = nn.Linear(d_model, d_model * 3, bias=False)
+        self.qkv_conv = CausalConv1d(d_model * 3, d_model * 3, kernel_size=d_conv, groups=d_model * 3)
+        self.ba_proj = nn.Linear(d_model, n_heads * 2, bias=True)   # 每头两个标量：β（写入强度）与 α（状态门控）
+        with torch.no_grad():
+            self.ba_proj.bias[:n_heads].zero_()                     # β 初值 0.5
+            self.ba_proj.bias[n_heads:].fill_(2.0)                  # α 初值 ≈ 0.88
+        self.z = nn.Linear(d_model, d_model, bias=False)
+        self.o_norm = nn.GroupNorm(n_heads, d_model)                # 逐时间步、逐头归一化（与 E4 一致，防跨时间泄漏）
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.norm2 = nn.LayerNorm(d_model)
-        self.mu_ck = nn.Parameter(torch.full((1, 1, d_model), 0.5))
-        self.mu_cr = nn.Parameter(torch.full((1, 1, d_model), 0.5))
-        self.ck = nn.Linear(d_model, d_model * ffn_mult, bias=False)
-        self.cv = nn.Linear(d_model * ffn_mult, d_model, bias=False)
-        self.cr = nn.Linear(d_model, d_model, bias=False)
+        self.ffn_gate = nn.Linear(d_model, ffn_hidden, bias=False)
+        self.ffn_up = nn.Linear(d_model, ffn_hidden, bias=False)
+        self.ffn_down = nn.Linear(ffn_hidden, d_model, bias=False)
 
-    def _run(self, x: torch.Tensor, last_t: torch.Tensor, wkv_s: torch.Tensor, last_c: torch.Tensor):
+    def _run(self, x: torch.Tensor, attn, conv_state, S_init):
         B, T, D = x.shape
         xn = self.norm1(x)
-        prev_t = torch.cat([last_t, xn[:, :-1, :]], dim=1)
-        xr = xn * self.mu_r + prev_t * (1.0 - self.mu_r)
-        xk = xn * self.mu_k + prev_t * (1.0 - self.mu_k)
-        xv = xn * self.mu_v + prev_t * (1.0 - self.mu_v)
-        xw = xn * self.mu_w + prev_t * (1.0 - self.mu_w)
-        xg = xn * self.mu_g + prev_t * (1.0 - self.mu_g)
-
-        r = self.receptance(xr).view(B, T, self.n_heads, self.head_dim).float()
-        k = self.key(xk).view(B, T, self.n_heads, self.head_dim).float()
-        v = self.value(xv).view(B, T, self.n_heads, self.head_dim).float()
-        w_dyn = self.w_lora2(torch.tanh(self.w_lora1(xw))).view(B, T, self.n_heads, self.head_dim).float()
-        decay = torch.exp(-torch.exp(self.w_base[None, None, :, :].float() + w_dyn).clamp(max=10.0))
-        g = F.silu(self.gate(xg))
-
-        S = wkv_s.float()
-        u = self.u_bonus[None, :, :].float()
-        ys = []
-        for t in range(T):
-            rt, kt, vt, wt = r[:, t], k[:, t], v[:, t], decay[:, t]
-            yt = torch.einsum("bhd,bhde->bhe", rt, S) + (rt * u * kt).sum(dim=-1, keepdim=True) * vt
-            S = wt.unsqueeze(-1) * S + torch.einsum("bhd,bhe->bhde", kt, vt)
-            ys.append(yt)
-        # 逐时间步独立 GroupNorm（严防跨时间轴统计泄漏，保证流式等价）
-        y = torch.stack(ys, dim=1).reshape(B * T, D).to(x.dtype)
-        y = self.head_norm(y).reshape(B, T, D)
-        x = x + self.out_proj(y * g)
-        new_last_t = xn[:, -1:, :]
-
-        xc = self.norm2(x)
-        prev_c = torch.cat([last_c, xc[:, :-1, :]], dim=1)
-        xck = xc * self.mu_ck + prev_c * (1.0 - self.mu_ck)
-        xcr = xc * self.mu_cr + prev_c * (1.0 - self.mu_cr)
-        x = x + torch.sigmoid(self.cr(xcr)) * self.cv(F.relu(self.ck(xck)) ** 2)
-        return x, new_last_t, S, xc[:, -1:, :]
+        qkv_in = self.qkv(xn).transpose(1, 2)
+        if conv_state is None:
+            qkv_c, new_conv = F.silu(self.qkv_conv(qkv_in).transpose(1, 2)), None
+        else:
+            qkv_raw, new_conv = self.qkv_conv.forward_step(qkv_in, conv_state)
+            qkv_c = F.silu(qkv_raw.transpose(1, 2))
+        q, k, v = qkv_c.reshape(B, T, 3, self.n_heads, self.head_dim).float().unbind(2)
+        q, k = F.normalize(q, dim=-1), F.normalize(k, dim=-1)
+        b_logit, a_logit = self.ba_proj(xn).float().reshape(B, T, 2, self.n_heads).unbind(2)
+        beta, log_alpha = torch.sigmoid(b_logit), F.logsigmoid(a_logit)
+        if S_init is None:
+            S_init = torch.zeros(B, self.n_heads, self.head_dim, self.head_dim, device=x.device, dtype=torch.float32)
+        o, S = attn(q, k, v, beta, log_alpha, S_init)
+        # 先转回 x.dtype 再经逐头 GroupNorm，兼容纯 fp16/bf16 推理且与 E4 一致
+        y = self.o_norm(o.reshape(B * T, D).to(x.dtype)).reshape(B, T, D) * F.silu(self.z(xn))
+        h = x + self.out_proj(y)
+        xc = self.norm2(h)
+        return h + self.ffn_down(F.silu(self.ffn_gate(xc)) * self.ffn_up(xc)), new_conv, S
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B = x.shape[0]
-        z1 = torch.zeros(B, 1, self.d_model, device=x.device, dtype=x.dtype)
-        S0 = torch.zeros(B, self.n_heads, self.head_dim, self.head_dim, device=x.device, dtype=torch.float32)
-        out, _, _, _ = self._run(x, z1, S0, z1)
-        return out
+        return self._run(x, gated_delta_rule_chunkwise, None, None)[0]
 
     def init_state(self, batch_size: int, device, dtype):
         return {
-            "last_t": torch.zeros(batch_size, 1, self.d_model, device=device, dtype=dtype),
+            "conv": self.qkv_conv.init_state(batch_size, device, dtype),
             "S": torch.zeros(batch_size, self.n_heads, self.head_dim, self.head_dim, device=device, dtype=torch.float32),
-            "last_c": torch.zeros(batch_size, 1, self.d_model, device=device, dtype=dtype),
         }
 
     def forward_step(self, x: torch.Tensor, state: dict):
         if x.shape[1] == 0:
             return x, state
-        out, lt, S, lc = self._run(x, state["last_t"], state["S"], state["last_c"])
-        return out, {"last_t": lt, "S": S, "last_c": lc}
+        out, new_conv, S = self._run(x, gated_delta_rule_recurrent, state["conv"], state["S"])
+        return out, {"conv": new_conv, "S": S}
 
 
-class RWKVBackbone(nn.Module):
+class GatedDeltaNetBackbone(nn.Module):
     def __init__(self, d_model: int = 256, k_left: int = 3, lookahead: int = 4, n_layers: int = 5, n_heads: int = 4):
         super().__init__()
         self.is_streaming = True
         self.lookahead_layer = CentralizedLookaheadBlock(d_model, k_left=k_left, lookahead=lookahead, mult=2)
-        self.layers = nn.ModuleList([RWKVBlock(d_model, n_heads=n_heads, ffn_mult=2) for _ in range(n_layers)])
+        self.layers = nn.ModuleList([GatedDeltaNetBlock(d_model, n_heads=n_heads, ffn_hidden=384, d_conv=4) for _ in range(n_layers)])
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         h = self.lookahead_layer(x)
@@ -1174,7 +1317,7 @@ class RWKVBackbone(nn.Module):
 
 
 # ==============================================================================
-# 5.3 内置单调对齐器 (Beta-Binomial 对角先验 + Soft->Hard 直通二值化，防对齐坍缩) & 完整声学模型
+# 5.3 内置单调对齐器 (Beta-Binomial 对角先验 + Soft->Hard 直通二值化，批向量化热路径) & 完整声学模型
 # ==============================================================================
 @torch.no_grad()
 def build_beta_binomial_log_prior_ref(text_lens: torch.Tensor, mel_lens: torch.Tensor, max_t: int, max_f: int, scaling: float = 1.0) -> torch.Tensor:
@@ -1197,6 +1340,29 @@ def build_beta_binomial_log_prior_ref(text_lens: torch.Tensor, mel_lens: torch.T
         log_beta_den = torch.lgamma(alpha) + torch.lgamma(beta) - torch.lgamma(alpha + beta)
         log_prior[b, :F_b, :T_b] = (log_comb + log_beta_num - log_beta_den).clamp(min=-50.0)
     return log_prior
+
+
+@torch.no_grad()
+def build_beta_binomial_log_prior(text_lens: torch.Tensor, mel_lens: torch.Tensor, max_t: int, max_f: int, scaling: float = 1.0) -> torch.Tensor:
+    """批向量化 Beta-Binomial 对角先验：一次广播计算整个 (B, F, T)，与 *_ref 逐位等价。"""
+    B = text_lens.shape[0]
+    device = text_lens.device
+    f_col = torch.arange(max_f, device=device, dtype=torch.float32).view(1, max_f, 1)
+    t_row = torch.arange(max_t, device=device, dtype=torch.float32).view(1, 1, max_t)
+    n = (text_lens.to(torch.float32) - 1.0).view(B, 1, 1)
+    f_b = mel_lens.to(torch.float32).view(B, 1, 1)
+    alpha = scaling * (f_col + 1.0)
+    beta = scaling * (f_b - f_col)
+    log_comb = torch.lgamma(n + 1.0) - torch.lgamma(t_row + 1.0) - torch.lgamma(n - t_row + 1.0)
+    log_beta_num = torch.lgamma(t_row + alpha) + torch.lgamma(n - t_row + beta) - torch.lgamma(n + alpha + beta)
+    log_beta_den = torch.lgamma(alpha) + torch.lgamma(beta) - torch.lgamma(alpha + beta)
+    dense = (log_comb + log_beta_num - log_beta_den).clamp_(min=-50.0)
+    valid = (f_col < f_b) & (t_row < text_lens.to(torch.float32).view(B, 1, 1))
+    single_tok = (text_lens <= 1).view(B, 1, 1)
+    out = torch.full((B, max_f, max_t), -1e4, device=device, dtype=torch.float32)
+    out = torch.where(valid & ~single_tok, dense, out)
+    out = torch.where(valid & single_tok, torch.zeros_like(out), out)
+    return out
 
 
 class AlignmentEncoder(nn.Module):
@@ -1249,43 +1415,9 @@ def viterbi_monotonic_alignment_ref(attn_logprob: torch.Tensor, text_lens: torch
     return torch.from_numpy(attn_hard).to(attn_logprob.device), torch.from_numpy(durations).to(attn_logprob.device)
 
 
-
-
-# ==============================================================================
-# 5.3b 向量化热路径（与上方 *_ref 参考实现逐位等价；--selftest 随时可验证）
-# ==============================================================================
-@torch.no_grad()
-def build_beta_binomial_log_prior(text_lens: torch.Tensor, mel_lens: torch.Tensor, max_t: int, max_f: int, scaling: float = 1.0) -> torch.Tensor:
-    """批向量化 Beta-Binomial 对角先验：一次广播计算整个 (B, F, T)，消除逐样本 Python 循环。
-
-    与 build_beta_binomial_log_prior_ref 逐位一致（相同元素级运算、相同 clamp/-1e4 填充语义）。
-    """
-    B = text_lens.shape[0]
-    device = text_lens.device
-    f_col = torch.arange(max_f, device=device, dtype=torch.float32).view(1, max_f, 1)
-    t_row = torch.arange(max_t, device=device, dtype=torch.float32).view(1, 1, max_t)
-    n = (text_lens.to(torch.float32) - 1.0).view(B, 1, 1)
-    f_b = mel_lens.to(torch.float32).view(B, 1, 1)
-    alpha = scaling * (f_col + 1.0)                                    # (1,F,1)
-    beta = scaling * (f_b - f_col)                                     # (B,F,1)
-    log_comb = torch.lgamma(n + 1.0) - torch.lgamma(t_row + 1.0) - torch.lgamma(n - t_row + 1.0)          # (B,1,T)
-    log_beta_num = torch.lgamma(t_row + alpha) + torch.lgamma(n - t_row + beta) - torch.lgamma(n + alpha + beta)  # (B,F,T)
-    log_beta_den = torch.lgamma(alpha) + torch.lgamma(beta) - torch.lgamma(alpha + beta)                  # (B,F,1)
-    dense = (log_comb + log_beta_num - log_beta_den).clamp_(min=-50.0)
-    valid = (f_col < f_b) & (t_row < text_lens.to(torch.float32).view(B, 1, 1))      # (B,F,T)
-    single_tok = (text_lens <= 1).view(B, 1, 1)
-    out = torch.full((B, max_f, max_t), -1e4, device=device, dtype=torch.float32)
-    out = torch.where(valid & ~single_tok, dense, out)
-    out = torch.where(valid & single_tok, torch.zeros_like(out), out)
-    return out
-
-
 @torch.no_grad()
 def viterbi_monotonic_alignment(attn_logprob: torch.Tensor, text_lens: torch.Tensor, mel_lens: torch.Tensor):
-    """批向量化单调 Viterbi 回溯：仅在帧轴 f 上保留 Python 循环，批与 token 全程向量化。
-
-    与 viterbi_monotonic_alignment_ref 逐位一致（相同 DP 递推、相同回溯判据）。
-    """
+    """批向量化单调 Viterbi 回溯：批与 token 维全程向量化，与 *_ref 逐位等价。"""
     B, F_max, T_max = attn_logprob.shape
     lp = attn_logprob.detach().cpu().float().numpy()
     mel_np = mel_lens.detach().cpu().numpy().astype(np.int64)
@@ -1334,6 +1466,62 @@ def expand_by_duration(h: torch.Tensor, durations: torch.Tensor, max_frames: int
     return padded, torch.tensor(out_lens, device=h.device, dtype=torch.long)
 
 
+FRAME_PHASE_DIM = 24
+
+
+def frame_phase_and_dur(durations: torch.Tensor, max_frames: int):
+    """用 searchsorted 以 O(B·F·log T) 零同步计算每帧在其所属音素内的序号 τ（0 起）与该音素时长 d，
+    自动跳过 0 时长 token 并在有效帧之外返回 (0, 1)，与 expand_by_duration 网格严格对齐。"""
+    B, T = durations.shape
+    device = durations.device
+    if T == 0 or max_frames == 0:
+        return (
+            torch.zeros(B, max_frames, device=device, dtype=torch.long),
+            torch.ones(B, max_frames, device=device, dtype=torch.long),
+        )
+    d = durations.long().clamp(min=0)
+    ends = torch.cumsum(d, dim=1)                                                     # (B, T) 单调非降
+    starts = ends - d                                                                 # (B, T)
+    idx = torch.arange(max_frames, device=device, dtype=torch.long).unsqueeze(0).expand(B, max_frames).contiguous()
+    tok_idx = torch.searchsorted(ends, idx, right=True)                               # (B, F) 有效帧 < T，填充帧 == T
+    valid = tok_idx < T
+    tok_safe = tok_idx.clamp(max=T - 1)
+    s_f = starts.gather(1, tok_safe)
+    d_f = d.gather(1, tok_safe)
+    tau = torch.where(valid, idx - s_f, torch.zeros_like(idx))
+    dur_f = torch.where(valid, d_f.clamp(min=1), torch.ones_like(idx))
+    return tau, dur_f
+
+
+def build_frame_phase_features(durations: torch.Tensor, max_frames: int) -> torch.Tensor:
+    """构造 24 维音素内相位特征（仅依赖当前音素时长，零额外前瞻，天然适配变速推理 speed != 1.0）：
+      - 相对进度 prog = (τ + 0.5) / d 的 4 阶 Fourier（8 维）：表征声调轮廓与双元音滑动进度
+      - 已过帧数 τ 与剩余帧数 d-1-τ 的短尺度 Fourier（各 6 维，尺度 2/6/18 帧）：表征辅音起始与尾音释放
+      - 归一化标量 [τ/32, rem/32, prog, log1p(d)/4]（4 维）"""
+    tau, dur_f = frame_phase_and_dur(durations, max_frames)
+    tau_f = tau.to(torch.float32)
+    dur_ff = dur_f.to(torch.float32)
+    rem_f = (dur_ff - 1.0 - tau_f).clamp(min=0.0)
+    prog = (tau_f + 0.5) / dur_ff
+
+    prog_angles = prog.unsqueeze(-1) * torch.tensor([2.0 * math.pi * k for k in (1, 2, 4, 8)], device=durations.device, dtype=torch.float32)
+    inv_scales = torch.tensor([1.0 / 2.0, 1.0 / 6.0, 1.0 / 18.0], device=durations.device, dtype=torch.float32)
+    tau_angles = tau_f.unsqueeze(-1) * inv_scales
+    rem_angles = rem_f.unsqueeze(-1) * inv_scales
+    scalars = torch.stack([
+        (tau_f / 32.0).clamp(max=2.0),
+        (rem_f / 32.0).clamp(max=2.0),
+        prog,
+        torch.log1p(dur_ff) / 4.0,
+    ], dim=-1)
+    return torch.cat([
+        torch.sin(prog_angles), torch.cos(prog_angles),
+        torch.sin(tau_angles), torch.cos(tau_angles),
+        torch.sin(rem_angles), torch.cos(rem_angles),
+        scalars,
+    ], dim=-1)
+
+
 class CausalPredictorHead(nn.Module):
     def __init__(self, d_model: int = 256, kernel_size: int = 3):
         super().__init__()
@@ -1362,14 +1550,19 @@ class CausalPredictorHead(nn.Module):
 
 
 class AetherAcousticModel(nn.Module):
-    def __init__(self, vocab_size: int, backbone_type: str = "swa", d_model: int = 256, n_mels: int = 100, k_left: int = 3, lookahead: int = 4, swa_window: int = 48):
+    def __init__(self, vocab_size: int, backbone_type: str = "chunk_attn", d_model: int = 256, n_mels: int = 100, k_left: int = 3, lookahead: int = 8, swa_window: int = 48, chunk_size: int = 4, frame_lookahead: int = 2):
         super().__init__()
         self.backbone_type = backbone_type
         self.d_model = d_model
         self.n_mels = n_mels
         self.lookahead = lookahead
+        self.frame_lookahead = frame_lookahead
         self.phoneme_emb = nn.Embedding(vocab_size, d_model, padding_idx=0)
         self.lang_emb = nn.Embedding(4, d_model)
+        # 音素内多尺度相位投影（24 维 -> d_model，小初始化避免初态淹没 h_txt），作用见 expand_frames
+        self.frame_phase_proj = nn.Linear(FRAME_PHASE_DIM, d_model)
+        nn.init.normal_(self.frame_phase_proj.weight, std=0.02)
+        nn.init.zeros_(self.frame_phase_proj.bias)
 
         if backbone_type == "offline_transformer":
             self.backbone = OfflineBiTransformerBackbone(d_model=d_model, n_layers=4, n_heads=4, d_ff=896)
@@ -1377,10 +1570,10 @@ class AetherAcousticModel(nn.Module):
             self.backbone = ConvUniGRUBackbone(d_model=d_model, k_left=k_left, lookahead=lookahead, n_conv=4)
         elif backbone_type == "swa":
             self.backbone = SWABackbone(d_model=d_model, k_left=k_left, lookahead=lookahead, n_layers=5, n_heads=4, window_size=swa_window)
-        elif backbone_type == "ssm":
-            self.backbone = SelectiveSSMBackbone(d_model=d_model, k_left=k_left, lookahead=lookahead, n_layers=5)
-        elif backbone_type == "rwkv":
-            self.backbone = RWKVBackbone(d_model=d_model, k_left=k_left, lookahead=lookahead, n_layers=5, n_heads=4)
+        elif backbone_type == "chunk_attn":
+            self.backbone = ChunkLookaheadBackbone(d_model=d_model, chunk_size=chunk_size, lookahead=lookahead, n_layers=5, n_heads=4, window_size=swa_window)
+        elif backbone_type == "gdn":
+            self.backbone = GatedDeltaNetBackbone(d_model=d_model, k_left=k_left, lookahead=lookahead, n_layers=5, n_heads=4)
         else:
             raise ValueError(f"Unknown backbone_type: {backbone_type}")
 
@@ -1392,11 +1585,35 @@ class AetherAcousticModel(nn.Module):
         self.energy_predictor = CausalPredictorHead(d_model, kernel_size=3)
         self.f0_emb = nn.Linear(1, d_model)
         self.energy_emb = nn.Linear(1, d_model)
-        self.frame_decoder = nn.ModuleList([CausalConvNeXtBlock(d_model, kernel_size=5, mult=2) for _ in range(4)])
+        # 集中式帧级右前瞻：仅 frame_decoder[0] 允许看右边 frame_lookahead 帧（默认 2 帧 ≈ 21 ms）改善元音->辅音协同发音，其余 3 层严格因果
+        self.frame_decoder = nn.ModuleList(
+            [CentralizedLookaheadBlock(d_model, k_left=4, lookahead=frame_lookahead, mult=2)]
+            + [CausalConvNeXtBlock(d_model, kernel_size=5, mult=2) for _ in range(3)]
+        )
         self.mel_out = nn.Linear(d_model, n_mels)
 
     def encode_text(self, phoneme_ids: torch.Tensor, lang_ids: torch.Tensor, text_mask: torch.Tensor = None):
-        return self.backbone(self.phoneme_emb(phoneme_ids) + self.lang_emb(lang_ids), mask=text_mask)
+        return self.backbone(self.embed_text(phoneme_ids, lang_ids, text_mask), mask=text_mask)
+
+    def embed_text(self, phoneme_ids: torch.Tensor, lang_ids: torch.Tensor, text_mask: torch.Tensor = None):
+        """音素 + 语种嵌入，右填充位置置零。lang_id=0 的嵌入非零，若不置零，填充位会经集中右前瞻层泄漏进句末 L 个位置的隐状态；
+        而推理期（离线 F.pad / 流式 is_final 补零）看到的都是零，训练与推理不一致"""
+        x_emb = self.phoneme_emb(phoneme_ids) + self.lang_emb(lang_ids)
+        return x_emb if text_mask is None else x_emb * text_mask[:, :, None].to(x_emb.dtype)
+
+    def _frame_phase_embed(self, durations: torch.Tensor, max_frames: int, dtype: torch.dtype) -> torch.Tensor:
+        feats = build_frame_phase_features(durations, max_frames).to(dtype=self.frame_phase_proj.weight.dtype)
+        return self.frame_phase_proj(feats).to(dtype)
+
+    def expand_frames(self, h_txt: torch.Tensor, durations: torch.Tensor, max_frames: int = None):
+        """帧级展开 + 注入音素内多尺度相位特征（已过帧数 τ、剩余帧数 d-1-τ、相对进度 (τ+0.5)/d）。
+        F0/能量预测器与帧级解码器全是因果卷积，而按时长展开后的输入是分段常量：音素内部过了感受野输出必然冻结
+        （实测 F0/能量 4 帧≈43 ms 后为常数，mel 20 帧≈213 ms 后冻结），无法表达声调轮廓、双元音滑动等音素内部动态。
+        所有相位特征仅依赖当前音素自身时长 d，流式推理可逐音素实时计算、零额外前瞻，且适配变速推理。"""
+        h_frame, out_lens = expand_by_duration(h_txt, durations, max_frames=max_frames)
+        valid = torch.arange(h_frame.shape[1], device=h_frame.device)[None, :, None] < out_lens[:, None, None]
+        h_frame = h_frame + self._frame_phase_embed(durations, h_frame.shape[1], h_frame.dtype)
+        return h_frame * valid.to(h_frame.dtype), out_lens
 
     def forward_train(self, phoneme_ids, lang_ids, text_lens, mel_gt, f0_gt, energy_gt, mel_lens, step_ratio: float = 1.0):
         B, T_max = phoneme_ids.shape
@@ -1405,7 +1622,7 @@ class AetherAcousticModel(nn.Module):
         mel_mask = torch.arange(F_max, device=phoneme_ids.device)[None, :] < mel_lens[:, None]
 
         # Aligner 基于纯音素嵌入 + Beta-Binomial 对角先验，避免受流式右前瞻/因果偏移影响且严防 <bos> 坍缩
-        x_emb = self.phoneme_emb(phoneme_ids) + self.lang_emb(lang_ids)
+        x_emb = self.embed_text(phoneme_ids, lang_ids, text_mask)
         h_txt = self.backbone(x_emb, mask=text_mask)
         attn_log_prior = build_beta_binomial_log_prior(text_lens, mel_lens, T_max, F_max, scaling=1.0)
         attn_logprob, attn_soft = self.aligner(mel_gt, x_emb, text_mask, attn_log_prior=attn_log_prior)
@@ -1415,7 +1632,7 @@ class AetherAcousticModel(nn.Module):
         # 前 25% 步数用 soft attention 让 mel 重建梯度直接训练对齐器；之后直通硬对齐 + 二值化损失，实现训练↔推理零落差
         use_hard = (not self.training) or (step_ratio >= 0.25)
         attn_use = (attn_hard + (attn_soft - attn_soft.detach())) if use_hard else attn_soft
-        h_frame = torch.bmm(attn_use.to(h_txt.dtype), h_txt)
+        h_frame = (torch.bmm(attn_use.to(h_txt.dtype), h_txt) + self._frame_phase_embed(dur_gt, F_max, h_txt.dtype)) * mel_mask[:, :, None].to(h_txt.dtype)
 
         loss_bin = -(attn_hard * attn_logprob * mel_mask[:, :, None]).sum() / mel_mask.sum().clamp(min=1)
         bin_weight = 0.0 if step_ratio < 0.25 else min(1.0, (step_ratio - 0.25) / 0.25)
@@ -1432,7 +1649,8 @@ class AetherAcousticModel(nn.Module):
         use_pred = (not self.training) or (step_ratio >= 0.25 and torch.rand(1).item() < 0.5)
         f0_in = f0_pred.detach() if use_pred else f0_gt
         e_in = energy_pred.detach() if use_pred else energy_gt
-        h_dec = h_frame + self.f0_emb(f0_in.unsqueeze(-1)) + self.energy_emb(e_in.unsqueeze(-1))
+        # 右填充帧置零（防 f0_emb/energy_emb 偏置经 frame_decoder[0] 的集中右前瞻泄漏进有效句末帧，保证训练↔推理一致）
+        h_dec = (h_frame + self.f0_emb(f0_in.unsqueeze(-1)) + self.energy_emb(e_in.unsqueeze(-1))) * mel_mask[:, :, None].to(h_frame.dtype)
         for blk in self.frame_decoder:
             h_dec = blk(h_dec)
         mel_pred = self.mel_out(h_dec).transpose(1, 2)
@@ -1450,7 +1668,7 @@ class AetherAcousticModel(nn.Module):
     def infer_offline(self, phoneme_ids: torch.Tensor, lang_ids: torch.Tensor, speed: float = 1.0):
         h_txt = self.encode_text(phoneme_ids, lang_ids)
         dur = torch.clamp(torch.round((torch.exp(self.dur_predictor(h_txt)) - 1.0) / speed), min=1, max=60).long()
-        h_frame, _ = expand_by_duration(h_txt, dur)
+        h_frame, _ = self.expand_frames(h_txt, dur)
         f0_pred = self.f0_predictor(h_frame)
         e_pred = self.energy_predictor(h_frame)
         h_dec = h_frame + self.f0_emb(f0_pred.unsqueeze(-1)) + self.energy_emb(e_pred.unsqueeze(-1))
@@ -1474,18 +1692,25 @@ class AetherAcousticModel(nn.Module):
         x = (self.phoneme_emb(phoneme_chunk) + self.lang_emb(lang_chunk)) if phoneme_chunk.shape[1] > 0 else torch.zeros(phoneme_chunk.shape[0], 0, self.d_model, device=phoneme_chunk.device, dtype=self.phoneme_emb.weight.dtype)
         h_emit, state["backbone"] = self.backbone.forward_step(x, state["backbone"], is_final=is_final)
         if h_emit.shape[1] == 0:
-            return torch.zeros(x.shape[0], self.n_mels, 0, device=x.device, dtype=x.dtype), state
-        log_dur, state["dur"] = self.dur_predictor.forward_step(h_emit, state["dur"])
-        dur = torch.clamp(torch.round((torch.exp(log_dur) - 1.0) / speed), min=1, max=60).long()
-        h_frame, _ = expand_by_duration(h_emit, dur)
-        f0_pred, state["f0"] = self.f0_predictor.forward_step(h_frame, state["f0"])
-        e_pred, state["energy"] = self.energy_predictor.forward_step(h_frame, state["energy"])
-        h_dec = h_frame + self.f0_emb(f0_pred.unsqueeze(-1)) + self.energy_emb(e_pred.unsqueeze(-1))
-        new_fdec = []
-        for blk, fst in zip(self.frame_decoder, state["frame_dec"]):
+            if not is_final:
+                return torch.zeros(x.shape[0], self.n_mels, 0, device=x.device, dtype=x.dtype), state
+            h_dec = torch.zeros(x.shape[0], 0, self.d_model, device=x.device, dtype=x.dtype)
+        else:
+            log_dur, state["dur"] = self.dur_predictor.forward_step(h_emit, state["dur"])
+            dur = torch.clamp(torch.round((torch.exp(log_dur) - 1.0) / speed), min=1, max=60).long()
+            h_frame, _ = self.expand_frames(h_emit, dur)
+            f0_pred, state["f0"] = self.f0_predictor.forward_step(h_frame, state["f0"])
+            e_pred, state["energy"] = self.energy_predictor.forward_step(h_frame, state["energy"])
+            h_dec = h_frame + self.f0_emb(f0_pred.unsqueeze(-1)) + self.energy_emb(e_pred.unsqueeze(-1))
+        # frame_decoder[0] 带集中式帧级右前瞻，须透传 is_final 完成末尾 flush；其余 3 层严格因果
+        h_dec, f0_st = self.frame_decoder[0].forward_step(h_dec, state["frame_dec"][0], is_final=is_final)
+        new_fdec = [f0_st]
+        for blk, fst in zip(self.frame_decoder[1:], state["frame_dec"][1:]):
             h_dec, nfst = blk.forward_step(h_dec, fst)
             new_fdec.append(nfst)
         state["frame_dec"] = new_fdec
+        if h_dec.shape[1] == 0:
+            return torch.zeros(x.shape[0], self.n_mels, 0, device=x.device, dtype=x.dtype), state
         return self.mel_out(h_dec).transpose(1, 2), state
 
 
@@ -1518,7 +1743,9 @@ class StreamingISTFTHead(nn.Module):
             st = m * self.hop_length
             out[:, st : st + self.n_fft] += frames[:, m, :]
             env[:, st : st + self.n_fft] += w2
-        left_trim = pad // 2
+        # centre=True 约定（与 torch.istft 一致）：OLA 缓冲区下标 n_fft//2 对应采样时刻 0，输出与 mel 帧网格逐样本对齐。
+        # 旧实现按 pad//2 对称裁剪，输出整体晚 128 采样点（5.33 ms），波形域损失里预测与真值是错位的
+        left_trim = self.n_fft // 2
         return out[:, left_trim : left_trim + n_frames * self.hop_length] / env[:, left_trim : left_trim + n_frames * self.hop_length].clamp(min=1e-6)
 
     def init_state(self, batch_size: int, device):
@@ -1526,14 +1753,14 @@ class StreamingISTFTHead(nn.Module):
         return {
             "ola_out": torch.zeros(batch_size, pad, device=device, dtype=torch.float32),
             "ola_env": torch.zeros(batch_size, pad, device=device, dtype=torch.float32),
-            "trim_remaining": pad // 2,
+            "trim_remaining": self.n_fft // 2,
         }
 
     @torch.no_grad()
     def forward_step(self, x_chunk: torch.Tensor, state: dict, is_final: bool = False):
         B, C, _ = x_chunk.shape
         pad = self.n_fft - self.hop_length
-        left_trim = pad // 2
+        left_trim = self.n_fft // 2
         if C == 0 and not is_final:
             return torch.zeros(B, 0, device=x_chunk.device, dtype=torch.float32), state
         out_len = C * self.hop_length + pad
@@ -1551,7 +1778,7 @@ class StreamingISTFTHead(nn.Module):
         emit_end = C * self.hop_length
         trim_rem = state["trim_remaining"]
         if is_final:
-            tail_end = emit_end + (pad - left_trim)
+            tail_end = emit_end + left_trim
             wav_emit = torch.zeros(B, 0, device=x_chunk.device, dtype=torch.float32) if tail_end <= trim_rem else out[:, trim_rem:tail_end] / env[:, trim_rem:tail_end].clamp(min=1e-6)
             return wav_emit, self.init_state(B, x_chunk.device)
         if emit_end <= trim_rem:
@@ -1564,9 +1791,11 @@ class StreamingISTFTHead(nn.Module):
 
 
 class CausalVocosLite(nn.Module):
-    def __init__(self, n_mels: int = 100, dim: int = 256, n_layers: int = 8, kernel_size: int = 7, n_fft: int = 1024, hop_length: int = 256):
+    def __init__(self, n_mels: int = 100, dim: int = 256, n_layers: int = 8, kernel_size: int = 7, n_fft: int = 1024, hop_length: int = 256, lookahead: int = 2):
         super().__init__()
-        self.embed = CausalConv1d(n_mels, dim, kernel_size=7)
+        # 集中式右前瞻：仅 embed 这一层允许看右边 lookahead 帧 mel，其后 8 个 ConvNeXt 块与 iSTFT 全部严格因果。
+        # iSTFT 每帧合成窗以当前帧为中心，零前瞻等于让网络凭过去的 mel 预测未来半个窗，瞬态/辅音起始会糊
+        self.embed = LookaheadConv1d(n_mels, dim, k_left=kernel_size - 1, lookahead=lookahead)
         self.norm_in = nn.LayerNorm(dim)
         self.blocks = nn.ModuleList([CausalConvNeXtBlock(dim, kernel_size=kernel_size, mult=3) for _ in range(n_layers)])
         self.norm_out = nn.LayerNorm(dim)
@@ -1584,11 +1813,8 @@ class CausalVocosLite(nn.Module):
 
     @torch.no_grad()
     def forward_step(self, mel_chunk: torch.Tensor, state: dict, is_final: bool = False):
-        if mel_chunk.shape[-1] == 0:
-            h = torch.zeros(mel_chunk.shape[0], 0, self.norm_out.normalized_shape[0], device=mel_chunk.device, dtype=mel_chunk.dtype)
-            wav, state["head"] = self.head.forward_step(h, state["head"], is_final=is_final)
-            return wav, state
-        h, state["embed"] = self.embed.forward_step(mel_chunk, state["embed"])
+        # 空块不提前返回：embed 带右前瞻时需要攒够未来帧才吐帧，is_final 的空块也必须走到 embed 补零 flush
+        h, state["embed"] = self.embed.forward_step(mel_chunk, state["embed"], is_final=is_final)
         h = self.norm_in(h.transpose(1, 2))
         new_blks = []
         for blk, bst in zip(self.blocks, state["blocks"]):
@@ -1673,14 +1899,12 @@ def multi_res_stft_loss(y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Ten
 
 def count_params_m(model: nn.Module) -> float:
     return sum(p.numel() for p in model.parameters()) / 1e6
-
-
 # ==============================================================================
 # 6b. 向量化热路径 vs 参考实现 逐位等价自检（--selftest）
 # ==============================================================================
 def run_aligner_equivalence_selftest():
     print("=" * 72)
-    print("向量化对齐热路径 vs notebook 参考实现 —— 逐位等价自检 (torch.equal)")
+    print("向量化对齐热路径 vs 参考实现 —— 逐位等价自检 (torch.equal)")
     print("=" * 72)
     for seed in range(8):
         g = torch.Generator().manual_seed(seed)
@@ -1708,71 +1932,164 @@ def run_aligner_equivalence_selftest():
             p_ref_d = build_beta_binomial_log_prior_ref(tl_d, ml_d, T_max, F_max)
             p_fast_d = build_beta_binomial_log_prior(tl_d, ml_d, T_max, F_max)
             assert torch.equal(p_ref_d.cpu(), p_fast_d.cpu()), f"prior cuda mismatch seed={seed}"
-            # 说明：lgamma 在 CPU/CUDA 间允许 <=1 ulp 差异（notebook 训练时前后一致地在
-            # 同一设备上计算先验，故只需同设备逐位一致；此处仅做宽松一致性确认）
             assert torch.allclose(p_ref_d.cpu(), p_ref, rtol=1e-5, atol=1e-4), f"prior cross-device drift seed={seed}"
         print(f"  [PASS] seed={seed}  shape=({B},{F_max},{T_max}) CPU+CUDA 逐位一致")
-    print("[SelfTest] 全部通过：向量化实现与 notebook 参考实现完全等价。")
+    print("[SelfTest] 全部通过：向量化实现与参考实现完全等价。")
     print("=" * 72)
 
 
 if SELFTEST:
     run_aligner_equivalence_selftest()
 
+# #############################################################################
+# Cell 6: 训练前硬门禁（零前瞻膨胀 + 多块流式等价 + 强遗忘梯度校验）
+# #############################################################################
+def run_chunkwise_numerical_and_grad_tests():
+    """验证门控 DeltaNet (E4) 在多块 (T=75 > 2*SCAN_CHUNK) + 强遗忘条件下的前向等价性与反向梯度有限性（防 0/0 与 inf*0 NaN）。"""
+    torch.manual_seed(0)
+    B, T, H, D = 2, 75, 4, 16
+    q = F.normalize(torch.randn(B, T, H, D), dim=-1).detach().requires_grad_(True)
+    kd = F.normalize(torch.randn(B, T, H, D), dim=-1).detach().requires_grad_(True)
+    vd = torch.randn(B, T, H, D, requires_grad=True)
+    beta = torch.rand(B, T, H).clamp(0.05, 0.95).detach().requires_grad_(True)
+    log_a = (-torch.empty(B, T, H).uniform_(5.0, 30.0)).detach().requires_grad_(True)
+    Sd0 = torch.randn(B, H, D, D, requires_grad=True)
+    yo_chk, Sd_chk = gated_delta_rule_chunkwise(q, kd, vd, beta, log_a, Sd0)
+    assert torch.isfinite(yo_chk).all() and torch.isfinite(Sd_chk).all(), "GDN chunkwise non-finite output under strong decay"
+    (yo_chk.pow(2).mean() + Sd_chk.pow(2).mean()).backward()
+    for name, t in (("q", q), ("k", kd), ("v", vd), ("beta", beta), ("log_alpha", log_a), ("S0", Sd0)):
+        assert torch.isfinite(t.grad).all(), f"GDN gated_delta_rule_chunkwise non-finite grad on {name}"
+    with torch.no_grad():
+        yo_rec, Sd_rec = gated_delta_rule_recurrent(q, kd, vd, beta, log_a, Sd0.clone())
+        assert (yo_chk.detach() - yo_rec).abs().max().item() < 1e-5, "GDN chunkwise fwd mismatch under strong decay"
+        assert (Sd_chk.detach() - Sd_rec).abs().max().item() < 1e-5, "GDN chunkwise state mismatch under strong decay"
+    print(f"  [PASS] {'GDN Log-Space Chunk Scan':26s} | T={T} (>2×{SCAN_CHUNK}) | 强遗忘前向等价 & 反向全有限")
 
-# #############################################################################
-# Cell 6: 训练前门禁
-# #############################################################################
-@torch.no_grad()
+
 def run_architecture_and_streaming_tests():
     print("=" * 72)
-    print("参数量检查 & 流式↔离线等价性测试 (要求最大绝对误差 < 1e-4)")
+    print("参数量检查 & 流式↔离线等价 + 零前瞻膨胀 + 强遗忘梯度硬门禁 (误差 < 1e-4)")
     print("=" * 72)
-    T = 23
-    pids = torch.randint(4, FRONTEND.vocab_size, (1, T), dtype=torch.long)
-    lids = torch.randint(0, 3, (1, T), dtype=torch.long)
+    run_chunkwise_numerical_and_grad_tests()
 
-    for exp_name, bb_type, lookahead in EXPERIMENTS:
-        m = AetherAcousticModel(
-            vocab_size=FRONTEND.vocab_size, backbone_type=bb_type, d_model=CFG["d_model"],
-            n_mels=CFG["n_mels"], k_left=CFG["k_left"], lookahead=lookahead, swa_window=CFG["swa_window"],
-        ).eval()
-        infer_params = sum(p.numel() for n, p in m.named_parameters() if not n.startswith("aligner.")) / 1e6
-        mel_off, _, _, _ = m.infer_offline(pids, lids)
-        if m.is_streaming:
-            st = m.init_stream_state(1, device=pids.device, dtype=torch.float32)
-            chunks = []
-            step = CFG["stream_text_chunk"]
-            for i in range(0, T, step):
-                mc, st = m.infer_stream_step(pids[:, i:i+step], lids[:, i:i+step], st, is_final=(i + step >= T))
-                if mc.shape[-1] > 0:
-                    chunks.append(mc)
-            mel_str = torch.cat(chunks, dim=-1)
-            diff = (mel_off - mel_str).abs().max().item()
-            assert mel_str.shape == mel_off.shape and diff < 1e-4, f"{exp_name} streaming mismatch: {diff}"
-            print(f"  [PASS] {exp_name:26s} | Infer: {infer_params:.2f}M | L={lookahead} | Stream Diff: {diff:.2e}")
-        else:
-            print(f"  [PASS] {exp_name:26s} | Infer: {infer_params:.2f}M | (Offline Upper-Bound)")
+    with torch.no_grad():
+        T = 75  # > 2 * SCAN_CHUNK (32)，覆盖多块递推、滑窗截断与非整除尾块
+        pids = torch.randint(4, FRONTEND.vocab_size, (1, T), dtype=torch.long)
+        lids = torch.randint(0, 3, (1, T), dtype=torch.long)
 
-    voc = CausalVocosLite(n_mels=CFG["n_mels"], n_fft=CFG["n_fft"], hop_length=CFG["hop_length"]).eval()
-    mel_dummy = torch.randn(1, CFG["n_mels"], 53)
-    wav_off = voc(mel_dummy)
-    vst = voc.init_state(1, device=mel_dummy.device, dtype=torch.float32)
-    w_chunks = []
-    for i in range(0, 53, CFG["stream_mel_chunk"]):
-        wc, vst = voc.forward_step(mel_dummy[:, :, i:i+CFG["stream_mel_chunk"]], vst, is_final=(i + CFG["stream_mel_chunk"] >= 53))
-        if wc.shape[-1] > 0:
-            w_chunks.append(wc)
-    vdiff = (wav_off - torch.cat(w_chunks, dim=-1)).abs().max().item()
-    assert vdiff < 1e-4, f"Vocoder OLA mismatch: {vdiff}"
-    print(f"  [PASS] {'CausalVocosLite (24kHz)':26s} | Infer: {count_params_m(voc):.2f}M | OLA Diff: {vdiff:.2e}")
+        for exp_name, bb_type, lookahead in EXPERIMENTS:
+            m = AetherAcousticModel(
+                vocab_size=FRONTEND.vocab_size, backbone_type=bb_type, d_model=CFG["d_model"],
+                n_mels=CFG["n_mels"], k_left=CFG["k_left"], lookahead=lookahead,
+                swa_window=CFG["swa_window"], chunk_size=CFG["chunk_attn_size"],
+                frame_lookahead=CFG["frame_lookahead"],
+            ).eval()
+            infer_params = sum(p.numel() for n, p in m.named_parameters() if not n.startswith("aligner.")) / 1e6
+            mel_off, _, _, _ = m.infer_offline(pids, lids)
+            if m.is_streaming:
+                def _run_stream(step: int, empty_final: bool = False):
+                    st = m.init_stream_state(1, device=pids.device, dtype=torch.float32)
+                    chunks = []
+                    for i in range(0, T, step):
+                        mc, st = m.infer_stream_step(pids[:, i:i+step], lids[:, i:i+step], st, is_final=(i + step >= T and not empty_final))
+                        if mc.shape[-1] > 0:
+                            chunks.append(mc)
+                    if empty_final:
+                        mc, st = m.infer_stream_step(pids[:, :0], lids[:, :0], st, is_final=True)
+                        if mc.shape[-1] > 0:
+                            chunks.append(mc)
+                    return torch.cat(chunks, dim=-1)
+
+                mel_str = _run_stream(CFG["stream_text_chunk"], False)
+                diff = (mel_off - mel_str).abs().max().item()
+                assert mel_str.shape == mel_off.shape and diff < 1e-4, f"{exp_name} streaming mismatch: {diff}"
+                # 对分块深前瞻额外测 step=1 + 空块收尾，覆盖非整除 chunk 与 frame_decoder 空块 flush
+                if bb_type == "chunk_attn":
+                    mel_s1 = _run_stream(1, True)
+                    diff = max(diff, (mel_off - mel_s1).abs().max().item())
+                    assert mel_s1.shape == mel_off.shape and diff < 1e-4, f"{exp_name} step=1 streaming mismatch: {diff}"
+
+                # 零前瞻膨胀扰动测试：改写超出允许前瞻窗口的未来音素，验证已提交位置隐状态变化严格为 0
+                c_probe = 12  # 对齐 C=4 的第 3 块右边界
+                cutoff = c_probe + lookahead  # 严格禁止依赖 index >= cutoff 的任何信息
+                pids_pert = pids.clone()
+                pids_pert[:, cutoff:] = torch.randint(4, FRONTEND.vocab_size, (1, T - cutoff), dtype=torch.long)
+                h_ref = m.encode_text(pids, lids)
+                h_pert = m.encode_text(pids_pert, lids)
+                leak = (h_ref[:, :c_probe] - h_pert[:, :c_probe]).abs().max().item()
+                assert leak == 0.0, f"{exp_name} LOOKAHEAD EXPLOSION detected! leak={leak}"
+
+                # 验证批训练右填充等价（B=2 不同长度 vs B=1 无填充，确保右填充不污染有效句末前瞻）
+                T_short = 31
+                pids_b = torch.zeros(2, T, dtype=torch.long)
+                lids_b = torch.zeros(2, T, dtype=torch.long)
+                pids_b[0], lids_b[0] = pids[0], lids[0]
+                pids_b[1, :T_short], lids_b[1, :T_short] = pids[0, :T_short], lids[0, :T_short]
+                tmask_b = torch.arange(T)[None, :] < torch.tensor([T, T_short])[:, None]
+                h_batched = m.encode_text(pids_b, lids_b, text_mask=tmask_b)
+                h_single = m.encode_text(pids[:, :T_short], lids[:, :T_short])
+                pad_diff = (h_batched[1, :T_short] - h_single[0]).abs().max().item()
+                assert pad_diff < 1e-4, f"{exp_name} batched padding mismatch: {pad_diff}"
+
+                if bb_type == "chunk_attn":
+                    # 校验 Phase 2 流式前端原生接口 forward_committed_with_lookahead
+                    x_all = m.embed_text(pids, lids)
+                    st_c = m.backbone.init_state(1, x_all.device, x_all.dtype)
+                    out_c = []
+                    C_sz = CFG["chunk_attn_size"]
+                    for s in range(0, T, C_sz):
+                        xc = x_all[:, s : min(T, s + C_sz)]
+                        xl = x_all[:, min(T, s + C_sz) : min(T, s + C_sz + lookahead)]
+                        hc, st_c = m.backbone.forward_committed_with_lookahead(xc, xl, st_c)
+                        out_c.append(hc)
+                    api_diff = (h_ref - torch.cat(out_c, dim=1)).abs().max().item()
+                    assert api_diff < 1e-5, f"{exp_name} forward_committed_with_lookahead mismatch: {api_diff}"
+
+                print(f"  [PASS] {exp_name:26s} | Infer: {infer_params:.2f}M | L={lookahead} fL={CFG['frame_lookahead']} | Stream: {diff:.2e} | Leak: 0.0")
+            else:
+                print(f"  [PASS] {exp_name:26s} | Infer: {infer_params:.2f}M | (Offline Upper-Bound)")
+
+        # LookaheadConv1d 零前瞻零左上下文边界检查（防 buf[:, :, -0:] 全量切片回归）
+        la0 = LookaheadConv1d(8, 8, k_left=0, lookahead=0).eval()
+        x0 = torch.randn(1, 8, 7)
+        y0_off = la0(x0)
+        st0 = la0.init_state(1, x0.device, x0.dtype)
+        ys0 = []
+        for i in range(7):
+            yi, st0 = la0.forward_step(x0[:, :, i:i+1], st0, is_final=(i == 6))
+            ys0.append(yi)
+        assert (y0_off - torch.cat(ys0, dim=-1)).abs().max().item() < 1e-5, "LookaheadConv1d(0,0) mismatch"
+
+        voc = CausalVocosLite(n_mels=CFG["n_mels"], n_fft=CFG["n_fft"], hop_length=CFG["hop_length"], lookahead=CFG["vocoder_lookahead"]).eval()
+        mel_dummy = torch.randn(1, CFG["n_mels"], 53)
+        wav_off = voc(mel_dummy)
+
+        def _stream_voc_diff(m_step: int, empty_final: bool):
+            """逐块流式合成与离线对比。empty_final=True 时逐帧喂入并在末尾多送一个空块 is_final，
+            覆盖「块长 <= 前瞻帧数」与「右前瞻攒帧后的收尾 flush」两条边界路径"""
+            vst = voc.init_state(1, device=mel_dummy.device, dtype=torch.float32)
+            w_chunks = []
+            for i in range(0, 53, m_step):
+                wc, vst = voc.forward_step(mel_dummy[:, :, i:i+m_step], vst, is_final=(i + m_step >= 53 and not empty_final))
+                if wc.shape[-1] > 0:
+                    w_chunks.append(wc)
+            if empty_final:
+                wc, vst = voc.forward_step(mel_dummy[:, :, :0], vst, is_final=True)
+                if wc.shape[-1] > 0:
+                    w_chunks.append(wc)
+            wav_str = torch.cat(w_chunks, dim=-1)
+            assert wav_str.shape == wav_off.shape, f"Vocoder stream shape {tuple(wav_str.shape)} != offline {tuple(wav_off.shape)}"
+            return (wav_off - wav_str).abs().max().item()
+
+        vdiff = max(_stream_voc_diff(CFG["stream_mel_chunk"], False), _stream_voc_diff(1, True))
+        assert vdiff < 1e-4, f"Vocoder OLA mismatch: {vdiff}"
+        print(f"  [PASS] {'CausalVocosLite (24kHz)':26s} | Infer: {count_params_m(voc):.2f}M | Lookahead: {CFG['vocoder_lookahead']} 帧 | OLA Diff: {vdiff:.2e}")
     print("=" * 72)
 
 
 run_architecture_and_streaming_tests()
-
 if SELFTEST:
-    print('[SelfTest] 架构与流式等价门禁已通过，退出 --selftest 模式。')
+    print("[SelfTest] 架构、零前瞻膨胀、多块流式等价与强遗忘梯度门禁全部通过，退出 --selftest 模式。")
     import sys as _sys
     _sys.exit(0)
 
@@ -2373,18 +2690,22 @@ val_loader = DataLoader(
     num_workers=min(2, CFG["num_workers"]), collate_fn=acoustic_collate,
 )
 print(f"Train batches/epoch: {len(train_loader)} | Val batches: {len(val_loader)}")
-
-
 # ==============================================================================
 # 7b. 单步耗时分解（--profile-steps N）：定位数据/前向/对齐/反向各占多少
 # ==============================================================================
+def _acc_store(acc, k, dt):
+    acc[k] = acc.get(k, 0.0) + dt
+
+
 def _run_step_profile():
     if PROFILE_STEPS <= 0:
         return
     exp_name, bb_type, la = EXPERIMENTS[0]
     model = AetherAcousticModel(
         vocab_size=FRONTEND.vocab_size, backbone_type=bb_type, d_model=CFG["d_model"],
-        n_mels=CFG["n_mels"], k_left=CFG["k_left"], lookahead=la, swa_window=CFG["swa_window"],
+        n_mels=CFG["n_mels"], k_left=CFG["k_left"], lookahead=la,
+        swa_window=CFG["swa_window"], chunk_size=CFG["chunk_attn_size"],
+        frame_lookahead=CFG["frame_lookahead"],
     ).to(DEVICE).train()
     opt = torch.optim.AdamW(model.parameters(), lr=CFG["lr_acoustic"])
     pids_all, lids_all, tl_all, mels_all, f0_all, e_all, ml_all = next(iter(train_loader))
@@ -2415,12 +2736,12 @@ def _run_step_profile():
         _acc_store(acc, "bwd+opt", time.perf_counter() - tb0)
         _acc_store(acc, "e2e", time.perf_counter() - t0)
     n = max(1, PROFILE_STEPS)
-    print(f"[Profile] batch={pids.shape[0]} T={pids.shape[1]} F={mels.shape[-1]} | 每步平均耗时:")
+    print(f"[Profile] model={exp_name} batch={pids.shape[0]} T={pids.shape[1]} F={mels.shape[-1]} | 每步平均耗时:")
     for k in ("h2d", "fwd(含对齐)", "bwd+opt", "e2e"):
         print(f"  {k:12s}: {acc[k] / n * 1000:8.1f} ms")
     with torch.no_grad():
-        x_emb = model.phoneme_emb(pids) + model.lang_emb(lids)
         text_mask = torch.arange(pids.shape[1], device=pids.device)[None, :] < t_lens[:, None]
+        x_emb = model.embed_text(pids, lids, text_mask)
         prior = build_beta_binomial_log_prior(t_lens, m_lens, pids.shape[1], mels.shape[-1])
         attn_logprob, _ = model.aligner(mels, x_emb, text_mask, attn_log_prior=prior)
         for tag, fn in (("viterbi(fast)", viterbi_monotonic_alignment), ("viterbi(ref)", viterbi_monotonic_alignment_ref),
@@ -2434,17 +2755,12 @@ def _run_step_profile():
     sys.exit(0)
 
 
-def _acc_store(acc, k, dt):
-    acc[k] = acc.get(k, 0.0) + dt
-
-
 _run_step_profile()
-
 
 # #############################################################################
 # Cell 8: 声码器训练
 # #############################################################################
-VOC_TAG = f"causal_vocos_lite_{CFG['dataset_source']}_{CFG['profile']}"
+VOC_TAG = f"causal_vocos_lite_{CFG['run_suffix']}_L{CFG['vocoder_lookahead']}"
 VOC_STORAGE_DIR = STORAGE_ROOT / "vocoder" / VOC_TAG
 VOC_LOCAL_DIR = LOCAL_WORK / "vocoder" / VOC_TAG
 VOC_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -2452,7 +2768,7 @@ VOC_LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def train_or_load_causal_vocoder():
-    voc = CausalVocosLite(n_mels=CFG["n_mels"], n_fft=CFG["n_fft"], hop_length=CFG["hop_length"]).to(DEVICE)
+    voc = CausalVocosLite(n_mels=CFG["n_mels"], n_fft=CFG["n_fft"], hop_length=CFG["hop_length"], lookahead=CFG["vocoder_lookahead"]).to(DEVICE)
     disc = LiteVocoderDiscriminator().to(DEVICE)
     opt_g = torch.optim.AdamW(voc.parameters(), lr=CFG["lr_vocoder"], betas=(0.8, 0.99))
     opt_d = torch.optim.AdamW(disc.parameters(), lr=CFG["lr_vocoder"], betas=(0.8, 0.99))
@@ -2590,7 +2906,7 @@ TRAIN_HISTORIES = {}
 
 
 def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
-    tag = f"{exp_name}_{CFG['dataset_source']}_{CFG['profile']}"
+    tag = f"{exp_name}_{CFG['acoustic_suffix']}"
     run_local = LOCAL_WORK / "runs" / tag
     run_storage = STORAGE_ROOT / "runs" / tag
     run_local.mkdir(parents=True, exist_ok=True)
@@ -2609,7 +2925,9 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
 
     model = AetherAcousticModel(
         vocab_size=FRONTEND.vocab_size, backbone_type=backbone_type, d_model=CFG["d_model"],
-        n_mels=CFG["n_mels"], k_left=CFG["k_left"], lookahead=lookahead, swa_window=CFG["swa_window"],
+        n_mels=CFG["n_mels"], k_left=CFG["k_left"], lookahead=lookahead,
+        swa_window=CFG["swa_window"], chunk_size=CFG["chunk_attn_size"],
+        frame_lookahead=CFG["frame_lookahead"],
     ).to(DEVICE)
 
     if SKIP_IF_DONE and storage_done.exists() and (storage_best.exists() or storage_latest.exists()):
@@ -2927,8 +3245,8 @@ def synthesize_streaming(model: AetherAcousticModel, text: str, vocoder: CausalV
     return wav, mel_all, seam_positions
 
 
-EVAL_LOCAL_DIR = LOCAL_WORK / "eval_samples" / f"{CFG['dataset_source']}_{CFG['profile']}"
-EVAL_STORAGE_DIR = STORAGE_ROOT / "eval_samples" / f"{CFG['dataset_source']}_{CFG['profile']}"
+EVAL_LOCAL_DIR = LOCAL_WORK / "eval_samples" / f"{CFG['eval_suffix']}"
+EVAL_STORAGE_DIR = STORAGE_ROOT / "eval_samples" / f"{CFG['eval_suffix']}"
 EVAL_LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
 gt_dir = EVAL_LOCAL_DIR / "00_ground_truth"
@@ -3209,7 +3527,7 @@ for exp_name, model in TRAINED_MODELS.items():
 
     rtf_2t, ttfa_ms = benchmark_cpu_2thread(model, CAUSAL_VOCODER, bench_text)
     infer_params_m = sum(p.numel() for n, p in model.named_parameters() if not n.startswith("aligner.")) / 1e6
-    int8_path = STORAGE_ROOT / "runs" / f"{exp_name}_{CFG['dataset_source']}_{CFG['profile']}" / "model_int8.pt"
+    int8_path = STORAGE_ROOT / "runs" / f"{exp_name}_{CFG['acoustic_suffix']}" / "model_int8.pt"
     size_mb = round(int8_path.stat().st_size / 1e6, 2) if int8_path.exists() else round(infer_params_m * 4.0, 2)
 
     mean_utmos = _safe_nanmean(utmos_s)
@@ -3234,8 +3552,8 @@ for exp_name, model in TRAINED_MODELS.items():
 LEADERBOARD = pd.DataFrame(summary_rows).sort_values("Composite_Score↑", ascending=False).reset_index(drop=True)
 PER_SAMPLE_DF = pd.DataFrame(all_sample_rows)
 
-report_local = LOCAL_WORK / "reports" / f"{CFG['dataset_source']}_{CFG['profile']}"
-report_storage = STORAGE_ROOT / "reports" / f"{CFG['dataset_source']}_{CFG['profile']}"
+report_local = LOCAL_WORK / "reports" / f"{CFG['eval_suffix']}"
+report_storage = STORAGE_ROOT / "reports" / f"{CFG['eval_suffix']}"
 report_local.mkdir(parents=True, exist_ok=True)
 report_storage.mkdir(parents=True, exist_ok=True)
 
@@ -3355,4 +3673,4 @@ if RUN_TEACHER_SYNTH:
 else:
     print("当前跳过教师离线造数。")
 
-print('[All Done] 独立 Python 实验全部执行完毕！', flush=True)
+print("[All Done] 独立 Python 实验全部执行完毕！", flush=True)
