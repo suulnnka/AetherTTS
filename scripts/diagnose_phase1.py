@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-AetherTTS Phase 1 (a5) 深度诊断与 ChunkAttn 提速校验脚本。
+AetherTTS Phase 1 (a6) 深度诊断与 ChunkAttn 提速校验脚本。
 
 直接 import scripts/aethertts_lib.py（零正则 exec 脆弱耦合），复用 `./aethertts_exp` 产物，
 一次性检查：
   A. 模型训练历史 (history.json) 收敛趋势（val_mel / val_struct / val_f0 / val_uv / val_dur）
   B. Train vs Val 各分项损失分解（含归一化与原始 log-mel L1、共振峰结构损失、浊音 F0 与 UV 准确率）
   C. Aligner 深度体检（锐度、对角偏离、dur==1 塌缩率、dur_gt vs dur_pred 相关性 + 热力图 PNG）
-  D. 前端一致性审计（v3 缓存标贝儿化/韵律音素 vs 推理端文本 G2P 差异与 0-<unk> 校验）
+  D. 前端一致性审计（v4 缓存标贝儿化/韵律音素 vs 推理端文本 G2P 差异与 0-<unk> 校验）
   E. 8 链路逐级隔离评测（含 Teacher-Forced + 真/预测 F0+UV -> 预训练 Vocos / 谐波源 CausalVocosLite + CPU int8 Whisper CER + UTMOS + DTW Raw Mel L1）
   F. ChunkLookaheadBackbone 零循环并行 & 局部相对 RoPE 超长流式等价校验 + GPU/CPU 提速实测
 
@@ -43,7 +43,7 @@ def find_checkpoint(root: Path, model_name: str, profile: str, dataset: str, exp
         assert p.exists(), f"指定 checkpoint 不存在: {p}"
         return p
     runs_dir = root / "runs"
-    cands = sorted(runs_dir.glob(f"{model_name}_{dataset}_{profile}_a5*")) if runs_dir.exists() else []
+    cands = sorted(runs_dir.glob(f"{model_name}_{dataset}_{profile}_a6*")) if runs_dir.exists() else []
     if not cands and runs_dir.exists():
         cands = sorted(runs_dir.glob(f"{model_name}_{dataset}_{profile}_*")) or sorted(runs_dir.glob(f"{model_name}*"))
     for d in reversed(cands):
@@ -61,7 +61,7 @@ def find_vocoder_ckpt(root: Path, profile: str, dataset: str, explicit: str = ""
     if not voc_dir.exists():
         return None
     cands = (
-        sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_a5*"))
+        sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_a6*"))
         or sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_*"))
         or sorted(voc_dir.glob("causal_vocos_lite_*"))
     )
@@ -77,11 +77,11 @@ def find_manifest(root: Path, dataset: str, max_hours: float = None, explicit: s
         return p / "manifest.json" if p.is_dir() else p
     cache_dir = root / "cache"
     if max_hours is not None:
-        for ver in ("v3", "v2"):
+        for ver in ("v4", "v3", "v2"):
             exact = cache_dir / f"{dataset}_{ver}_max{max_hours}h" / "manifest.json"
             if exact.exists():
                 return exact
-    cands = sorted(cache_dir.glob(f"{dataset}_v3_max*h/manifest.json")) if cache_dir.exists() else []
+    cands = sorted(cache_dir.glob(f"{dataset}_v4_max*h/manifest.json")) if cache_dir.exists() else []
     if not cands and cache_dir.exists():
         cands = sorted(cache_dir.glob(f"{dataset}_*_max*h/manifest.json")) or sorted(cache_dir.glob("*/manifest.json"))
     if not cands:
@@ -355,7 +355,7 @@ def section_c_aligner_forensics(model, frontend, meta: dict, manifest_dir: Path,
 
 def section_d_frontend_audit(frontend, meta: dict, manifest_dir: Path, max_utts: int = 30):
     print("\n" + "=" * 78)
-    print("[D] 前端一致性审计（v3 缓存音素 vs 推理 G2P 差异与 <unk> 校验）")
+    print("[D] 前端一致性审计（v4 缓存音素 vs 推理 G2P 差异与 <unk> 校验）")
     print("=" * 78)
     entries = meta["val"][:max_utts]
     exact, tot_cached, tot_infer, unk_cached, unk_infer, tot_ed = 0, 0, 0, 0, 0, 0
@@ -575,7 +575,7 @@ def section_f_chunk_attn_benchmark(model, device: torch.device):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="AetherTTS Phase 1 (a5) 深度诊断脚本")
+    ap = argparse.ArgumentParser(description="AetherTTS Phase 1 (a6) 深度诊断脚本")
     ap.add_argument("--root", default="./aethertts_exp")
     ap.add_argument("--profile", default="standard_phase1")
     ap.add_argument("--dataset", default="bznsyp")

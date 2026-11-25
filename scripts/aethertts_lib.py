@@ -91,27 +91,48 @@ def _get_en_g2p():
     try:
         from g2p_en import G2p
         import nltk
-        missing = []
-        for _res_path, _res_name in [
+        def _has_nltk(path):
+            try:
+                nltk.data.find(path)
+                return True
+            except LookupError:
+                return False
+
+        _tried_dl = set()
+
+        def _dl_nltk(name):
+            if name in _tried_dl:
+                return False
+            _tried_dl.add(name)
+            try:
+                ok = nltk.download(name, quiet=True)
+            except Exception as _e_dl:
+                print(f"[Warn] nltk.download({name}) 异常: {_e_dl}")
+                return False
+            if not ok:
+                print(f"[Warn] nltk.download({name}) 失败")
+            return bool(ok)
+
+        if not _has_nltk("corpora/cmudict") and not _dl_nltk("cmudict"):
+            raise RuntimeError("nltk 数据缺失 cmudict，请手动 nltk.download('cmudict') 或设置 NLTK_DATA")
+        _taggers = [
             ("taggers/averaged_perceptron_tagger_eng", "averaged_perceptron_tagger_eng"),
             ("taggers/averaged_perceptron_tagger", "averaged_perceptron_tagger"),
-            ("corpora/cmudict", "cmudict"),
-        ]:
-            try:
-                nltk.data.find(_res_path)
-            except LookupError:
-                # 下载失败必须显式告警并最终让 G2P 初始化失败，不能静默吞掉后继续训练
-                try:
-                    _ok = nltk.download(_res_name, quiet=True)
-                except Exception as _e_dl:
-                    _ok = False
-                    print(f"[Warn] nltk.download({_res_name}) 异常: {_e_dl}")
-                if not _ok:
-                    print(f"[Warn] nltk.download({_res_name}) 失败")
-                    missing.append(_res_name)
-        if missing:
-            raise RuntimeError(f"nltk 数据缺失 {missing}，请手动 nltk.download('<name>') 或设置 NLTK_DATA")
-        _EN_G2P = G2p()
+        ]
+        # 不同 NLTK 版本只需对应版本的 tagger（<3.8.2 用 legacy，>=3.8.2 用 _eng）：已有其一时先不触发网络下载，避免离线环境误杀或空等超时
+        if not any(_has_nltk(p) for p, _ in _taggers):
+            for _p, _n in _taggers:
+                _dl_nltk(_n)
+        _g2p = G2p()
+        try:
+            _g2p("test")
+        except LookupError:
+            # 仅安装了旧/新其中一版 tagger 与当前 NLTK 版本不匹配时，补下缺失的一版再试一次
+            for _p, _n in _taggers:
+                if not _has_nltk(_p):
+                    _dl_nltk(_n)
+            _g2p("test")
+        _EN_G2P = _g2p
     except Exception as e:
         print(f"[Warn] g2p_en unavailable ({e})：英文词将退化为逐字母拼读，仅适合没有英文训练数据的场景。")
         _EN_G2P = None
@@ -546,11 +567,24 @@ class BilingualPhonemeFrontend:
         return cls._int_to_en(int(num_str))
 
     @classmethod
+    def _en_decade(cls, n: int) -> str:
+        """年代读法：1960s -> nineteen sixties，1900s -> nineteen hundreds，2000s -> two thousands，2010s -> twenty tens。"""
+        hi, lo = n // 100, n % 100
+        if lo == 0:
+            return "two thousands" if n == 2000 else f"{cls._int_to_en(hi)} hundreds"
+        if lo == 10:
+            return f"{cls._int_to_en(hi)} tens"
+        return f"{cls._int_to_en(hi)} {_EN_TENS[lo // 10][:-1]}ies"
+
+    @classmethod
     def _normalize_en_numbers(cls, text: str) -> str:
-        """千分位逗号、序数词（1st/2nd/3rd/…th 与旧式 3d）、年份语境、基数词与小数；与字母粘连的编号（3D / B2B）不转写。"""
+        """千分位逗号、百分比、年代（1960s）、序数词（1st/2nd/3rd/…th 与旧式 2d/3d）、年份语境、基数词与小数；与字母粘连的编号（3D / B2B）不转写。"""
         text = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", text)
-        text = re.sub(r"\b(\d{1,3})(?:st|nd|rd|th)\b", lambda m: cls._en_ordinal(int(m.group(1))), text, flags=re.I)
-        text = re.sub(r"\b(\d{1,3})d\b", lambda m: cls._en_ordinal(int(m.group(1))), text)
+        text = re.sub(r"(?<![\w.])(\d+(?:\.\d+)?)%", lambda m: cls._num_to_en(m.group(1)) + " percent", text)
+        text = re.sub(r"\b(1[1-9]\d0|20\d0)s\b", lambda m: cls._en_decade(int(m.group(1))), text)
+        text = re.sub(r"\b(\d{1,6})(?:st|nd|rd|th)\b", lambda m: cls._en_ordinal(int(m.group(1))), text, flags=re.I)
+        # 旧式 d 序数仅存在于个位为 2/3 且非 12/13 的数（2d/3d/22d/23d…），避免误伤 5d / 10d / 30d
+        text = re.sub(r"\b((?:[1-9]\d*)?[02-9][23]|[23])d\b", lambda m: cls._en_ordinal(int(m.group(1))), text)
         text = re.sub(
             r"\b(in|by|since|until|from|to|before|after|between|and|year)\s+(1[1-9]\d{2}|20\d{2})\b",
             lambda m: f"{m.group(1)} {cls._en_year(int(m.group(2)))}", text, flags=re.I,
@@ -733,7 +767,9 @@ class BilingualPhonemeFrontend:
         if seg_fn is not None:
             for w in seg_fn(span):
                 if c0 < len(syl_of_char) and w not in _ENCLITIC_PARTICLES:
-                    word_start_syls.add(syl_of_char[c0])
+                    # 若分词把儿化尾「儿」单独切出，它属于前一字合并后的同一音节，不应误标为词首
+                    if c0 == 0 or syl_of_char[c0] != syl_of_char[c0 - 1]:
+                        word_start_syls.add(syl_of_char[c0])
                 c0 += len(w)
         else:
             word_start_syls = set(range(0, len(m_pys), 2))
@@ -782,7 +818,7 @@ class BilingualPhonemeFrontend:
             ch = norm_t[i]
             if ch in _BZ_MARK_CHARS:
                 if ch != _BZ_MARK["#4"]:
-                    pending_bound = 2 + _BZ_MARK_CHARS.index(ch)  # #1 韵律词=2 / #2 韵律短语=3 / #3 语调短语=4
+                    pending_bound = max(pending_bound, 2 + _BZ_MARK_CHARS.index(ch))  # #1 韵律词=2 / #2 韵律短语=3 / #3 语调短语=4
                 i += 1
                 continue
             if ch in (",", ".", "?", "!", ";", ":"):
@@ -845,14 +881,17 @@ class BilingualPhonemeFrontend:
                         bounds.append(pending_b if idx_p == 0 else 0)
                     pending_b = 1
         else:
-            norm = self.normalize_text(text)
-            pattern = re.compile(r"([\u4e00-\u9fff]+|[A-Za-z][A-Za-z'\-]*|#[1-4]|[,\.\?!;:])")
+            raw = text
+            for _mk, _ph in _BZ_MARK.items():
+                raw = raw.replace(_mk, _ph)
+            norm = self.normalize_text(raw)
+            pattern = re.compile(rf"([\u4e00-\u9fff]+|[A-Za-z][A-Za-z'\-]*|[{re.escape(_BZ_MARK_CHARS)}]|[,\.\?!;:])")
             pending_b = 4  # 句首视为语调短语首
             for m in pattern.finditer(norm):
                 seg = m.group(0)
-                if seg in ("#1", "#2", "#3", "#4"):
-                    if seg != "#4":
-                        pending_b = 1 + int(seg[1])
+                if seg in _BZ_MARK_CHARS:
+                    if seg != _BZ_MARK["#4"]:
+                        pending_b = max(pending_b, 2 + _BZ_MARK_CHARS.index(seg))
                 elif re.match(r"^[\u4e00-\u9fff]+$", seg):
                     phs, bds = self._zh_span_to_phonemes_and_bounds(seg, first_bound=pending_b)
                     for ph, bd in zip(phs, bds):

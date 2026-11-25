@@ -389,27 +389,48 @@ def _get_en_g2p():
     try:
         from g2p_en import G2p
         import nltk
-        missing = []
-        for _res_path, _res_name in [
+        def _has_nltk(path):
+            try:
+                nltk.data.find(path)
+                return True
+            except LookupError:
+                return False
+
+        _tried_dl = set()
+
+        def _dl_nltk(name):
+            if name in _tried_dl:
+                return False
+            _tried_dl.add(name)
+            try:
+                ok = nltk.download(name, quiet=True)
+            except Exception as _e_dl:
+                print(f"[Warn] nltk.download({name}) 异常: {_e_dl}")
+                return False
+            if not ok:
+                print(f"[Warn] nltk.download({name}) 失败")
+            return bool(ok)
+
+        if not _has_nltk("corpora/cmudict") and not _dl_nltk("cmudict"):
+            raise RuntimeError("nltk 数据缺失 cmudict，请手动 nltk.download('cmudict') 或设置 NLTK_DATA")
+        _taggers = [
             ("taggers/averaged_perceptron_tagger_eng", "averaged_perceptron_tagger_eng"),
             ("taggers/averaged_perceptron_tagger", "averaged_perceptron_tagger"),
-            ("corpora/cmudict", "cmudict"),
-        ]:
-            try:
-                nltk.data.find(_res_path)
-            except LookupError:
-                # 下载失败必须显式告警并最终让 G2P 初始化失败，不能静默吞掉后继续训练
-                try:
-                    _ok = nltk.download(_res_name, quiet=True)
-                except Exception as _e_dl:
-                    _ok = False
-                    print(f"[Warn] nltk.download({_res_name}) 异常: {_e_dl}")
-                if not _ok:
-                    print(f"[Warn] nltk.download({_res_name}) 失败")
-                    missing.append(_res_name)
-        if missing:
-            raise RuntimeError(f"nltk 数据缺失 {missing}，请手动 nltk.download('<name>') 或设置 NLTK_DATA")
-        _EN_G2P = G2p()
+        ]
+        # 不同 NLTK 版本只需对应版本的 tagger（<3.8.2 用 legacy，>=3.8.2 用 _eng）：已有其一时先不触发网络下载，避免离线环境误杀或空等超时
+        if not any(_has_nltk(p) for p, _ in _taggers):
+            for _p, _n in _taggers:
+                _dl_nltk(_n)
+        _g2p = G2p()
+        try:
+            _g2p("test")
+        except LookupError:
+            # 仅安装了旧/新其中一版 tagger 与当前 NLTK 版本不匹配时，补下缺失的一版再试一次
+            for _p, _n in _taggers:
+                if not _has_nltk(_p):
+                    _dl_nltk(_n)
+            _g2p("test")
+        _EN_G2P = _g2p
     except Exception as e:
         print(f"[Warn] g2p_en unavailable ({e})：英文词将退化为逐字母拼读，仅适合没有英文训练数据的场景。")
         _EN_G2P = None
@@ -844,11 +865,24 @@ class BilingualPhonemeFrontend:
         return cls._int_to_en(int(num_str))
 
     @classmethod
+    def _en_decade(cls, n: int) -> str:
+        """年代读法：1960s -> nineteen sixties，1900s -> nineteen hundreds，2000s -> two thousands，2010s -> twenty tens。"""
+        hi, lo = n // 100, n % 100
+        if lo == 0:
+            return "two thousands" if n == 2000 else f"{cls._int_to_en(hi)} hundreds"
+        if lo == 10:
+            return f"{cls._int_to_en(hi)} tens"
+        return f"{cls._int_to_en(hi)} {_EN_TENS[lo // 10][:-1]}ies"
+
+    @classmethod
     def _normalize_en_numbers(cls, text: str) -> str:
-        """千分位逗号、序数词（1st/2nd/3rd/…th 与旧式 3d）、年份语境、基数词与小数；与字母粘连的编号（3D / B2B）不转写。"""
+        """千分位逗号、百分比、年代（1960s）、序数词（1st/2nd/3rd/…th 与旧式 2d/3d）、年份语境、基数词与小数；与字母粘连的编号（3D / B2B）不转写。"""
         text = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", text)
-        text = re.sub(r"\b(\d{1,3})(?:st|nd|rd|th)\b", lambda m: cls._en_ordinal(int(m.group(1))), text, flags=re.I)
-        text = re.sub(r"\b(\d{1,3})d\b", lambda m: cls._en_ordinal(int(m.group(1))), text)
+        text = re.sub(r"(?<![\w.])(\d+(?:\.\d+)?)%", lambda m: cls._num_to_en(m.group(1)) + " percent", text)
+        text = re.sub(r"\b(1[1-9]\d0|20\d0)s\b", lambda m: cls._en_decade(int(m.group(1))), text)
+        text = re.sub(r"\b(\d{1,6})(?:st|nd|rd|th)\b", lambda m: cls._en_ordinal(int(m.group(1))), text, flags=re.I)
+        # 旧式 d 序数仅存在于个位为 2/3 且非 12/13 的数（2d/3d/22d/23d…），避免误伤 5d / 10d / 30d
+        text = re.sub(r"\b((?:[1-9]\d*)?[02-9][23]|[23])d\b", lambda m: cls._en_ordinal(int(m.group(1))), text)
         text = re.sub(
             r"\b(in|by|since|until|from|to|before|after|between|and|year)\s+(1[1-9]\d{2}|20\d{2})\b",
             lambda m: f"{m.group(1)} {cls._en_year(int(m.group(2)))}", text, flags=re.I,
@@ -1031,7 +1065,9 @@ class BilingualPhonemeFrontend:
         if seg_fn is not None:
             for w in seg_fn(span):
                 if c0 < len(syl_of_char) and w not in _ENCLITIC_PARTICLES:
-                    word_start_syls.add(syl_of_char[c0])
+                    # 若分词把儿化尾「儿」单独切出，它属于前一字合并后的同一音节，不应误标为词首
+                    if c0 == 0 or syl_of_char[c0] != syl_of_char[c0 - 1]:
+                        word_start_syls.add(syl_of_char[c0])
                 c0 += len(w)
         else:
             word_start_syls = set(range(0, len(m_pys), 2))
@@ -1080,7 +1116,7 @@ class BilingualPhonemeFrontend:
             ch = norm_t[i]
             if ch in _BZ_MARK_CHARS:
                 if ch != _BZ_MARK["#4"]:
-                    pending_bound = 2 + _BZ_MARK_CHARS.index(ch)  # #1 韵律词=2 / #2 韵律短语=3 / #3 语调短语=4
+                    pending_bound = max(pending_bound, 2 + _BZ_MARK_CHARS.index(ch))  # #1 韵律词=2 / #2 韵律短语=3 / #3 语调短语=4
                 i += 1
                 continue
             if ch in (",", ".", "?", "!", ";", ":"):
@@ -1143,14 +1179,17 @@ class BilingualPhonemeFrontend:
                         bounds.append(pending_b if idx_p == 0 else 0)
                     pending_b = 1
         else:
-            norm = self.normalize_text(text)
-            pattern = re.compile(r"([\u4e00-\u9fff]+|[A-Za-z][A-Za-z'\-]*|#[1-4]|[,\.\?!;:])")
+            raw = text
+            for _mk, _ph in _BZ_MARK.items():
+                raw = raw.replace(_mk, _ph)
+            norm = self.normalize_text(raw)
+            pattern = re.compile(rf"([\u4e00-\u9fff]+|[A-Za-z][A-Za-z'\-]*|[{re.escape(_BZ_MARK_CHARS)}]|[,\.\?!;:])")
             pending_b = 4  # 句首视为语调短语首
             for m in pattern.finditer(norm):
                 seg = m.group(0)
-                if seg in ("#1", "#2", "#3", "#4"):
-                    if seg != "#4":
-                        pending_b = 1 + int(seg[1])
+                if seg in _BZ_MARK_CHARS:
+                    if seg != _BZ_MARK["#4"]:
+                        pending_b = max(pending_b, 2 + _BZ_MARK_CHARS.index(seg))
                 elif re.match(r"^[\u4e00-\u9fff]+$", seg):
                     phs, bds = self._zh_span_to_phonemes_and_bounds(seg, first_bound=pending_b)
                     for ph, bd in zip(phs, bds):
@@ -2771,6 +2810,10 @@ def run_frontend_phonology_tests():
     assert toks_bz[-2] == "." and toks_bz.count("zh_er_coda") == 2, toks_bz
     bz2 = FRONTEND.parse_bznsyp_prosody("卡#1门#2跪#3#4求#2", "ka3 men2 gui3 qiu2")
     assert [(s, b) for s, is_p, b in bz2 if not is_p] == [("ka3", 4), ("men2", 2), ("gui3", 3), ("qiu2", 4)], bz2
+    # 直接传入带 #1/#2/#3/#4 的文本走 text_to_ids 同样不得把数字转成「一」，并保留分级边界
+    pids_mk, _, bids_mk = FRONTEND.text_to_ids("卡#1门#2跪#3#4求")
+    toks_mk = [FRONTEND.id2tok[x] for x in pids_mk]
+    assert "zh_i1" not in toks_mk and [bids_mk[toks_mk.index(t)] for t in ("zh_k", "zh_m", "zh_g", "zh_q")] == [4, 2, 3, 4], list(zip(toks_mk, bids_mk))
 
     # 验证推理期口语儿化与「一/不/叠字」变调
     pids_inf, _, _ = FRONTEND.text_to_ids("一会儿见，看一看，不要紧。")
@@ -2794,8 +2837,11 @@ def run_frontend_phonology_tests():
     assert FRONTEND.normalize_text("In 1861, page 39, the 4th of May.") == "In eighteen sixty one, page thirty nine, the fourth of May."
     assert FRONTEND.normalize_text("1,234.5 units; the 3d of June; 20th, 21st, 2nd") == "one thousand two hundred thirty four point five units; the third of June; twentieth, twenty first, second"
     assert FRONTEND.normalize_text("3D and B2B stay 1:1") == "3D and B2B stay one:one"
-    assert FRONTEND.normalize_text("1st 2nd 3rd 4th 11th 12th 13th 20th 21st 23rd 30th 100th 121st") == (
-        "first second third fourth eleventh twelfth thirteenth twentieth twenty first twenty third thirtieth one hundredth one hundred twenty first"
+    assert FRONTEND.normalize_text("1st 2nd 3rd 4th 11th 12th 13th 20th 21st 23rd 30th 100th 121st 1000th") == (
+        "first second third fourth eleventh twelfth thirteenth twentieth twenty first twenty third thirtieth one hundredth one hundred twenty first one thousandth"
+    )
+    assert FRONTEND.normalize_text("2d 3d 23d vs 5d 10d 12d 13d 30d; 50% in the 1960s and 2000s") == (
+        "second third twenty third vs 5d 10d 12d 13d 30d; fifty percent in the nineteen sixties and two thousands"
     )
     assert FRONTEND.normalize_text("from 1809 to 1811; between 1900 and 2005; 2,500 men in 1812") == (
         "from eighteen oh nine to eighteen eleven; between nineteen hundred and two thousand five; two thousand five hundred men in eighteen twelve"
@@ -3380,8 +3426,8 @@ def download_and_prepare_dataset(cfg):
     else:
         raise ValueError(f"Unsupported DATASET_SOURCE: {src}")
 
-    # 含英文的训练语料必须有真正的英文 G2P：逐字母回退会把所有英文词拼成字母名，整份文本失真，默认直接报错
-    n_en_utts = sum(1 for it in items if re.search(r"[A-Za-z]{2,}", it["text"]))
+    # 仅对真正会走文本 G2P 的语料（无拼音标注 line_py）强校验 g2p_en：BZNSYP 走拼音标注不调用 g2p_en，不应被少量英文缩写误杀
+    n_en_utts = sum(1 for it in items if it.get("line_py") is None and re.search(r"[A-Za-z]{2,}", it["text"]))
     if n_en_utts > 0:
         if FRONTEND.en_g2p() is None:
             if os.environ.get("AETHER_ALLOW_EN_FALLBACK", "0") == "1":
@@ -4727,7 +4773,7 @@ def benchmark_cpu_2thread_and_int8(model: AetherAcousticModel, vocoder: CausalVo
     need_chars, n_chars = [], 0
     for i in range(0, T, t_step):
         need_ph = min(i + t_step, T - 1) - 1  # 不含 <bos>/<eos>
-        while n_chars < len(norm_txt) and len(FRONTEND.text_to_ids(norm_txt[:n_chars + 1])[0]) - 2 < need_ph:
+        while n_chars < len(norm_txt) and len(FRONTEND.text_to_ids(norm_txt[:n_chars])[0]) - 2 < need_ph:
             n_chars += 1
         need_chars.append(n_chars)
     arrival_s = [max(n - 1, 0) / chars_per_tok / tok_rate for n in need_chars]
@@ -4740,6 +4786,8 @@ def benchmark_cpu_2thread_and_int8(model: AetherAcousticModel, vocoder: CausalVo
             mel_buf = torch.zeros(1, CFG["n_mels"], 0)
             first_emitted, first_need = False, (len(norm_txt), T - 2)
             for ci, i in enumerate(range(0, T, t_step)):
+                # paced：文本块到达后才能算，此前的计算与等待重叠；非 paced：整句已在手，纯累加计算耗时
+                chunk_start_clock = max(clock, arrival_s[ci]) if paced else clock
                 t0 = time.perf_counter()
                 is_last = (i + t_step >= T)
                 mc, ast_st = m_cpu.infer_stream_step(
@@ -4757,12 +4805,11 @@ def benchmark_cpu_2thread_and_int8(model: AetherAcousticModel, vocoder: CausalVo
                     total_samples += wc.shape[-1]
                     if wc.shape[-1] > 0:
                         first_emitted = True
-                dt = time.perf_counter() - t0
-                # paced：文本块到达后才能算，此前的计算与等待重叠；非 paced：整句已在手，纯累加计算耗时
-                clock = (max(clock, arrival_s[ci]) if paced else clock) + dt
-                if ttfa_ms is None and first_emitted:
-                    ttfa_ms = clock * 1000.0
-                    first_need = (need_chars[ci], min(i + t_step, T - 1) - 1)
+                        if ttfa_ms is None:
+                            # 首包一产出立刻记时，避免把同一文本块内后续 16 帧稳态块耗时算进 TTFA
+                            ttfa_ms = (chunk_start_clock + (time.perf_counter() - t0)) * 1000.0
+                            first_need = (need_chars[ci], min(i + t_step, T - 1) - 1)
+                clock = chunk_start_clock + (time.perf_counter() - t0)
                 if is_last:
                     t0 = time.perf_counter()
                     wc, voc_st = v_cpu.forward_step(mel_buf, voc_st, is_final=True)
@@ -4775,7 +4822,8 @@ def benchmark_cpu_2thread_and_int8(model: AetherAcousticModel, vocoder: CausalVo
         mel = denorm_mel(m_cpu.infer_offline(pt, lt, boundary_ids=bt)[0])
         audio_sec = max((v_cpu(mel).shape[-1] if v_cpu is not None else mel.shape[-1] * CFG["hop_length"]) / CFG["sample_rate"], 1e-3)
         elapsed = time.perf_counter() - t_start
-        return elapsed / audio_sec, elapsed * 1000.0, (len(norm_txt), T - 2)
+        wait_s = arrival_s[-1] if (paced and arrival_s) else 0.0
+        return elapsed / audio_sec, (wait_s + elapsed) * 1000.0, (len(norm_txt), T - 2)
 
     _run_once(False); _run_once(True)
     runs = [_run_once(False) for _ in range(3)]
