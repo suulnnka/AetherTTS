@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AetherTTS Phase 1 (a5) — 纯模型与前端基础设施定义库（import 零副作用）。
+AetherTTS Phase 1 (a6) — 纯模型与前端基础设施定义库（import 零副作用）。
 
 由 scripts/sync_phase1_script.py 从 notebooks/AetherTTS_Colab_Phase1_Experiment.ipynb
 的 Cell 3 与 Cell 5 确定性生成（请勿手改本文件，修改 Notebook 后运行 sync_phase1_script.py 即可同步）。
@@ -57,6 +57,7 @@ import re
 import copy
 import ctypes
 import subprocess
+import socket
 import unicodedata
 import numpy as np
 import soundfile as sf
@@ -70,6 +71,13 @@ from pypinyin import pinyin, Style
 
 _EN_G2P = None
 _EN_G2P_INIT_TRIED = False
+_ZH_WORD_SEG = None
+_ZH_WORD_SEG_TRIED = False
+# 结构助词 / 体标记 / 复数标记永远附着在前一个词上，不自成韵律词
+_ENCLITIC_PARTICLES = {"的", "地", "得", "了", "着", "过", "们"}
+# 标贝韵律符 -> 控制字符占位符：解析前先替换，保护 #1 的数字不被 normalize_text 转成汉字
+_BZ_MARK = {"#1": "\x01", "#2": "\x02", "#3": "\x03", "#4": "\x04"}
+_BZ_MARK_CHARS = "".join(_BZ_MARK.values())
 
 
 def _get_en_g2p():
@@ -77,9 +85,13 @@ def _get_en_g2p():
     if _EN_G2P_INIT_TRIED:
         return _EN_G2P
     _EN_G2P_INIT_TRIED = True
+    # g2p_en 的 import 与 nltk.download 都没有超时参数：临时设 socket 超时，防代理 / 受限网络下无限挂起
+    _prev_to = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(30.0)
     try:
         from g2p_en import G2p
         import nltk
+        missing = []
         for _res_path, _res_name in [
             ("taggers/averaged_perceptron_tagger_eng", "averaged_perceptron_tagger_eng"),
             ("taggers/averaged_perceptron_tagger", "averaged_perceptron_tagger"),
@@ -88,15 +100,43 @@ def _get_en_g2p():
             try:
                 nltk.data.find(_res_path)
             except LookupError:
+                # 下载失败必须显式告警并最终让 G2P 初始化失败，不能静默吞掉后继续训练
                 try:
-                    nltk.download(_res_name, quiet=True)
-                except Exception:
-                    pass
+                    _ok = nltk.download(_res_name, quiet=True)
+                except Exception as _e_dl:
+                    _ok = False
+                    print(f"[Warn] nltk.download({_res_name}) 异常: {_e_dl}")
+                if not _ok:
+                    print(f"[Warn] nltk.download({_res_name}) 失败")
+                    missing.append(_res_name)
+        if missing:
+            raise RuntimeError(f"nltk 数据缺失 {missing}，请手动 nltk.download('<name>') 或设置 NLTK_DATA")
         _EN_G2P = G2p()
     except Exception as e:
-        print(f"[Warn] g2p_en unavailable ({e}), falling back to character-level EN G2P.")
+        print(f"[Warn] g2p_en unavailable ({e})：英文词将退化为逐字母拼读，仅适合没有英文训练数据的场景。")
         _EN_G2P = None
+    finally:
+        socket.setdefaulttimeout(_prev_to)
     return _EN_G2P
+
+
+def _get_zh_word_segmenter():
+    """推理期韵律词边界的近似来源：jieba 词典分词取词首（标贝 #1 韵律词边界主要就是词边界）。
+    无 jieba 时退化为「每 2 个音节一个边界」的机械规则并显式告警。"""
+    global _ZH_WORD_SEG, _ZH_WORD_SEG_TRIED
+    if _ZH_WORD_SEG_TRIED:
+        return _ZH_WORD_SEG
+    _ZH_WORD_SEG_TRIED = True
+    try:
+        import logging
+        import jieba
+        jieba.setLogLevel(logging.WARNING)
+        jieba.lcut("预热")  # 在主线程完成词典加载，避免首次调用落在多线程里
+        _ZH_WORD_SEG = jieba.lcut
+    except Exception as e:
+        print(f"[Warn] jieba unavailable ({e})：推理期韵律词边界退化为每 2 个音节一个（建议 pip install jieba）。")
+        _ZH_WORD_SEG = None
+    return _ZH_WORD_SEG
 
 
 def set_seed(seed: int = 42):
@@ -338,7 +378,9 @@ def extract_f0_and_energy(wav: np.ndarray, sr: int = 24000, hop_length: int = 25
 #   - 区分齐齿呼 i 与舌尖前/后元音 ii (zi/ci/si) / iii (zhi/chi/shi/ri)
 #   - 还原 y/w 零声母与 iu->iou / ui->uei / un->uen / ue->ve 省写，覆盖全部 20,901 个 CJK 汉字零 <unk>
 #   - 显式儿化韵尾 zh_er_coda + 完整「一 / 不 / A-一-A / 双音节韵律步三声」变调
-#   - 用音素级词/韵律边界标记 boundary_ids (0: 音节内, 1: 词内音节首, 2: 词/韵律词/语种切换首) 替代抢占连读辅音帧的 <sp>
+#   - 用音素级韵律边界标记 boundary_ids 替代抢占连读辅音帧的 <sp>：
+#       0 = 音节内非首音素（韵母 / 儿化尾），1 = 韵律词内音节首，2 = 韵律词首（标贝 #1 / 分词词首），
+#       3 = 韵律短语首（#2），4 = 语调短语首（#3 / 标点之后 / 句首）；训练用标注，推理用分词近似
 # ------------------------------------------------------------------------------
 ZH_INITIALS = [
     "b", "p", "m", "f", "d", "t", "n", "l", "g", "k", "h",
@@ -372,6 +414,9 @@ _W_RESTORE = {
 }
 _ABBREV_RESTORE = {"iu": "iou", "ui": "uei", "un": "uen"}
 _NASAL_SYL_MAP = {"hm": ("h", "en"), "hng": ("h", "eng"), "m": ("m", "u"), "n": ("n", "en"), "ng": ("n", "eng")}
+_EN_ONES = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"]
+_EN_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+_EN_ORD_SMALL = {1: "first", 2: "second", 3: "third", 5: "fifth", 8: "eighth", 9: "ninth", 12: "twelfth"}
 
 # 非儿化词汇表（防止把实义「儿 / 尔」误合并为前一字的儿化尾音）
 NON_ERHUA_WORDS = {
@@ -399,6 +444,11 @@ class BilingualPhonemeFrontend:
         self.bos_id = self.tok2id["<bos>"]
         self.eos_id = self.tok2id["<eos>"]
         self.unk_id = self.tok2id["<unk>"]
+
+    @staticmethod
+    def en_g2p():
+        """真实英文 G2P（g2p_en）；返回 None 表示只能逐字母拼读回退。"""
+        return _get_en_g2p()
 
     @property
     def vocab_size(self) -> int:
@@ -430,6 +480,83 @@ class BilingualPhonemeFrontend:
             return digits[n // 100] + "百" + digits[rem // 10] + "十" + ("" if rem % 10 == 0 else digits[rem % 10])
         return "".join(digits[int(c)] for c in num_str)
 
+    # ---- 纯英文数字转写（LJSpeech 等无汉字文本）。此前数字既不转写、也不被分词正则捕获，会被整段丢弃 ----
+    @staticmethod
+    def _int_to_en(n: int) -> str:
+        if n == 0:
+            return "zero"
+        if n >= 10 ** 12:
+            return " ".join(_EN_ONES[int(c)] for c in str(n))
+
+        def _three(v):
+            if v < 20:
+                return _EN_ONES[v]
+            if v < 100:
+                return _EN_TENS[v // 10] + ("" if v % 10 == 0 else " " + _EN_ONES[v % 10])
+            return _EN_ONES[v // 100] + " hundred" + ("" if v % 100 == 0 else " " + _three(v % 100))
+
+        parts = []
+        for i, scale in enumerate(("", " thousand", " million", " billion")):
+            v = (n // (1000 ** i)) % 1000
+            if v:
+                parts.append(_three(v) + scale)
+        return " ".join(reversed(parts))
+
+    @classmethod
+    def _en_ordinal(cls, n: int) -> str:
+        """英文序数：first/second/third/fifth/eighth/ninth/twelfth 不规则，整十 y->ieth（twentieth），
+        13-19 与带个位的复合数只变最后一个词（twenty first, one hundred thirteenth），其余为 cardinal + th。"""
+        r, o = n % 100, n % 10
+
+        def _with_head(head_num, last):
+            head = cls._int_to_en(head_num) + " " if head_num > 0 else ""
+            return head + last
+
+        if 0 < r < 13:
+            return _with_head(n - r, _EN_ORD_SMALL.get(r, _EN_ONES[r] + "th"))
+        if 13 <= r <= 19:
+            return _with_head(n - r, _EN_ONES[r] + "th")
+        if r % 10 == 0:
+            if 20 <= r <= 90:
+                return _with_head(n - r, _EN_TENS[r // 10][:-1] + "ieth")  # twenty -> twentieth, fifty -> fiftieth
+            words = cls._int_to_en(n).split()  # one hundredth / one thousandth
+            words[-1] += "th"
+            return " ".join(words)
+        return _with_head(n - o, _EN_ORD_SMALL.get(o, _EN_ONES[o] + "th"))
+
+    @classmethod
+    def _en_year(cls, n: int) -> str:
+        """年份读法：1861 -> eighteen sixty one，1805 -> eighteen oh five，1900 -> nineteen hundred，2026 -> twenty twenty six。"""
+        hi, lo = n // 100, n % 100
+        if 2010 <= n <= 2099:
+            return f"{cls._int_to_en(hi)} {cls._int_to_en(lo)}"
+        if n >= 2000:
+            return "two thousand" + ("" if lo == 0 else " " + cls._int_to_en(lo))
+        if lo == 0:
+            return f"{cls._int_to_en(hi)} hundred"
+        if lo < 10:
+            return f"{cls._int_to_en(hi)} oh {cls._int_to_en(lo)}"
+        return f"{cls._int_to_en(hi)} {cls._int_to_en(lo)}"
+
+    @classmethod
+    def _num_to_en(cls, num_str: str) -> str:
+        if "." in num_str:
+            int_p, dec_p = num_str.split(".", 1)
+            return cls._int_to_en(int(int_p)) + " point " + " ".join(_EN_ONES[int(c)] for c in dec_p)
+        return cls._int_to_en(int(num_str))
+
+    @classmethod
+    def _normalize_en_numbers(cls, text: str) -> str:
+        """千分位逗号、序数词（1st/2nd/3rd/…th 与旧式 3d）、年份语境、基数词与小数；与字母粘连的编号（3D / B2B）不转写。"""
+        text = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", text)
+        text = re.sub(r"\b(\d{1,3})(?:st|nd|rd|th)\b", lambda m: cls._en_ordinal(int(m.group(1))), text, flags=re.I)
+        text = re.sub(r"\b(\d{1,3})d\b", lambda m: cls._en_ordinal(int(m.group(1))), text)
+        text = re.sub(
+            r"\b(in|by|since|until|from|to|before|after|between|and|year)\s+(1[1-9]\d{2}|20\d{2})\b",
+            lambda m: f"{m.group(1)} {cls._en_year(int(m.group(2)))}", text, flags=re.I,
+        )
+        return re.sub(r"(?<![\w.])(\d+(?:\.\d+)?)(?!\w)", lambda m: cls._num_to_en(m.group(1)), text)
+
     def normalize_text(self, text: str) -> str:
         text = unicodedata.normalize("NFKC", text).strip()
         punc_map = {"，": ",", "。": ".", "？": "?", "！": "!", "；": ";", "：": ":", "、": ",", "—": ",", "…": "."}
@@ -439,6 +566,8 @@ class BilingualPhonemeFrontend:
         if has_zh:
             text = re.sub(r"(\d+(?:\.\d+)?)%", lambda m: "百分之" + self._num_to_zh(m.group(1)), text)
             text = re.sub(r"\d+(?:\.\d+)?", lambda m: self._num_to_zh(m.group(0)), text)
+        else:
+            text = self._normalize_en_numbers(text)  # 无汉字：数字转英文词，否则整段丢弃
         return text
 
     @staticmethod
@@ -591,24 +720,35 @@ class BilingualPhonemeFrontend:
                     m_pys[pos] = m_pys[pos][:-1] + "2"
             k = r_end
 
-        return m_pys
+        return m_pys, m_chars
 
-    def _zh_span_to_phonemes_and_bounds(self, span: str, first_bound: int = 2):
+    def _zh_span_to_phonemes_and_bounds(self, span: str, first_bound: int = 4):
         raw_pys = [p[0] for p in pinyin(span, style=Style.TONE3, neutral_tone_with_five=True, errors="ignore") if p]
-        m_pys = self._apply_zh_sandhi_and_erhua(span, raw_pys)
+        m_pys, m_chars = self._apply_zh_sandhi_and_erhua(span, raw_pys)
+        # 推理期没有标注：用分词词首近似标贝 #1 韵律词边界 (2)，附着助词（的/了…）不另起词；
+        # 标点后的首音节取 first_bound（短语级 4），其余音节为词内续接 (1)——与训练期 boundary_ids 是同一套语义
+        syl_of_char = [k for k, ch in enumerate(m_chars) for _ in ch]
+        word_start_syls, c0 = set(), 0
+        seg_fn = _get_zh_word_segmenter()
+        if seg_fn is not None:
+            for w in seg_fn(span):
+                if c0 < len(syl_of_char) and w not in _ENCLITIC_PARTICLES:
+                    word_start_syls.add(syl_of_char[c0])
+                c0 += len(w)
+        else:
+            word_start_syls = set(range(0, len(m_pys), 2))
         toks, bounds = [], []
         for idx, s in enumerate(m_pys):
             phs = self._split_zh_syllable(s)
             if not phs:
                 continue
-            # 短语首或每 2 个音节给韵律词起点 boundary=2，词内音节首给 boundary=1，韵母/儿化尾给 boundary=0
-            b0 = first_bound if idx == 0 else (2 if idx % 2 == 0 else 1)
+            b0 = first_bound if idx == 0 else (2 if idx in word_start_syls else 1)
             for pi, ph in enumerate(phs):
                 toks.append(ph)
                 bounds.append(b0 if pi == 0 else 0)
         return toks, bounds
 
-    def _en_word_to_phonemes_and_bounds(self, word: str, first_bound: int = 2):
+    def _en_word_to_phonemes_and_bounds(self, word: str, first_bound: int = 4):
         phs = []
         en_g2p = _get_en_g2p()
         if en_g2p is not None:
@@ -626,33 +766,39 @@ class BilingualPhonemeFrontend:
         return phs, bounds
 
     def parse_bznsyp_prosody(self, text_with_prosody: str, line_py: str):
-        """逐字符儿化感知解析标贝标注：100% 保留句中逗号/分号停顿，并将 #1/#2/#3 韵律边界无损映射为 boundary_ids=2。"""
-        norm_t = self.normalize_text(text_with_prosody)
+        """逐字符儿化感知解析标贝标注：100% 保留句中逗号/分号停顿，并把 #1/#2/#3 韵律边界按等级无损映射为 boundary_ids
+        （#1 韵律词=2、#2 韵律短语=3、#3 语调短语=4；标点之后与句首取 4，#4 为句末符不占位）。
+        韵律符必须先换成控制字符占位符再做文本归一化：否则数字规则会把 #1 转成汉字「一」，变成一个偷占拼音条目的
+        伪音节——边界全部丢失，且句中标点被整体后移到句尾。"""
+        raw = text_with_prosody
+        for _mk, _ph in _BZ_MARK.items():
+            raw = raw.replace(_mk, _ph)
+        norm_t = self.normalize_text(raw)
         pys = line_py.strip().split()
         items = []  # list of (syl_or_punc, is_punc, bound)
         i, pi = 0, 0
-        pending_bound = 2
+        pending_bound = 4
         while i < len(norm_t):
-            if norm_t[i] == "#" and i + 1 < len(norm_t) and norm_t[i + 1] in "1234":
-                if norm_t[i + 1] in "123":
-                    pending_bound = 2
-                i += 2
-                continue
             ch = norm_t[i]
+            if ch in _BZ_MARK_CHARS:
+                if ch != _BZ_MARK["#4"]:
+                    pending_bound = 2 + _BZ_MARK_CHARS.index(ch)  # #1 韵律词=2 / #2 韵律短语=3 / #3 语调短语=4
+                i += 1
+                continue
             if ch in (",", ".", "?", "!", ";", ":"):
                 items.append((ch, True, 0))
-                pending_bound = 2
+                pending_bound = 4
                 i += 1
                 continue
             if re.match(r"[\u4e00-\u9fff]", ch) and pi < len(pys):
                 py = pys[pi]
                 pi += 1
                 i += 1
-                # 若当前拼音带儿化 r，跳过紧随其后的「儿」字（中间允许隔 #1~#4 韵律符）
+                # 若当前拼音带儿化 r，跳过紧随其后的「儿」字（中间允许隔韵律符）
                 if self.is_erhua_pinyin(py):
                     j = i
-                    while j + 1 < len(norm_t) and norm_t[j] == "#" and norm_t[j + 1] in "1234":
-                        j += 2
+                    while j < len(norm_t) and norm_t[j] in _BZ_MARK_CHARS:
+                        j += 1
                     if j < len(norm_t) and norm_t[j] == "儿":
                         i = j + 1
                 items.append((py, False, pending_bound))
@@ -683,13 +829,14 @@ class BilingualPhonemeFrontend:
                         langs.append(1)
                         bounds.append(b_flag if idx_p == 0 else 0)
         elif prosody_pinyin is not None:
-            pending_b = 2
+            pending_b = 4
             for item in prosody_pinyin:
                 if item in ("#1", "#2", "#3", "#4"):
-                    pending_b = 2
+                    if item != "#4":
+                        pending_b = 1 + int(item[1])
                 elif item in self.tok2id:
                     tokens.append(item); langs.append(0); bounds.append(0)
-                    pending_b = 2
+                    pending_b = 4
                 else:
                     phs = self._split_zh_syllable(item)
                     for idx_p, ph in enumerate(phs):
@@ -700,34 +847,30 @@ class BilingualPhonemeFrontend:
         else:
             norm = self.normalize_text(text)
             pattern = re.compile(r"([\u4e00-\u9fff]+|[A-Za-z][A-Za-z'\-]*|#[1-4]|[,\.\?!;:])")
-            pending_b = 2
-            prev_lang = 0
+            pending_b = 4  # 句首视为语调短语首
             for m in pattern.finditer(norm):
                 seg = m.group(0)
                 if seg in ("#1", "#2", "#3", "#4"):
-                    pending_b = 2
+                    if seg != "#4":
+                        pending_b = 1 + int(seg[1])
                 elif re.match(r"^[\u4e00-\u9fff]+$", seg):
-                    fb = 2 if (pending_b == 2 or prev_lang != 1) else 1
-                    phs, bds = self._zh_span_to_phonemes_and_bounds(seg, first_bound=fb)
+                    phs, bds = self._zh_span_to_phonemes_and_bounds(seg, first_bound=pending_b)
                     for ph, bd in zip(phs, bds):
                         tokens.append(ph if ph in self.tok2id else "<unk>")
                         langs.append(1)
                         bounds.append(bd)
-                    prev_lang = 1
-                    pending_b = 1
+                    pending_b = 2  # 紧随其后的英文词 / 汉字串至少是词首
                 elif re.match(r"^[A-Za-z]", seg):
-                    phs, bds = self._en_word_to_phonemes_and_bounds(seg, first_bound=2)
+                    phs, bds = self._en_word_to_phonemes_and_bounds(seg, first_bound=pending_b)
                     for ph, bd in zip(phs, bds):
                         tokens.append(ph if ph in self.tok2id else "<unk>")
                         langs.append(2)
                         bounds.append(bd)
-                    prev_lang = 2
                     pending_b = 2
                 else:
                     if seg in self.tok2id:
                         tokens.append(seg); langs.append(0); bounds.append(0)
-                    prev_lang = 0
-                    pending_b = 2
+                    pending_b = 4  # 标点之后视为语调短语首
 
         tokens.append("<eos>")
         langs.append(0)
@@ -880,7 +1023,18 @@ def unit_lower_tri_inverse(N: torch.Tensor) -> torch.Tensor:
         P = P @ P
     return A
 
+def _fp32_zone(fn):
+    """装饰器：在关闭 autocast 的上下文里执行被装饰函数（bf16 训练下仍保持 FP32 数值；入参首项须为 Tensor）。"""
+    import functools
 
+    @functools.wraps(fn)
+    def _wrapped(*args, **kwargs):
+        with torch.autocast(args[0].device.type, enabled=False):
+            return fn(*args, **kwargs)
+    return _wrapped
+
+
+@_fp32_zone  # 分块 WY 扫描全程 FP32：autocast 会把 einsum / @ 降到 bf16，破坏与推理期递推的数值等价
 def gated_delta_rule_chunkwise(q, k, v, beta, log_alpha, S_init, chunk: int = SCAN_CHUNK):
     T = q.shape[1]
     q, k, v, beta, log_alpha = (pad_to_chunk(t, chunk) for t in (q, k, v, beta, log_alpha))
@@ -1494,18 +1648,19 @@ class AlignmentEncoder(nn.Module):
         return pe.to(dtype)
 
     def forward(self, mel: torch.Tensor, text_emb: torch.Tensor, text_mask: torch.Tensor, attn_log_prior: torch.Tensor = None, mel_mask: torch.Tensor = None):
-        T_max = text_emb.shape[1]
-        pos_pe = self._sinusoidal_pos(T_max, self.d_text, text_emb.device, text_emb.dtype)[None, :, :]
-        t_in = (text_emb + 0.15 * pos_pe) * text_mask[:, :, None].to(text_emb.dtype)
-        m_in = mel * mel_mask[:, None, :].to(mel.dtype) if mel_mask is not None else mel
-        keys = F.normalize(self.key_proj(t_in.transpose(1, 2)).float(), dim=1)
-        queries = F.normalize(self.query_proj(m_in).float(), dim=1)
-        logits = torch.bmm(queries.transpose(1, 2), keys) * self.scale
-        if attn_log_prior is not None:
-            logits = logits + attn_log_prior.float()
-        logits = logits.masked_fill(~text_mask[:, None, :], -1e4)
-        return F.log_softmax(logits, dim=-1), torch.softmax(logits, dim=-1)
-
+        # 对齐 logits 直接决定 Viterbi 硬时长，整段强制 FP32：autocast 下 .float() 挡不住 bmm / conv 被降到 bf16
+        with torch.autocast(mel.device.type, enabled=False):
+            T_max = text_emb.shape[1]
+            pos_pe = self._sinusoidal_pos(T_max, self.d_text, text_emb.device, torch.float32)[None, :, :]
+            t_in = (text_emb.float() + 0.15 * pos_pe) * text_mask[:, :, None]
+            m_in = mel.float() * mel_mask[:, None, :].to(torch.float32) if mel_mask is not None else mel.float()
+            keys = F.normalize(self.key_proj(t_in.transpose(1, 2)), dim=1)
+            queries = F.normalize(self.query_proj(m_in), dim=1)
+            logits = torch.bmm(queries.transpose(1, 2), keys) * self.scale
+            if attn_log_prior is not None:
+                logits = logits + attn_log_prior.float()
+            logits = logits.masked_fill(~text_mask[:, None, :], -1e4)
+            return F.log_softmax(logits, dim=-1), torch.softmax(logits, dim=-1)
 
 def forward_sum_loss(attn_logprob: torch.Tensor, text_lens: torch.Tensor, mel_lens: torch.Tensor) -> torch.Tensor:
     B, F_max, _ = attn_logprob.shape
@@ -1698,7 +1853,7 @@ class AetherAcousticModel(nn.Module):
         self.frame_lookahead = frame_lookahead
         self.phoneme_emb = nn.Embedding(vocab_size, d_model, padding_idx=0)
         self.lang_emb = nn.Embedding(4, d_model)
-        self.boundary_emb = nn.Embedding(4, d_model)
+        self.boundary_emb = nn.Embedding(5, d_model)  # 0 音素内 / 1 词内音节首 / 2 韵律词首 / 3 韵律短语首 / 4 语调短语首
         nn.init.normal_(self.boundary_emb.weight, std=0.02)
 
         self.frame_phase_proj = nn.Linear(FRAME_PHASE_DIM, d_model)
@@ -1804,6 +1959,13 @@ class AetherAcousticModel(nn.Module):
         h_dur_in = h_txt.detach() + 0.1 * (h_txt - h_txt.detach())
         log_dur_pred = self.dur_predictor(h_dur_in)
         loss_dur = (F.l1_loss(log_dur_pred, torch.log(dur_gt.float() + 1.0), reduction="none") * text_mask).sum() / text_mask.sum().clamp(min=1)
+        # 真实推理时长（exp-1 后四舍五入并 clamp 到 [1, 60]）相对 Viterbi 时长的误差，供推理路径验证与 best.pt 选模使用
+        with torch.no_grad():
+            dur_pred = torch.clamp(torch.round(torch.exp(log_dur_pred.float()) - 1.0), min=1, max=60)
+            dur_abs = (dur_pred - dur_gt.float()).abs() * text_mask
+            dur_mae = dur_abs.sum() / text_mask.sum().clamp(min=1)
+            dur_rel = (dur_abs.sum(1) / (dur_gt.float() * text_mask).sum(1).clamp(min=1)).mean()
+            len_ratio = ((dur_pred * text_mask).sum(1) / (dur_gt.float() * text_mask).sum(1).clamp(min=1)).mean()
 
         f0_uv_out = self.f0_uv_predictor(h_frame)
         f0_pred, uv_logit = f0_uv_out[..., 0], f0_uv_out[..., 1]
@@ -1843,6 +2005,7 @@ class AetherAcousticModel(nn.Module):
             "dur": loss_dur.detach(), "f0": loss_f0.detach(), "uv": loss_uv.detach(),
             "energy": loss_energy.detach(), "align": loss_align.detach(),
             "bin": loss_bin.detach(), "bos_ratio": bos_ratio,
+            "dur_mae": dur_mae, "dur_rel": dur_rel, "len_ratio": len_ratio,
         }
 
     @torch.no_grad()
@@ -1934,7 +2097,8 @@ class StreamingISTFTHead(nn.Module):
         self.register_buffer("window", torch.hann_window(n_fft, periodic=True))
 
     def _frames_to_time(self, x: torch.Tensor) -> torch.Tensor:
-        mag, p = self.out(x).float().chunk(2, dim=-1)
+        with torch.autocast(x.device.type, enabled=False):  # 幅值 / 相位头强制 FP32：bf16 输出会给重建波形引入量化底噪
+            mag, p = self.out(x.float()).chunk(2, dim=-1)
         mag = torch.exp(mag).clamp(max=1e2)
         spec = torch.complex(mag * torch.cos(p), mag * torch.sin(p))
         return torch.fft.irfft(spec, n=self.n_fft, dim=-1) * self.window[None, None, :]
@@ -2047,7 +2211,9 @@ class CausalHarmonicSource(nn.Module):
 
     def forward(self, h: torch.Tensor):
         p_hid = F.silu(self.pitch_norm(self.pitch_conv(h.transpose(1, 2)).transpose(1, 2)))
-        p_out = self.pitch_out(p_hid)
+        # 基频头强制 FP32：bf16 的 log_f0 量化一步 ≈ 54 音分，稳态元音期间参考谐波相位会随时间漂移
+        with torch.autocast(h.device.type, enabled=False):
+            p_out = self.pitch_out(p_hid.float())
         log_f0_pred, uv_logit = p_out[..., 0], p_out[..., 1]
         harm_in, harm_head, _ = self._oscillate(log_f0_pred, uv_logit, h.dtype, phi_init=None)
         return harm_in, harm_head, log_f0_pred, uv_logit
@@ -2065,7 +2231,8 @@ class CausalHarmonicSource(nn.Module):
             return empty, empty, state
         p_conv, new_conv = self.pitch_conv.forward_step(h_chunk.transpose(1, 2), state["conv"])
         p_hid = F.silu(self.pitch_norm(p_conv.transpose(1, 2)))
-        p_out = self.pitch_out(p_hid)
+        with torch.autocast(h_chunk.device.type, enabled=False):
+            p_out = self.pitch_out(p_hid.float())
         log_f0_pred, uv_logit = p_out[..., 0], p_out[..., 1]
         harm_in, harm_head, new_phi = self._oscillate(log_f0_pred, uv_logit, h_chunk.dtype, phi_init=state["phi"])
         return harm_in, harm_head, {"conv": new_conv, "phi": new_phi}

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AetherTTS Phase 1 (a5) — 独立 Python 运行器（无需 Notebook / 无 exec-cell）。
+AetherTTS Phase 1 (a6) — 独立 Python 运行器（无需 Notebook / 无 exec-cell）。
 
 由 scripts/sync_phase1_script.py 从 notebooks/AetherTTS_Colab_Phase1_Experiment.ipynb
 确定性 1:1 生成（请勿手改本文件，修改 Notebook 后运行 sync_phase1_script.py 即可同步）。
@@ -11,12 +11,12 @@ AetherTTS Phase 1 (a5) — 独立 Python 运行器（无需 Notebook / 无 exec-
 
 用法：
     python scripts/aethertts_phase1.py --profile full_quality --dataset bznsyp --root ./aethertts_exp
-    python scripts/aethertts_phase1.py --selftest          # 验证前端零 UNK + 向量化对齐 + 长流式局部 RoPE + 声码器谐波源流式等价门禁
+    python scripts/aethertts_phase1.py --selftest          # 验证前端零 UNK + 向量化对齐 + 长流式局部 RoPE + 声码器谐波源流式 + autocast 精度门禁
     python scripts/aethertts_phase1.py --profile-steps 20  # 打印单步训练耗时分解后退出
 """
 import argparse
 
-_AP = argparse.ArgumentParser(description="AetherTTS Phase 1 (a5) standalone runner (synced from notebook).")
+_AP = argparse.ArgumentParser(description="AetherTTS Phase 1 (a6) standalone runner (synced from notebook).")
 _AP.add_argument("--root", default="./aethertts_exp", help="Local directory for datasets, checkpoints, samples, reports.")
 _AP.add_argument("--profile", default="standard_phase1", choices=["quick_smoke", "standard_phase1", "full_quality"])
 _AP.add_argument("--dataset", default="bznsyp", choices=["bznsyp", "ljspeech", "custom_bilingual"])
@@ -156,9 +156,11 @@ elif _filter_models:
 else:
     EXPERIMENTS = list(DEFAULT_EXPERIMENTS)
 
-# 架构版本号 a5：升级音系前端 (v3)、浊音感知 F0/UV、局部窗口相对 RoPE、转置 SpecDisc + PeriodDisc(11)、帧率谐波源与 GTA 闭环
-ARCH_TAG = "a5"
-DATASET_CACHE_VER = "v3"
+# 架构版本号 a6：在 a5（v3 音系前端 / 浊音感知 F0/UV / 局部窗口相对 RoPE / 转置 SpecDisc + PeriodDisc(11) / 帧率谐波源与 GTA 闭环）基础上——
+# 韵律边界分级 (boundary_ids 0-4)、对齐器 / GDN / 谐波源基频头 / iSTFT 头强制 FP32、best.pt 改按真实推理路径选模、
+# 推理期韵律词边界改用分词近似、英文数字转写。模型结构或输入语义变更后必须递增
+ARCH_TAG = "a6"
+DATASET_CACHE_VER = "v4"  # boundary_ids 语义变更（#1/#2/#3 分级），v3 特征不可复用
 FIXED_VAL_UTTS = 100
 
 SKIP_IF_DONE = True
@@ -221,6 +223,9 @@ CFG = {
     "stream_mel_first_chunk": 6,    # ★ 动态低延迟首包：首块攒够 6 帧 (~64ms) 立即触发声码器出声，避免首块干等 16 帧
     "stream_mel_chunk": 16,         # 稳态声码器块长 16 帧 (~171ms)，兼顾高吞吐与零接缝爆音
     "vocoder_gta_prob": float(os.environ.get("AETHER_GTA_PROB", "0.5")),  # Stage 2 混入声学 GTA 预测 Mel 的比例
+    # 流式首包 TTFA 评测口径：t=0 记为 LLM 第一个 token 到达，文本按 tok_rate × chars_per_tok 的节奏逐字到达
+    "llm_tok_rate": float(os.environ.get("AETHER_LLM_TOK_RATE", "25.0")),          # LLM 解码吞吐 (token/s)
+    "llm_chars_per_tok": float(os.environ.get("AETHER_LLM_CHARS_PER_TOK", "1.5")), # 中文平均每 token 汉字数
     "lr_acoustic": 4e-4,
     "lr_vocoder": 2e-4,
     "env_mode": ENV_MODE,
@@ -274,6 +279,7 @@ PROTECTED_BASE_PKGS = [
 
 CORE_PKGS = [
     ("pypinyin", "pypinyin"),
+    ("jieba", "jieba"),  # 推理期韵律词边界近似（缺失时退化为每 2 音节一个边界并告警）
     ("g2p_en", "g2p-en"),
     ("soundfile", "soundfile"),
     ("librosa", "librosa"),
@@ -349,6 +355,7 @@ import re
 import copy
 import ctypes
 import subprocess
+import socket
 import unicodedata
 import numpy as np
 import soundfile as sf
@@ -362,6 +369,13 @@ from pypinyin import pinyin, Style
 
 _EN_G2P = None
 _EN_G2P_INIT_TRIED = False
+_ZH_WORD_SEG = None
+_ZH_WORD_SEG_TRIED = False
+# 结构助词 / 体标记 / 复数标记永远附着在前一个词上，不自成韵律词
+_ENCLITIC_PARTICLES = {"的", "地", "得", "了", "着", "过", "们"}
+# 标贝韵律符 -> 控制字符占位符：解析前先替换，保护 #1 的数字不被 normalize_text 转成汉字
+_BZ_MARK = {"#1": "\x01", "#2": "\x02", "#3": "\x03", "#4": "\x04"}
+_BZ_MARK_CHARS = "".join(_BZ_MARK.values())
 
 
 def _get_en_g2p():
@@ -369,9 +383,13 @@ def _get_en_g2p():
     if _EN_G2P_INIT_TRIED:
         return _EN_G2P
     _EN_G2P_INIT_TRIED = True
+    # g2p_en 的 import 与 nltk.download 都没有超时参数：临时设 socket 超时，防代理 / 受限网络下无限挂起
+    _prev_to = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(30.0)
     try:
         from g2p_en import G2p
         import nltk
+        missing = []
         for _res_path, _res_name in [
             ("taggers/averaged_perceptron_tagger_eng", "averaged_perceptron_tagger_eng"),
             ("taggers/averaged_perceptron_tagger", "averaged_perceptron_tagger"),
@@ -380,15 +398,43 @@ def _get_en_g2p():
             try:
                 nltk.data.find(_res_path)
             except LookupError:
+                # 下载失败必须显式告警并最终让 G2P 初始化失败，不能静默吞掉后继续训练
                 try:
-                    nltk.download(_res_name, quiet=True)
-                except Exception:
-                    pass
+                    _ok = nltk.download(_res_name, quiet=True)
+                except Exception as _e_dl:
+                    _ok = False
+                    print(f"[Warn] nltk.download({_res_name}) 异常: {_e_dl}")
+                if not _ok:
+                    print(f"[Warn] nltk.download({_res_name}) 失败")
+                    missing.append(_res_name)
+        if missing:
+            raise RuntimeError(f"nltk 数据缺失 {missing}，请手动 nltk.download('<name>') 或设置 NLTK_DATA")
         _EN_G2P = G2p()
     except Exception as e:
-        print(f"[Warn] g2p_en unavailable ({e}), falling back to character-level EN G2P.")
+        print(f"[Warn] g2p_en unavailable ({e})：英文词将退化为逐字母拼读，仅适合没有英文训练数据的场景。")
         _EN_G2P = None
+    finally:
+        socket.setdefaulttimeout(_prev_to)
     return _EN_G2P
+
+
+def _get_zh_word_segmenter():
+    """推理期韵律词边界的近似来源：jieba 词典分词取词首（标贝 #1 韵律词边界主要就是词边界）。
+    无 jieba 时退化为「每 2 个音节一个边界」的机械规则并显式告警。"""
+    global _ZH_WORD_SEG, _ZH_WORD_SEG_TRIED
+    if _ZH_WORD_SEG_TRIED:
+        return _ZH_WORD_SEG
+    _ZH_WORD_SEG_TRIED = True
+    try:
+        import logging
+        import jieba
+        jieba.setLogLevel(logging.WARNING)
+        jieba.lcut("预热")  # 在主线程完成词典加载，避免首次调用落在多线程里
+        _ZH_WORD_SEG = jieba.lcut
+    except Exception as e:
+        print(f"[Warn] jieba unavailable ({e})：推理期韵律词边界退化为每 2 个音节一个（建议 pip install jieba）。")
+        _ZH_WORD_SEG = None
+    return _ZH_WORD_SEG
 
 
 def set_seed(seed: int = 42):
@@ -630,7 +676,9 @@ def extract_f0_and_energy(wav: np.ndarray, sr: int = 24000, hop_length: int = 25
 #   - 区分齐齿呼 i 与舌尖前/后元音 ii (zi/ci/si) / iii (zhi/chi/shi/ri)
 #   - 还原 y/w 零声母与 iu->iou / ui->uei / un->uen / ue->ve 省写，覆盖全部 20,901 个 CJK 汉字零 <unk>
 #   - 显式儿化韵尾 zh_er_coda + 完整「一 / 不 / A-一-A / 双音节韵律步三声」变调
-#   - 用音素级词/韵律边界标记 boundary_ids (0: 音节内, 1: 词内音节首, 2: 词/韵律词/语种切换首) 替代抢占连读辅音帧的 <sp>
+#   - 用音素级韵律边界标记 boundary_ids 替代抢占连读辅音帧的 <sp>：
+#       0 = 音节内非首音素（韵母 / 儿化尾），1 = 韵律词内音节首，2 = 韵律词首（标贝 #1 / 分词词首），
+#       3 = 韵律短语首（#2），4 = 语调短语首（#3 / 标点之后 / 句首）；训练用标注，推理用分词近似
 # ------------------------------------------------------------------------------
 ZH_INITIALS = [
     "b", "p", "m", "f", "d", "t", "n", "l", "g", "k", "h",
@@ -664,6 +712,9 @@ _W_RESTORE = {
 }
 _ABBREV_RESTORE = {"iu": "iou", "ui": "uei", "un": "uen"}
 _NASAL_SYL_MAP = {"hm": ("h", "en"), "hng": ("h", "eng"), "m": ("m", "u"), "n": ("n", "en"), "ng": ("n", "eng")}
+_EN_ONES = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"]
+_EN_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+_EN_ORD_SMALL = {1: "first", 2: "second", 3: "third", 5: "fifth", 8: "eighth", 9: "ninth", 12: "twelfth"}
 
 # 非儿化词汇表（防止把实义「儿 / 尔」误合并为前一字的儿化尾音）
 NON_ERHUA_WORDS = {
@@ -691,6 +742,11 @@ class BilingualPhonemeFrontend:
         self.bos_id = self.tok2id["<bos>"]
         self.eos_id = self.tok2id["<eos>"]
         self.unk_id = self.tok2id["<unk>"]
+
+    @staticmethod
+    def en_g2p():
+        """真实英文 G2P（g2p_en）；返回 None 表示只能逐字母拼读回退。"""
+        return _get_en_g2p()
 
     @property
     def vocab_size(self) -> int:
@@ -722,6 +778,83 @@ class BilingualPhonemeFrontend:
             return digits[n // 100] + "百" + digits[rem // 10] + "十" + ("" if rem % 10 == 0 else digits[rem % 10])
         return "".join(digits[int(c)] for c in num_str)
 
+    # ---- 纯英文数字转写（LJSpeech 等无汉字文本）。此前数字既不转写、也不被分词正则捕获，会被整段丢弃 ----
+    @staticmethod
+    def _int_to_en(n: int) -> str:
+        if n == 0:
+            return "zero"
+        if n >= 10 ** 12:
+            return " ".join(_EN_ONES[int(c)] for c in str(n))
+
+        def _three(v):
+            if v < 20:
+                return _EN_ONES[v]
+            if v < 100:
+                return _EN_TENS[v // 10] + ("" if v % 10 == 0 else " " + _EN_ONES[v % 10])
+            return _EN_ONES[v // 100] + " hundred" + ("" if v % 100 == 0 else " " + _three(v % 100))
+
+        parts = []
+        for i, scale in enumerate(("", " thousand", " million", " billion")):
+            v = (n // (1000 ** i)) % 1000
+            if v:
+                parts.append(_three(v) + scale)
+        return " ".join(reversed(parts))
+
+    @classmethod
+    def _en_ordinal(cls, n: int) -> str:
+        """英文序数：first/second/third/fifth/eighth/ninth/twelfth 不规则，整十 y->ieth（twentieth），
+        13-19 与带个位的复合数只变最后一个词（twenty first, one hundred thirteenth），其余为 cardinal + th。"""
+        r, o = n % 100, n % 10
+
+        def _with_head(head_num, last):
+            head = cls._int_to_en(head_num) + " " if head_num > 0 else ""
+            return head + last
+
+        if 0 < r < 13:
+            return _with_head(n - r, _EN_ORD_SMALL.get(r, _EN_ONES[r] + "th"))
+        if 13 <= r <= 19:
+            return _with_head(n - r, _EN_ONES[r] + "th")
+        if r % 10 == 0:
+            if 20 <= r <= 90:
+                return _with_head(n - r, _EN_TENS[r // 10][:-1] + "ieth")  # twenty -> twentieth, fifty -> fiftieth
+            words = cls._int_to_en(n).split()  # one hundredth / one thousandth
+            words[-1] += "th"
+            return " ".join(words)
+        return _with_head(n - o, _EN_ORD_SMALL.get(o, _EN_ONES[o] + "th"))
+
+    @classmethod
+    def _en_year(cls, n: int) -> str:
+        """年份读法：1861 -> eighteen sixty one，1805 -> eighteen oh five，1900 -> nineteen hundred，2026 -> twenty twenty six。"""
+        hi, lo = n // 100, n % 100
+        if 2010 <= n <= 2099:
+            return f"{cls._int_to_en(hi)} {cls._int_to_en(lo)}"
+        if n >= 2000:
+            return "two thousand" + ("" if lo == 0 else " " + cls._int_to_en(lo))
+        if lo == 0:
+            return f"{cls._int_to_en(hi)} hundred"
+        if lo < 10:
+            return f"{cls._int_to_en(hi)} oh {cls._int_to_en(lo)}"
+        return f"{cls._int_to_en(hi)} {cls._int_to_en(lo)}"
+
+    @classmethod
+    def _num_to_en(cls, num_str: str) -> str:
+        if "." in num_str:
+            int_p, dec_p = num_str.split(".", 1)
+            return cls._int_to_en(int(int_p)) + " point " + " ".join(_EN_ONES[int(c)] for c in dec_p)
+        return cls._int_to_en(int(num_str))
+
+    @classmethod
+    def _normalize_en_numbers(cls, text: str) -> str:
+        """千分位逗号、序数词（1st/2nd/3rd/…th 与旧式 3d）、年份语境、基数词与小数；与字母粘连的编号（3D / B2B）不转写。"""
+        text = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", text)
+        text = re.sub(r"\b(\d{1,3})(?:st|nd|rd|th)\b", lambda m: cls._en_ordinal(int(m.group(1))), text, flags=re.I)
+        text = re.sub(r"\b(\d{1,3})d\b", lambda m: cls._en_ordinal(int(m.group(1))), text)
+        text = re.sub(
+            r"\b(in|by|since|until|from|to|before|after|between|and|year)\s+(1[1-9]\d{2}|20\d{2})\b",
+            lambda m: f"{m.group(1)} {cls._en_year(int(m.group(2)))}", text, flags=re.I,
+        )
+        return re.sub(r"(?<![\w.])(\d+(?:\.\d+)?)(?!\w)", lambda m: cls._num_to_en(m.group(1)), text)
+
     def normalize_text(self, text: str) -> str:
         text = unicodedata.normalize("NFKC", text).strip()
         punc_map = {"，": ",", "。": ".", "？": "?", "！": "!", "；": ";", "：": ":", "、": ",", "—": ",", "…": "."}
@@ -731,6 +864,8 @@ class BilingualPhonemeFrontend:
         if has_zh:
             text = re.sub(r"(\d+(?:\.\d+)?)%", lambda m: "百分之" + self._num_to_zh(m.group(1)), text)
             text = re.sub(r"\d+(?:\.\d+)?", lambda m: self._num_to_zh(m.group(0)), text)
+        else:
+            text = self._normalize_en_numbers(text)  # 无汉字：数字转英文词，否则整段丢弃
         return text
 
     @staticmethod
@@ -883,24 +1018,35 @@ class BilingualPhonemeFrontend:
                     m_pys[pos] = m_pys[pos][:-1] + "2"
             k = r_end
 
-        return m_pys
+        return m_pys, m_chars
 
-    def _zh_span_to_phonemes_and_bounds(self, span: str, first_bound: int = 2):
+    def _zh_span_to_phonemes_and_bounds(self, span: str, first_bound: int = 4):
         raw_pys = [p[0] for p in pinyin(span, style=Style.TONE3, neutral_tone_with_five=True, errors="ignore") if p]
-        m_pys = self._apply_zh_sandhi_and_erhua(span, raw_pys)
+        m_pys, m_chars = self._apply_zh_sandhi_and_erhua(span, raw_pys)
+        # 推理期没有标注：用分词词首近似标贝 #1 韵律词边界 (2)，附着助词（的/了…）不另起词；
+        # 标点后的首音节取 first_bound（短语级 4），其余音节为词内续接 (1)——与训练期 boundary_ids 是同一套语义
+        syl_of_char = [k for k, ch in enumerate(m_chars) for _ in ch]
+        word_start_syls, c0 = set(), 0
+        seg_fn = _get_zh_word_segmenter()
+        if seg_fn is not None:
+            for w in seg_fn(span):
+                if c0 < len(syl_of_char) and w not in _ENCLITIC_PARTICLES:
+                    word_start_syls.add(syl_of_char[c0])
+                c0 += len(w)
+        else:
+            word_start_syls = set(range(0, len(m_pys), 2))
         toks, bounds = [], []
         for idx, s in enumerate(m_pys):
             phs = self._split_zh_syllable(s)
             if not phs:
                 continue
-            # 短语首或每 2 个音节给韵律词起点 boundary=2，词内音节首给 boundary=1，韵母/儿化尾给 boundary=0
-            b0 = first_bound if idx == 0 else (2 if idx % 2 == 0 else 1)
+            b0 = first_bound if idx == 0 else (2 if idx in word_start_syls else 1)
             for pi, ph in enumerate(phs):
                 toks.append(ph)
                 bounds.append(b0 if pi == 0 else 0)
         return toks, bounds
 
-    def _en_word_to_phonemes_and_bounds(self, word: str, first_bound: int = 2):
+    def _en_word_to_phonemes_and_bounds(self, word: str, first_bound: int = 4):
         phs = []
         en_g2p = _get_en_g2p()
         if en_g2p is not None:
@@ -918,33 +1064,39 @@ class BilingualPhonemeFrontend:
         return phs, bounds
 
     def parse_bznsyp_prosody(self, text_with_prosody: str, line_py: str):
-        """逐字符儿化感知解析标贝标注：100% 保留句中逗号/分号停顿，并将 #1/#2/#3 韵律边界无损映射为 boundary_ids=2。"""
-        norm_t = self.normalize_text(text_with_prosody)
+        """逐字符儿化感知解析标贝标注：100% 保留句中逗号/分号停顿，并把 #1/#2/#3 韵律边界按等级无损映射为 boundary_ids
+        （#1 韵律词=2、#2 韵律短语=3、#3 语调短语=4；标点之后与句首取 4，#4 为句末符不占位）。
+        韵律符必须先换成控制字符占位符再做文本归一化：否则数字规则会把 #1 转成汉字「一」，变成一个偷占拼音条目的
+        伪音节——边界全部丢失，且句中标点被整体后移到句尾。"""
+        raw = text_with_prosody
+        for _mk, _ph in _BZ_MARK.items():
+            raw = raw.replace(_mk, _ph)
+        norm_t = self.normalize_text(raw)
         pys = line_py.strip().split()
         items = []  # list of (syl_or_punc, is_punc, bound)
         i, pi = 0, 0
-        pending_bound = 2
+        pending_bound = 4
         while i < len(norm_t):
-            if norm_t[i] == "#" and i + 1 < len(norm_t) and norm_t[i + 1] in "1234":
-                if norm_t[i + 1] in "123":
-                    pending_bound = 2
-                i += 2
-                continue
             ch = norm_t[i]
+            if ch in _BZ_MARK_CHARS:
+                if ch != _BZ_MARK["#4"]:
+                    pending_bound = 2 + _BZ_MARK_CHARS.index(ch)  # #1 韵律词=2 / #2 韵律短语=3 / #3 语调短语=4
+                i += 1
+                continue
             if ch in (",", ".", "?", "!", ";", ":"):
                 items.append((ch, True, 0))
-                pending_bound = 2
+                pending_bound = 4
                 i += 1
                 continue
             if re.match(r"[\u4e00-\u9fff]", ch) and pi < len(pys):
                 py = pys[pi]
                 pi += 1
                 i += 1
-                # 若当前拼音带儿化 r，跳过紧随其后的「儿」字（中间允许隔 #1~#4 韵律符）
+                # 若当前拼音带儿化 r，跳过紧随其后的「儿」字（中间允许隔韵律符）
                 if self.is_erhua_pinyin(py):
                     j = i
-                    while j + 1 < len(norm_t) and norm_t[j] == "#" and norm_t[j + 1] in "1234":
-                        j += 2
+                    while j < len(norm_t) and norm_t[j] in _BZ_MARK_CHARS:
+                        j += 1
                     if j < len(norm_t) and norm_t[j] == "儿":
                         i = j + 1
                 items.append((py, False, pending_bound))
@@ -975,13 +1127,14 @@ class BilingualPhonemeFrontend:
                         langs.append(1)
                         bounds.append(b_flag if idx_p == 0 else 0)
         elif prosody_pinyin is not None:
-            pending_b = 2
+            pending_b = 4
             for item in prosody_pinyin:
                 if item in ("#1", "#2", "#3", "#4"):
-                    pending_b = 2
+                    if item != "#4":
+                        pending_b = 1 + int(item[1])
                 elif item in self.tok2id:
                     tokens.append(item); langs.append(0); bounds.append(0)
-                    pending_b = 2
+                    pending_b = 4
                 else:
                     phs = self._split_zh_syllable(item)
                     for idx_p, ph in enumerate(phs):
@@ -992,34 +1145,30 @@ class BilingualPhonemeFrontend:
         else:
             norm = self.normalize_text(text)
             pattern = re.compile(r"([\u4e00-\u9fff]+|[A-Za-z][A-Za-z'\-]*|#[1-4]|[,\.\?!;:])")
-            pending_b = 2
-            prev_lang = 0
+            pending_b = 4  # 句首视为语调短语首
             for m in pattern.finditer(norm):
                 seg = m.group(0)
                 if seg in ("#1", "#2", "#3", "#4"):
-                    pending_b = 2
+                    if seg != "#4":
+                        pending_b = 1 + int(seg[1])
                 elif re.match(r"^[\u4e00-\u9fff]+$", seg):
-                    fb = 2 if (pending_b == 2 or prev_lang != 1) else 1
-                    phs, bds = self._zh_span_to_phonemes_and_bounds(seg, first_bound=fb)
+                    phs, bds = self._zh_span_to_phonemes_and_bounds(seg, first_bound=pending_b)
                     for ph, bd in zip(phs, bds):
                         tokens.append(ph if ph in self.tok2id else "<unk>")
                         langs.append(1)
                         bounds.append(bd)
-                    prev_lang = 1
-                    pending_b = 1
+                    pending_b = 2  # 紧随其后的英文词 / 汉字串至少是词首
                 elif re.match(r"^[A-Za-z]", seg):
-                    phs, bds = self._en_word_to_phonemes_and_bounds(seg, first_bound=2)
+                    phs, bds = self._en_word_to_phonemes_and_bounds(seg, first_bound=pending_b)
                     for ph, bd in zip(phs, bds):
                         tokens.append(ph if ph in self.tok2id else "<unk>")
                         langs.append(2)
                         bounds.append(bd)
-                    prev_lang = 2
                     pending_b = 2
                 else:
                     if seg in self.tok2id:
                         tokens.append(seg); langs.append(0); bounds.append(0)
-                    prev_lang = 0
-                    pending_b = 2
+                    pending_b = 4  # 标点之后视为语调短语首
 
         tokens.append("<eos>")
         langs.append(0)
@@ -1172,7 +1321,18 @@ def unit_lower_tri_inverse(N: torch.Tensor) -> torch.Tensor:
         P = P @ P
     return A
 
+def _fp32_zone(fn):
+    """装饰器：在关闭 autocast 的上下文里执行被装饰函数（bf16 训练下仍保持 FP32 数值；入参首项须为 Tensor）。"""
+    import functools
 
+    @functools.wraps(fn)
+    def _wrapped(*args, **kwargs):
+        with torch.autocast(args[0].device.type, enabled=False):
+            return fn(*args, **kwargs)
+    return _wrapped
+
+
+@_fp32_zone  # 分块 WY 扫描全程 FP32：autocast 会把 einsum / @ 降到 bf16，破坏与推理期递推的数值等价
 def gated_delta_rule_chunkwise(q, k, v, beta, log_alpha, S_init, chunk: int = SCAN_CHUNK):
     T = q.shape[1]
     q, k, v, beta, log_alpha = (pad_to_chunk(t, chunk) for t in (q, k, v, beta, log_alpha))
@@ -1786,18 +1946,19 @@ class AlignmentEncoder(nn.Module):
         return pe.to(dtype)
 
     def forward(self, mel: torch.Tensor, text_emb: torch.Tensor, text_mask: torch.Tensor, attn_log_prior: torch.Tensor = None, mel_mask: torch.Tensor = None):
-        T_max = text_emb.shape[1]
-        pos_pe = self._sinusoidal_pos(T_max, self.d_text, text_emb.device, text_emb.dtype)[None, :, :]
-        t_in = (text_emb + 0.15 * pos_pe) * text_mask[:, :, None].to(text_emb.dtype)
-        m_in = mel * mel_mask[:, None, :].to(mel.dtype) if mel_mask is not None else mel
-        keys = F.normalize(self.key_proj(t_in.transpose(1, 2)).float(), dim=1)
-        queries = F.normalize(self.query_proj(m_in).float(), dim=1)
-        logits = torch.bmm(queries.transpose(1, 2), keys) * self.scale
-        if attn_log_prior is not None:
-            logits = logits + attn_log_prior.float()
-        logits = logits.masked_fill(~text_mask[:, None, :], -1e4)
-        return F.log_softmax(logits, dim=-1), torch.softmax(logits, dim=-1)
-
+        # 对齐 logits 直接决定 Viterbi 硬时长，整段强制 FP32：autocast 下 .float() 挡不住 bmm / conv 被降到 bf16
+        with torch.autocast(mel.device.type, enabled=False):
+            T_max = text_emb.shape[1]
+            pos_pe = self._sinusoidal_pos(T_max, self.d_text, text_emb.device, torch.float32)[None, :, :]
+            t_in = (text_emb.float() + 0.15 * pos_pe) * text_mask[:, :, None]
+            m_in = mel.float() * mel_mask[:, None, :].to(torch.float32) if mel_mask is not None else mel.float()
+            keys = F.normalize(self.key_proj(t_in.transpose(1, 2)), dim=1)
+            queries = F.normalize(self.query_proj(m_in), dim=1)
+            logits = torch.bmm(queries.transpose(1, 2), keys) * self.scale
+            if attn_log_prior is not None:
+                logits = logits + attn_log_prior.float()
+            logits = logits.masked_fill(~text_mask[:, None, :], -1e4)
+            return F.log_softmax(logits, dim=-1), torch.softmax(logits, dim=-1)
 
 def forward_sum_loss(attn_logprob: torch.Tensor, text_lens: torch.Tensor, mel_lens: torch.Tensor) -> torch.Tensor:
     B, F_max, _ = attn_logprob.shape
@@ -1990,7 +2151,7 @@ class AetherAcousticModel(nn.Module):
         self.frame_lookahead = frame_lookahead
         self.phoneme_emb = nn.Embedding(vocab_size, d_model, padding_idx=0)
         self.lang_emb = nn.Embedding(4, d_model)
-        self.boundary_emb = nn.Embedding(4, d_model)
+        self.boundary_emb = nn.Embedding(5, d_model)  # 0 音素内 / 1 词内音节首 / 2 韵律词首 / 3 韵律短语首 / 4 语调短语首
         nn.init.normal_(self.boundary_emb.weight, std=0.02)
 
         self.frame_phase_proj = nn.Linear(FRAME_PHASE_DIM, d_model)
@@ -2096,6 +2257,13 @@ class AetherAcousticModel(nn.Module):
         h_dur_in = h_txt.detach() + 0.1 * (h_txt - h_txt.detach())
         log_dur_pred = self.dur_predictor(h_dur_in)
         loss_dur = (F.l1_loss(log_dur_pred, torch.log(dur_gt.float() + 1.0), reduction="none") * text_mask).sum() / text_mask.sum().clamp(min=1)
+        # 真实推理时长（exp-1 后四舍五入并 clamp 到 [1, 60]）相对 Viterbi 时长的误差，供推理路径验证与 best.pt 选模使用
+        with torch.no_grad():
+            dur_pred = torch.clamp(torch.round(torch.exp(log_dur_pred.float()) - 1.0), min=1, max=60)
+            dur_abs = (dur_pred - dur_gt.float()).abs() * text_mask
+            dur_mae = dur_abs.sum() / text_mask.sum().clamp(min=1)
+            dur_rel = (dur_abs.sum(1) / (dur_gt.float() * text_mask).sum(1).clamp(min=1)).mean()
+            len_ratio = ((dur_pred * text_mask).sum(1) / (dur_gt.float() * text_mask).sum(1).clamp(min=1)).mean()
 
         f0_uv_out = self.f0_uv_predictor(h_frame)
         f0_pred, uv_logit = f0_uv_out[..., 0], f0_uv_out[..., 1]
@@ -2135,6 +2303,7 @@ class AetherAcousticModel(nn.Module):
             "dur": loss_dur.detach(), "f0": loss_f0.detach(), "uv": loss_uv.detach(),
             "energy": loss_energy.detach(), "align": loss_align.detach(),
             "bin": loss_bin.detach(), "bos_ratio": bos_ratio,
+            "dur_mae": dur_mae, "dur_rel": dur_rel, "len_ratio": len_ratio,
         }
 
     @torch.no_grad()
@@ -2226,7 +2395,8 @@ class StreamingISTFTHead(nn.Module):
         self.register_buffer("window", torch.hann_window(n_fft, periodic=True))
 
     def _frames_to_time(self, x: torch.Tensor) -> torch.Tensor:
-        mag, p = self.out(x).float().chunk(2, dim=-1)
+        with torch.autocast(x.device.type, enabled=False):  # 幅值 / 相位头强制 FP32：bf16 输出会给重建波形引入量化底噪
+            mag, p = self.out(x.float()).chunk(2, dim=-1)
         mag = torch.exp(mag).clamp(max=1e2)
         spec = torch.complex(mag * torch.cos(p), mag * torch.sin(p))
         return torch.fft.irfft(spec, n=self.n_fft, dim=-1) * self.window[None, None, :]
@@ -2339,7 +2509,9 @@ class CausalHarmonicSource(nn.Module):
 
     def forward(self, h: torch.Tensor):
         p_hid = F.silu(self.pitch_norm(self.pitch_conv(h.transpose(1, 2)).transpose(1, 2)))
-        p_out = self.pitch_out(p_hid)
+        # 基频头强制 FP32：bf16 的 log_f0 量化一步 ≈ 54 音分，稳态元音期间参考谐波相位会随时间漂移
+        with torch.autocast(h.device.type, enabled=False):
+            p_out = self.pitch_out(p_hid.float())
         log_f0_pred, uv_logit = p_out[..., 0], p_out[..., 1]
         harm_in, harm_head, _ = self._oscillate(log_f0_pred, uv_logit, h.dtype, phi_init=None)
         return harm_in, harm_head, log_f0_pred, uv_logit
@@ -2357,7 +2529,8 @@ class CausalHarmonicSource(nn.Module):
             return empty, empty, state
         p_conv, new_conv = self.pitch_conv.forward_step(h_chunk.transpose(1, 2), state["conv"])
         p_hid = F.silu(self.pitch_norm(p_conv.transpose(1, 2)))
-        p_out = self.pitch_out(p_hid)
+        with torch.autocast(h_chunk.device.type, enabled=False):
+            p_out = self.pitch_out(p_hid.float())
         log_f0_pred, uv_logit = p_out[..., 0], p_out[..., 1]
         harm_in, harm_head, new_phi = self._oscillate(log_f0_pred, uv_logit, h_chunk.dtype, phi_init=state["phi"])
         return harm_in, harm_head, {"conv": new_conv, "phi": new_phi}
@@ -2560,10 +2733,12 @@ if SELFTEST:
     run_aligner_equivalence_selftest()
 
 # #############################################################################
-# Cell 6: 训练前硬门禁（前端音系 + 长流式局部 RoPE + 零前瞻膨胀 + 声码器流式等价）
+# Cell 6: 训练前硬门禁（前端音系 + 长流式局部 RoPE + 零前瞻膨胀 + 声码器流式等价 + autocast 精度）
 # #############################################################################
 def run_frontend_phonology_tests():
-    """验证 a5 前端：20,901 个 CJK 基本汉字零 <unk>、舌尖元音区分、yan->ian 还原、儿化/一不变调及标贝韵律标点对齐。"""
+    """验证 a6 前端：20,901 个 CJK 基本汉字零 <unk>、舌尖元音区分、yan->ian 还原、儿化/一不变调、标贝韵律分级边界、
+    推理期分词边界、纯英文数字转写与 g2p_en 回退不丢词。"""
+    global _EN_G2P, _EN_G2P_INIT_TRIED
     all_cjk = "".join(chr(c) for c in range(0x4E00, 0x9FA5))
     unk_cnt = 0
     for p in pinyin(all_cjk, style=Style.TONE3, neutral_tone_with_five=True, errors="ignore"):
@@ -2580,19 +2755,63 @@ def run_frontend_phonology_tests():
     assert FRONTEND._split_zh_syllable("dianr3") == ["zh_d", "zh_ian3", "zh_er_coda"]
     assert FRONTEND._split_zh_syllable("zher4") == ["zh_zh", "zh_e4", "zh_er_coda"]
 
-    # 验证标贝儿化句逐字符解析不丢句中逗号且正确转化 #1/#2/#3 韵律边界
+    # 验证标贝儿化句逐字符解析不丢句中逗号，且 #1/#2/#3 按等级映射（压成同一个值会丢掉停顿等级信息）
     bz = FRONTEND.parse_bznsyp_prosody("这儿#1有一点儿#2水#3，你喝吧#4。", "zher4 you3 yi2 dianr3 shui3 ni3 he1 ba5")
     pids_bz, _, bids_bz = FRONTEND.text_to_ids("这儿有一点儿水，你喝吧。", bznsyp_prosody_items=bz)
     toks_bz = [FRONTEND.id2tok[x] for x in pids_bz]
     assert "," in toks_bz and "." in toks_bz and toks_bz.count("zh_er_coda") == 2, f"BZNSYP erhua punc lost: {toks_bz}"
-    assert max(bids_bz) == 2
+    # 逐音节比对完整解析序列：句首 4、#1 后 2（韵律词首）、词内 1、#2 后 3（韵律短语首）、#3 / 逗号后 4（语调短语首）
+    assert [(s, b) for s, is_p, b in bz] == [
+        ("zher4", 4), ("you3", 2), ("yi2", 1), ("dianr3", 1), ("shui3", 3), (",", 0), ("ni3", 4), ("he1", 1), ("ba5", 1), (".", 0)
+    ], bz
+    # 标点必须留在原位（逗号夹在「水」与「你」之间），且不得产生伪音节。
+    # 回归防护：旧解析器把 #1 的数字归一化成汉字「一」，伪音节偷占拼音后边界全丢、句中逗号被挤到句尾
+    _i_comma = toks_bz.index(",")
+    assert toks_bz[_i_comma - 1] == "zh_uei3" and toks_bz[_i_comma + 1] == "zh_n", toks_bz
+    assert toks_bz[-2] == "." and toks_bz.count("zh_er_coda") == 2, toks_bz
+    bz2 = FRONTEND.parse_bznsyp_prosody("卡#1门#2跪#3#4求#2", "ka3 men2 gui3 qiu2")
+    assert [(s, b) for s, is_p, b in bz2 if not is_p] == [("ka3", 4), ("men2", 2), ("gui3", 3), ("qiu2", 4)], bz2
 
     # 验证推理期口语儿化与「一/不/叠字」变调
     pids_inf, _, _ = FRONTEND.text_to_ids("一会儿见，看一看，不要紧。")
     toks_inf = [FRONTEND.id2tok[x] for x in pids_inf]
     assert "zh_i2" in toks_inf and "zh_er_coda" in toks_inf and "zh_i5" in toks_inf and "zh_u2" in toks_inf, f"Sandhi/erhua failed: {toks_inf}"
-    print(f"  [PASS] {'Frontend Phonology (a5)':26s} | 20,901 CJK 0-UNK | i/ii/iii + erhua + sandhi + BZNSYP punc")
 
+    # 推理期（无标注）边界必须与训练期同一套语义：句首 / 标点后首音节=4，词首=2，词内=1（jieba 可用时按分词词首）
+    pids_b, _, bids_b = FRONTEND.text_to_ids("你好，请问今天北京的天气怎么样？")
+    toks_b = [FRONTEND.id2tok[x] for x in pids_b]
+    _first_b = lambda t: bids_b[toks_b.index(t)]  # noqa: E731
+    assert _first_b("zh_n") == 4 and _first_b("zh_h") == 1, list(zip(toks_b, bids_b))  # 「你好」：句首 4，词内 1
+    assert _first_b("zh_q") == 4, list(zip(toks_b, bids_b))                           # 「请问」在逗号后 -> 4
+    assert _first_b("zh_j") == 2 and _first_b("zh_b") == 2, list(zip(toks_b, bids_b))  # 「今天」「北京」词首 -> 2
+    assert set(bids_b) <= {0, 1, 2, 4} and max(bids_b) == 4, list(zip(toks_b, bids_b))
+    has_jieba = _get_zh_word_segmenter() is not None
+    if has_jieba:
+        # 机械规则会把 13 音节串的第 12 个音节「样」标成词首；分词知道「怎么样」是一个词
+        assert _first_b("zh_m") == 1 and _first_b("zh_y") == 1, list(zip(toks_b, bids_b))
+
+    # 纯英文数字转写：此前数字既不转写也不被分词正则捕获，整段被丢弃
+    assert FRONTEND.normalize_text("In 1861, page 39, the 4th of May.") == "In eighteen sixty one, page thirty nine, the fourth of May."
+    assert FRONTEND.normalize_text("1,234.5 units; the 3d of June; 20th, 21st, 2nd") == "one thousand two hundred thirty four point five units; the third of June; twentieth, twenty first, second"
+    assert FRONTEND.normalize_text("3D and B2B stay 1:1") == "3D and B2B stay one:one"
+    assert FRONTEND.normalize_text("1st 2nd 3rd 4th 11th 12th 13th 20th 21st 23rd 30th 100th 121st") == (
+        "first second third fourth eleventh twelfth thirteenth twentieth twenty first twenty third thirtieth one hundredth one hundred twenty first"
+    )
+    assert FRONTEND.normalize_text("from 1809 to 1811; between 1900 and 2005; 2,500 men in 1812") == (
+        "from eighteen oh nine to eighteen eleven; between nineteen hundred and two thousand five; two thousand five hundred men in eighteen twelve"
+    )
+    _n_room, _n_room12 = len(FRONTEND.text_to_ids("Room")[0]), len(FRONTEND.text_to_ids("Room 12")[0])
+    assert _n_room12 > _n_room, "English digits still dropped from the phoneme sequence"
+
+    # g2p_en 不可用时的字母级回退不能丢词：强制走回退路径，英文词必须产出音素
+    _saved = (_EN_G2P, _EN_G2P_INIT_TRIED)
+    try:
+        _EN_G2P, _EN_G2P_INIT_TRIED = None, True
+        ids_fb, _, _ = FRONTEND.text_to_ids("Hello world")
+        assert sum(1 for x in ids_fb if x not in (FRONTEND.bos_id, FRONTEND.eos_id)) >= 8, ids_fb
+    finally:
+        _EN_G2P, _EN_G2P_INIT_TRIED = _saved
+    print(f"  [PASS] {'Frontend Phonology (a6)':26s} | 20,901 CJK 0-UNK | i/ii/iii + erhua + sandhi + BZNSYP 分级边界 | 推理边界={'jieba' if has_jieba else '机械规则'} | EN 数字转写 + 回退不丢词")
 
 def run_chunkwise_numerical_and_grad_tests():
     """验证保留的门控 DeltaNet (E4) 在强遗忘条件下的前向等价性与反向梯度有限性。"""
@@ -2656,14 +2875,90 @@ def run_chunk_attn_parallel_and_long_stream_tests():
         assert bb.layers[0]._rope_cos.shape[0] == 128 and st_l["layers"][0]["k"].shape[2] == 16
     print(f"  [PASS] {'ChunkAttn Parallel+LongRoPE':26s} | Fwd: {fwd_diff:.2e} | Grad: {pgrad_diff:.2e} | T=605 Diff: {long_diff:.2e}")
 
+def run_autocast_precision_tests():
+    """训练实际数值配置（CUDA + bf16 autocast）门禁：对齐器 / GDN 分块扫描 / 谐波源基频头 / iSTFT 头不得被 autocast 降精度。
+    CPU fp32 门禁覆盖不到这条路径——训练时这些敏感段正是跑在 autocast 里的。"""
+    if not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()):
+        print(f"  [SKIP] {'Autocast Precision':26s} | 无 CUDA bf16（训练不走 autocast，CPU fp32 门禁已覆盖）")
+        return
+    dev = torch.device("cuda")
+    tf32_mm, tf32_cudnn = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False  # 门禁期间关 TF32，隔离出纯 autocast 影响
+    try:
+        torch.manual_seed(0)
+
+        def _ac():
+            return torch.autocast("cuda", dtype=torch.bfloat16)
+
+        with torch.no_grad():
+            with _ac():
+                probe = torch.bmm(torch.randn(4, 4, 4, device=dev), torch.randn(4, 4, 4, device=dev))
+            assert probe.dtype == torch.bfloat16, "autocast 未生效，门禁无意义"
+
+            # 1) 对齐器：autocast 开 / 关必须得到同一份 logits（它们直接决定 Viterbi 硬时长）
+            enc = AlignmentEncoder(n_mels=100, d_text=256, d_attn=80).to(dev).eval()
+            mel = torch.randn(4, 100, 160, device=dev)
+            emb = torch.randn(4, 50, 256, device=dev)
+            tl = torch.tensor([50, 40, 30, 20], device=dev)
+            ml = torch.tensor([160, 120, 90, 60], device=dev)
+            tmask = torch.arange(50, device=dev)[None, :] < tl[:, None]
+            mmask = torch.arange(160, device=dev)[None, :] < ml[:, None]
+            prior = build_beta_binomial_log_prior(tl, ml, 50, 160)
+            lp_ref, _ = enc(mel, emb, tmask, attn_log_prior=prior, mel_mask=mmask)
+            with _ac():
+                lp_amp, _ = enc(mel, emb, tmask, attn_log_prior=prior, mel_mask=mmask)
+            al_diff = (lp_ref - lp_amp).abs().max().item()
+            assert torch.isfinite(lp_amp).all() and al_diff < 1e-5, f"Aligner logits drift under autocast: {al_diff:.2e}"
+
+            # 2) GDN：外层 autocast 下分块扫描仍须与 fp32 逐步递推一致
+            B, T, H, K = 2, 75, 4, 16
+            q = F.normalize(torch.randn(B, T, H, K, device=dev), dim=-1)
+            k = F.normalize(torch.randn(B, T, H, K, device=dev), dim=-1)
+            v = torch.randn(B, T, H, K, device=dev)
+            beta = torch.rand(B, T, H, device=dev).clamp(0.05, 0.95)
+            log_a = -torch.empty(B, T, H, device=dev).uniform_(5.0, 30.0)
+            S0 = torch.randn(B, H, K, K, device=dev)
+            y_ref, S_ref = gated_delta_rule_recurrent(q, k, v, beta, log_a, S0.clone())
+            with _ac():
+                y_amp, S_amp = gated_delta_rule_chunkwise(q, k, v, beta, log_a, S0.clone())
+            gdn_y, gdn_s = (y_amp - y_ref).abs().max().item(), (S_amp - S_ref).abs().max().item()
+            assert gdn_y < 1e-5 and gdn_s < 1e-5, f"GDN chunk scan drift under autocast: y={gdn_y:.2e} S={gdn_s:.2e}"
+
+            # 3) 谐波源 + iSTFT 头：外层 autocast 下 log_f0 与重建波形必须仍是 FP32（bf16 的 log_f0 一步 ≈ 54 音分）
+            voc = CausalVocosLite(n_mels=100, lookahead=2).to(dev).eval()
+            voc.set_mel_stats(torch.linspace(-7.0, -3.0, 100), torch.linspace(1.5, 2.5, 100))
+            with _ac():
+                wav_amp, f0_amp, _ = voc.forward_with_aux(torch.randn(2, 100, 50, device=dev) * 2.0 - 5.0)
+            on_bf16_grid = (f0_amp.to(torch.bfloat16).float() == f0_amp).float().mean().item()
+            assert f0_amp.dtype == torch.float32 and wav_amp.dtype == torch.float32, f"vocoder sensitive heads downcast: f0={f0_amp.dtype} wav={wav_amp.dtype}"
+            assert torch.isfinite(wav_amp).all() and on_bf16_grid < 0.05, f"log_f0 quantized to bf16 grid: {on_bf16_grid:.1%}"
+
+        # 4) 主力 E3：autocast 下并行训练路径 vs 逐块串行 / 流式路径只应相差 bf16 舍入量级，且无 NaN / Inf
+        torch.manual_seed(7)
+        bb = ChunkLookaheadBackbone(d_model=256, chunk_size=4, lookahead=8, n_layers=5, n_heads=4, window_size=48).to(dev)
+        mask = torch.arange(75, device=dev)[None, :] < torch.tensor([75, 43, 19, 3], device=dev)[:, None]
+        xb = torch.randn(4, 75, 256, device=dev) * mask[:, :, None].float()
+        with torch.no_grad():
+            with _ac():
+                y_par, y_seq = bb.forward(xb, mask=mask), bb._forward_sequential(xb, mask=mask)
+            valid = mask[:, :, None].expand_as(y_par)
+            assert torch.isfinite(y_par[valid]).all(), "E3 non-finite output under autocast"
+            e3_rel = (y_par.float() - y_seq.float()).abs().max().item() / (y_par.float()[valid].abs().max().item() + 1e-6)
+            assert e3_rel < 0.1, f"E3 parallel/sequential drift under autocast too large: {e3_rel:.3f}"
+        print(f"  [PASS] {'Autocast Precision':26s} | Aligner Δ={al_diff:.1e} | GDN Δ={gdn_y:.1e} | log_f0 on bf16 grid={on_bf16_grid:.1%} | E3 par/seq rel={e3_rel:.3f}")
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = tf32_mm
+        torch.backends.cudnn.allow_tf32 = tf32_cudnn
+
 
 def run_architecture_and_streaming_tests():
     print("=" * 72)
-    print("前端音系 & 主力 E3 长流式局部 RoPE & 零前瞻膨胀 & 谐波源因果声码器硬门禁")
+    print("前端音系 & 主力 E3 长流式局部 RoPE & 零前瞻膨胀 & 谐波源因果声码器 & autocast 精度硬门禁")
     print("=" * 72)
     run_frontend_phonology_tests()
     run_chunkwise_numerical_and_grad_tests()
     run_chunk_attn_parallel_and_long_stream_tests()
+    run_autocast_precision_tests()
 
     # 门禁检查：默认训练只跑 EXPERIMENTS ([E3])，但门禁对保留代码也做快速验证防止归档代码腐化
     gate_models = ALL_EXPERIMENTS if globals().get("SELFTEST", False) else EXPERIMENTS
@@ -2672,7 +2967,7 @@ def run_architecture_and_streaming_tests():
         T = 75
         pids = torch.randint(4, FRONTEND.vocab_size, (1, T), dtype=torch.long)
         lids = torch.randint(0, 3, (1, T), dtype=torch.long)
-        bids = torch.randint(0, 3, (1, T), dtype=torch.long)
+        bids = torch.randint(0, 5, (1, T), dtype=torch.long)
 
         for exp_name, bb_type, lookahead in gate_models:
             m = AetherAcousticModel(
@@ -2792,12 +3087,12 @@ def run_architecture_and_streaming_tests():
 
 run_architecture_and_streaming_tests()
 if SELFTEST:
-    print("[SelfTest] 前端音系、长流式局部 RoPE、零前瞻膨胀、谐波源因果声码器及保留主干门禁全部通过，退出 --selftest 模式。")
+    print("[SelfTest] 前端音系、长流式局部 RoPE、零前瞻膨胀、谐波源因果声码器、autocast 精度及保留主干门禁全部通过，退出 --selftest 模式。")
     import sys as _sys
     _sys.exit(0)
 
 # #############################################################################
-# Cell 4: 数据下载与 v3 预处理
+# Cell 4: 数据下载与 v4 预处理
 # #############################################################################
 from tqdm.auto import tqdm
 from huggingface_hub import hf_hub_download
@@ -3085,6 +3380,22 @@ def download_and_prepare_dataset(cfg):
     else:
         raise ValueError(f"Unsupported DATASET_SOURCE: {src}")
 
+    # 含英文的训练语料必须有真正的英文 G2P：逐字母回退会把所有英文词拼成字母名，整份文本失真，默认直接报错
+    n_en_utts = sum(1 for it in items if re.search(r"[A-Za-z]{2,}", it["text"]))
+    if n_en_utts > 0:
+        if FRONTEND.en_g2p() is None:
+            if os.environ.get("AETHER_ALLOW_EN_FALLBACK", "0") == "1":
+                print(f"[Warn] 已设置 AETHER_ALLOW_EN_FALLBACK=1：{n_en_utts} 句含英文文本将按字母拼读（发音不正确）。", flush=True)
+            else:
+                raise RuntimeError(
+                    f"{n_en_utts}/{len(items)} 句训练文本含英文，但 g2p_en 不可用（原因见上方 [Warn]）。"
+                    "逐字母回退会让英文数据失真，已中止预处理。请安装 g2p-en 与 nltk 数据"
+                    "（cmudict / averaged_perceptron_tagger / averaged_perceptron_tagger_eng）；"
+                    "确需接受字母级拼读时设置 AETHER_ALLOW_EN_FALLBACK=1。"
+                )
+        else:
+            print(f"[Frontend] 英文 G2P 就绪（g2p_en），含英文文本 {n_en_utts} 句。", flush=True)
+
     # ★ 全档位固定独立验证集池：大数据集固定划出前 130 条候选池（跨 standard->full 零训练/验证泄漏），极小自定义集最多占 20%
     rng = random.Random(cfg["seed"])
     rng.shuffle(items)
@@ -3101,14 +3412,13 @@ def download_and_prepare_dataset(cfg):
     for is_val_cand, it in [(True, x) for x in val_cands] + [(False, x) for x in train_pool[:est_train_needed]]:
         feat_file_str = str(shared_feat_dir / f"{it['utt_id']}.pt")
         it_tagged = {**it, "_is_val_cand": is_val_cand}
+        if it.get("text_with_prosody") is not None and it.get("line_py") is not None:
+            # 韵律边界标注同时留在条目里：验证集句子评测时用与训练一致的标注边界（见 Cell 10）
+            it_tagged["_bz_items"] = FRONTEND.parse_bznsyp_prosody(it["text_with_prosody"], it["line_py"])
         if Path(feat_file_str).exists():
             tasks.append((it_tagged, [], [], [], feat_file_str, cfg_sub))
         else:
-            if it.get("text_with_prosody") is not None and it.get("line_py") is not None:
-                bz_items = FRONTEND.parse_bznsyp_prosody(it["text_with_prosody"], it["line_py"])
-                pids, lids, bids = FRONTEND.text_to_ids(it["text"], bznsyp_prosody_items=bz_items)
-            else:
-                pids, lids, bids = FRONTEND.text_to_ids(it["text"])
+            pids, lids, bids = FRONTEND.text_to_ids(it["text"], bznsyp_prosody_items=it_tagged.get("_bz_items"))
             tasks.append((it_tagged, pids, lids, bids, feat_file_str, cfg_sub))
 
     print(f"[Preprocess] 提取 24 kHz Mel+F0+UV+Energy（{DATASET_CACHE_VER}，候选 {len(tasks)} 条，训练目标上限 {cfg['max_train_hours']}h）...", flush=True)
@@ -3131,6 +3441,8 @@ def download_and_prepare_dataset(cfg):
         }
         if it.get("_is_val_cand"):
             if len(val_list) < target_val_cnt:
+                if it.get("_bz_items") is not None:
+                    rec["bznsyp_prosody_items"] = [list(x) for x in it["_bz_items"]]
                 val_list.append(rec)
             return
         if train_sec >= max_train_sec:
@@ -3549,8 +3861,12 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     scaler = torch.amp.GradScaler("cuda", enabled=(DEVICE.type == "cuda" and AMP_DTYPE == torch.float16))
 
-    history = {"steps": [], "train_loss": [], "val_mel": [], "val_struct": [], "val_dur": [], "val_f0": [], "val_uv": [], "elapsed_min": 0.0}
+    history = {"steps": [], "train_loss": [], "val_mel": [], "val_struct": [], "val_dur": [], "val_f0": [], "val_uv": [],
+               "val_infer_mel": [], "val_infer_score": [], "val_dur_mae": [], "val_dur_rel": [], "val_len_ratio": [], "elapsed_min": 0.0}
     best_val_mel = float("inf")
+    # best.pt 选模分（推理路径 mel L1 + 相对时长误差）及其分量；teacher-forced 的 best_val_mel 仅作记录
+    best_val_infer, best_val_infer_mel, best_val_dur_rel = float("inf"), float("inf"), float("inf")
+    last_val = {"mel": float("inf"), "infer_mel": float("inf"), "dur_rel": float("inf"), "infer_score": float("inf")}
     step = 0
     prior_elapsed_min = 0.0
 
@@ -3564,6 +3880,10 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
             scaler.load_state_dict(ckpt["scaler"])
         step = int(ckpt["step"])
         best_val_mel = float(ckpt.get("best_val_mel", float("inf")))
+        # 旧断点没有推理路径选模分：置 inf，则续训后的首次验证即重新落盘 best.pt
+        best_val_infer = float(ckpt.get("best_val_infer", float("inf")))
+        best_val_infer_mel = float(ckpt.get("best_val_infer_mel", float("inf")))
+        best_val_dur_rel = float(ckpt.get("val_dur_rel", float("inf")))
         history = ckpt.get("history", history)
         prior_elapsed_min = float(history.get("elapsed_min", 0.0))
         if storage_best.exists() and not _same_path(local_best, storage_best):
@@ -3587,6 +3907,7 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
         ckpt_obj = {
             "exp_name": exp_name, "backbone_type": backbone_type, "lookahead": lookahead,
             "arch_tag": ARCH_TAG, "step": cur_step, "best_val_mel": best_val_mel, "history": history,
+            "best_val_infer": best_val_infer, "best_val_infer_mel": best_val_infer_mel, "val_dur_rel": best_val_dur_rel,
             "cfg": CFG, "stats": STATS, "vocab": FRONTEND.vocab,
             "model": model.state_dict(), "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(),
@@ -3598,6 +3919,7 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
         save_progress_status(exp_name, {
             "status": "running", "step": cur_step, "total_steps": total_steps,
             "best_val_mel": None if math.isinf(best_val_mel) else round(best_val_mel, 4),
+            "best_val_infer": None if math.isinf(best_val_infer) else round(best_val_infer, 4),
             "elapsed_min": history["elapsed_min"],
         })
         last_backup_t = time.time()
@@ -3621,6 +3943,21 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
             sync_file_to_storage(p_loc, run_storage / "previews" / p_loc.name)
         except Exception:
             pass
+
+    @torch.no_grad()
+    def _infer_mel_l1(vp, vl, vb, vtl, vm, vml):
+        """真实推理路径 mel L1：逐句（无右填充）走 infer_offline，预测谱线性时间规整到 GT 帧长后与归一化 GT mel 比较。
+        线性规整只吸收整体语速差，局部时长错误造成的错位仍会抬高 L1。"""
+        losses = []
+        for b in range(vp.shape[0]):
+            T_b, F_b = int(vtl[b].item()), int(vml[b].item())
+            mel_inf = model.infer_offline(vp[b:b+1, :T_b], vl[b:b+1, :T_b], boundary_ids=vb[b:b+1, :T_b])[0]
+            L_b = mel_inf.shape[-1]
+            if L_b >= 2 and F_b >= 2:
+                # linear 模式只接受 3D 输入 (N, C, W)：这里把 n_mels 当作通道维
+                warped = F.interpolate(mel_inf[0, :, :L_b].unsqueeze(1).float(), size=F_b, mode="linear", align_corners=False).squeeze(1)
+                losses.append(F.l1_loss(warped, vm[b, :, :F_b].float()))
+        return torch.stack(losses).mean() if losses else vm.new_zeros(())
 
     try:
         while step < total_steps:
@@ -3671,18 +4008,27 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
                 if step % eval_every == 0 or step == total_steps:
                     model.eval()
                     v_mel, v_strc, v_dur, v_f0, v_uv, v_bos, v_cnt = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0
+                    v_infer_mel, v_dur_mae, v_dur_rel, v_len_ratio = 0.0, 0.0, 0.0, 0.0
                     with torch.no_grad():
                         for vp, vl, vb, vtl, vm, vf0, ve, vuv, vml in val_loader:
+                            vp, vl, vb, vtl = vp.to(DEVICE), vl.to(DEVICE), vb.to(DEVICE), vtl.to(DEVICE)
+                            vm, vf0, ve, vuv, vml = vm.to(DEVICE), vf0.to(DEVICE), ve.to(DEVICE), vuv.to(DEVICE), vml.to(DEVICE)
                             vo = model.forward_train(
-                                vp.to(DEVICE), vl.to(DEVICE), vtl.to(DEVICE),
-                                vm.to(DEVICE), vf0.to(DEVICE), ve.to(DEVICE), vml.to(DEVICE),
-                                step_ratio=1.0, boundary_ids=vb.to(DEVICE), uv_gt=vuv.to(DEVICE),
+                                vp, vl, vtl, vm, vf0, ve, vml,
+                                step_ratio=1.0, boundary_ids=vb, uv_gt=vuv,
                             )
                             v_mel += vo["mel"].item(); v_strc += vo["struct"].item()
                             v_dur += vo["dur"].item(); v_f0 += vo["f0"].item(); v_uv += vo["uv"].item()
-                            v_bos += vo["bos_ratio"].item(); v_cnt += 1
+                            v_bos += vo["bos_ratio"].item()
+                            v_dur_mae += vo["dur_mae"].item(); v_dur_rel += vo["dur_rel"].item(); v_len_ratio += vo["len_ratio"].item()
+                            # 真实推理路径（预测时长 + 预测 F0/UV/Energy 全走 infer_offline）的 mel L1
+                            v_infer_mel += _infer_mel_l1(vp, vl, vb, vtl, vm, vml).item(); v_cnt += 1
                     d_cnt = max(v_cnt, 1)
                     v_mel /= d_cnt; v_strc /= d_cnt; v_dur /= d_cnt; v_f0 /= d_cnt; v_uv /= d_cnt; v_bos /= d_cnt
+                    v_infer_mel /= d_cnt; v_dur_mae /= d_cnt; v_dur_rel /= d_cnt; v_len_ratio /= d_cnt
+                    # best.pt 选模分 = 推理路径 mel L1 + 相对时长误差（后者含整体语速偏快 / 偏慢），越低越好。
+                    # teacher-forced 的 val_mel 用 GT 谱上的 Viterbi 对齐，衡量不到真实推理质量，只记录不选模
+                    v_infer_score = v_infer_mel + v_dur_rel
                     history["steps"].append(step)
                     history["train_loss"].append(round(loss.item(), 4))
                     history["val_mel"].append(round(v_mel, 4))
@@ -3691,12 +4037,21 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
                     history.setdefault("val_f0", []).append(round(v_f0, 4))
                     history.setdefault("val_uv", []).append(round(v_uv, 4))
                     history.setdefault("val_bos_ratio", []).append(round(v_bos, 3))
+                    history.setdefault("val_infer_mel", []).append(round(v_infer_mel, 4))
+                    history.setdefault("val_infer_score", []).append(round(v_infer_score, 4))
+                    history.setdefault("val_dur_mae", []).append(round(v_dur_mae, 3))
+                    history.setdefault("val_dur_rel", []).append(round(v_dur_rel, 4))
+                    history.setdefault("val_len_ratio", []).append(round(v_len_ratio, 4))
+                    last_val = {"mel": v_mel, "infer_mel": v_infer_mel, "dur_rel": v_dur_rel, "infer_score": v_infer_score}
 
-                    if not math.isnan(v_mel) and v_mel < best_val_mel:
-                        best_val_mel = v_mel
+                    if not math.isnan(v_infer_score) and v_infer_score < best_val_infer:
+                        best_val_infer, best_val_mel = v_infer_score, v_mel
+                        best_val_infer_mel, best_val_dur_rel = v_infer_mel, v_dur_rel
                         best_payload = {
                             "exp_name": exp_name, "backbone_type": backbone_type, "lookahead": lookahead,
                             "arch_tag": ARCH_TAG, "step": step, "best_val_mel": best_val_mel,
+                            "best_val_infer": best_val_infer, "best_val_infer_mel": best_val_infer_mel, "val_dur_rel": best_val_dur_rel,
+                            "select_metric": "val_infer_mel + val_dur_rel",
                             "cfg": CFG, "stats": STATS, "vocab": FRONTEND.vocab, "model": model.state_dict(),
                         }
                         atomic_torch_save(best_payload, local_best)
@@ -3726,7 +4081,9 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
         if not storage_best.exists():
             best_payload = {
                 "exp_name": exp_name, "backbone_type": backbone_type, "lookahead": lookahead,
-                "arch_tag": ARCH_TAG, "step": step, "best_val_mel": best_val_mel,
+                "arch_tag": ARCH_TAG, "step": step, "best_val_mel": last_val["mel"],
+                "best_val_infer": last_val["infer_score"], "best_val_infer_mel": last_val["infer_mel"], "val_dur_rel": last_val["dur_rel"],
+                "select_metric": "val_infer_mel + val_dur_rel",
                 "cfg": CFG, "stats": STATS, "vocab": FRONTEND.vocab, "model": model.state_dict(),
             }
             atomic_torch_save(best_payload, local_best)
@@ -3742,16 +4099,20 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
     except Exception as e:
         print(f"[Warn] INT8 dynamic export skipped for {exp_name}: {e}")
 
-    atomic_write_text(f"completed_step={step}\nbest_val_mel={best_val_mel:.4f}\n", local_done)
+    atomic_write_text(f"completed_step={step}\nbest_val_mel={best_val_mel:.4f}\nbest_val_infer={best_val_infer:.4f}\n", local_done)
     sync_file_to_storage(local_done, storage_done)
     save_progress_status(exp_name, {
         "status": "done", "step": step, "total_steps": total_steps,
         "best_val_mel": None if math.isinf(best_val_mel) else round(best_val_mel, 4),
+        "best_val_infer": None if math.isinf(best_val_infer) else round(best_val_infer, 4),
         "elapsed_min": history["elapsed_min"],
     })
     model = model.to(DEVICE).eval()
     TRAIN_HISTORIES[exp_name] = history
-    print(f"[Done] {exp_name} | Best Val Mel L1: {best_val_mel:.4f} | Total Time: {history['elapsed_min']} min | 保存位置: {run_storage}")
+    print(
+        f"[Done] {exp_name} | Best Val Infer: {best_val_infer:.4f} = mel {best_val_infer_mel:.4f} + dur_rel {best_val_dur_rel:.4f} "
+        f"(选模依据; TF Val Mel L1: {best_val_mel:.4f}) | Total Time: {history['elapsed_min']} min | 保存位置: {run_storage}"
+    )
     return model
 
 
@@ -4035,7 +4396,8 @@ GOLDEN_EN = [
 def build_eval_suite():
     suite = []
     for e in DATASET_META["val"][: CFG["eval_max_utts"]]:
-        suite.append({"utt_id": f"val_{e['utt_id']}", "text": e["text"], "feat_path": e["feat_path"], "is_val": True})
+        suite.append({"utt_id": f"val_{e['utt_id']}", "text": e["text"], "feat_path": e["feat_path"], "is_val": True,
+                      "bznsyp_prosody_items": e.get("bznsyp_prosody_items")})
     extras = GOLDEN_ZH if CFG["dataset_source"] == "bznsyp" else (GOLDEN_EN if CFG["dataset_source"] == "ljspeech" else GOLDEN_ZH + GOLDEN_EN)
     for uid, txt in extras:
         suite.append({"utt_id": uid, "text": txt, "feat_path": None, "is_val": False})
@@ -4046,9 +4408,16 @@ EVAL_SUITE = build_eval_suite()
 print(f"评测集构建完成：共 {len(EVAL_SUITE)} 句（含真声参考 Val: {sum(x['is_val'] for x in EVAL_SUITE)} 句）")
 
 
+def _eval_text_ids(text: str, bz_items=None):
+    """评测句音系化：验证集句子带标贝 #1-#3 标注边界（与训练同分布）；无标注的黄金句走推理期分词近似边界。"""
+    if bz_items:
+        return FRONTEND.text_to_ids(text, bznsyp_prosody_items=[tuple(x) for x in bz_items])
+    return FRONTEND.text_to_ids(text)
+
+
 @torch.no_grad()
-def synthesize_offline(model: AetherAcousticModel, text: str, vocoder, use_pretrained_vocos: bool = False):
-    pids, lids, bids = FRONTEND.text_to_ids(text)
+def synthesize_offline(model: AetherAcousticModel, text: str, vocoder, use_pretrained_vocos: bool = False, bz_items=None):
+    pids, lids, bids = _eval_text_ids(text, bz_items)
     mel_norm, _, _, _ = model.infer_offline(
         torch.tensor([pids], dtype=torch.long, device=DEVICE),
         torch.tensor([lids], dtype=torch.long, device=DEVICE),
@@ -4060,9 +4429,9 @@ def synthesize_offline(model: AetherAcousticModel, text: str, vocoder, use_pretr
 
 
 @torch.no_grad()
-def synthesize_streaming(model: AetherAcousticModel, text: str, vocoder: CausalVocosLite):
+def synthesize_streaming(model: AetherAcousticModel, text: str, vocoder: CausalVocosLite, bz_items=None):
     """动态双档低延迟流式合成：首包仅需攒够 stream_mel_first_chunk (6帧≈64ms) 即刻出声，后续稳态走 16 帧块高吞吐。"""
-    pids, lids, bids = FRONTEND.text_to_ids(text)
+    pids, lids, bids = _eval_text_ids(text, bz_items)
     pt = torch.tensor([pids], dtype=torch.long, device=DEVICE)
     lt = torch.tensor([lids], dtype=torch.long, device=DEVICE)
     bt = torch.tensor([bids], dtype=torch.long, device=DEVICE)
@@ -4141,19 +4510,20 @@ for exp_name, model in TRAINED_MODELS.items():
             model, item["text"],
             vocoder=CAUSAL_VOCODER if not use_pre_for_offline else PRETRAINED_VOCOS,
             use_pretrained_vocos=use_pre_for_offline,
+            bz_items=item.get("bznsyp_prosody_items"),
         )
         p_off = exp_out_off / f"{item['utt_id']}.wav"
         sf.write(p_off, np.clip(wav_off, -1.0, 1.0), CFG["sample_rate"])
 
         p_pre = None
         if PRETRAINED_VOCOS is not None and not use_pre_for_offline:
-            wav_pre, _ = synthesize_offline(model, item["text"], vocoder=None, use_pretrained_vocos=True)
+            wav_pre, _ = synthesize_offline(model, item["text"], vocoder=None, use_pretrained_vocos=True, bz_items=item.get("bznsyp_prosody_items"))
             p_pre = exp_out_pre / f"{item['utt_id']}.wav"
             sf.write(p_pre, np.clip(wav_pre, -1.0, 1.0), CFG["sample_rate"])
 
         p_str, seams, stream_diff = None, [], 0.0
         if model.is_streaming and CAUSAL_VOCODER is not None:
-            wav_str, _, seams = synthesize_streaming(model, item["text"], CAUSAL_VOCODER)
+            wav_str, _, seams = synthesize_streaming(model, item["text"], CAUSAL_VOCODER, bz_items=item.get("bznsyp_prosody_items"))
             p_str = exp_out_str / f"{item['utt_id']}.wav"
             sf.write(p_str, np.clip(wav_str, -1.0, 1.0), CFG["sample_rate"])
             L_min = min(len(wav_off), len(wav_str))
@@ -4165,6 +4535,7 @@ for exp_name, model in TRAINED_MODELS.items():
             "off_wav": str(p_off), "str_wav": str(p_str) if p_str else None,
             "pre_wav": str(p_pre) if p_pre else None,
             "seams": seams, "stream_wav_max_diff": stream_diff,
+            "boundary_src": "label" if item.get("bznsyp_prosody_items") else "heuristic",
         })
     GENERATED_RECORDS[exp_name] = recs
     sync_dir_to_storage(EVAL_LOCAL_DIR / exp_name, EVAL_STORAGE_DIR / exp_name)
@@ -4334,7 +4705,11 @@ print(f"[Gold Anchor] Ground-Truth UTMOS: {GT_UTMOS_MEAN:.3f} | 2-8kHz Ratio: {G
 
 @torch.no_grad()
 def benchmark_cpu_2thread_and_int8(model: AetherAcousticModel, vocoder: CausalVocosLite, sample_text: str):
-    """测量 2 线程纯 CPU 流式 RTF / 动态首包 TTFA，并验证剥离 Aligner 后的 INT8 量化精度漂移。"""
+    """测量 2 线程纯 CPU 流式 RTF、两种口径的首包 TTFA，并验证剥离 Aligner 后的 INT8 量化精度漂移。
+    - compute TTFA：整句文本在 t=0 已就绪，只计 TTS 自身计算耗时（与历史结果同口径）；
+    - stream TTFA：t=0 记为 LLM 第一个 token 到达，文本按 CFG["llm_tok_rate"] × CFG["llm_chars_per_tok"] 逐字到达，
+      每个文本块要等「其末音素所需的字符」到齐才能计算——包含 E3 提交首块前必须等满 C+L 音素的算法等待；
+      不含 LLM 自身生成首 token 的延迟。两者都只代表本机桌面 CPU，不代表目标 ARM 板。"""
     prev_threads = torch.get_num_threads()
     torch.set_num_threads(2)
     m_cpu = model.to("cpu").eval()
@@ -4344,16 +4719,28 @@ def benchmark_cpu_2thread_and_int8(model: AetherAcousticModel, vocoder: CausalVo
     lt = torch.tensor([lids], dtype=torch.long)
     bt = torch.tensor([bids], dtype=torch.long)
     T = pt.shape[1]
+    t_step = CFG["stream_text_chunk"]
+    tok_rate = max(float(CFG["llm_tok_rate"]), 1e-6)
+    chars_per_tok = max(float(CFG["llm_chars_per_tok"]), 1e-6)
+    # 逐前缀音系化，求每个文本块（到其末音素为止）所需的最少字符数；第 n 个字符到达时刻 = (n-1)/chars_per_tok/tok_rate
+    norm_txt = FRONTEND.normalize_text(sample_text)
+    need_chars, n_chars = [], 0
+    for i in range(0, T, t_step):
+        need_ph = min(i + t_step, T - 1) - 1  # 不含 <bos>/<eos>
+        while n_chars < len(norm_txt) and len(FRONTEND.text_to_ids(norm_txt[:n_chars + 1])[0]) - 2 < need_ph:
+            n_chars += 1
+        need_chars.append(n_chars)
+    arrival_s = [max(n - 1, 0) / chars_per_tok / tok_rate for n in need_chars]
 
-    def _run_once():
+    def _run_once(paced: bool):
         if m_cpu.is_streaming and v_cpu is not None:
-            t_start, ttfa_ms, total_samples = time.perf_counter(), None, 0
+            clock, ttfa_ms, total_samples = 0.0, None, 0
             ast_st = m_cpu.init_stream_state(1, device=torch.device("cpu"), dtype=torch.float32)
             voc_st = v_cpu.init_state(1, device=torch.device("cpu"), dtype=torch.float32)
             mel_buf = torch.zeros(1, CFG["n_mels"], 0)
-            first_emitted = False
-            t_step = CFG["stream_text_chunk"]
-            for i in range(0, T, t_step):
+            first_emitted, first_need = False, (len(norm_txt), T - 2)
+            for ci, i in enumerate(range(0, T, t_step)):
+                t0 = time.perf_counter()
                 is_last = (i + t_step >= T)
                 mc, ast_st = m_cpu.infer_stream_step(
                     pt[:, i:i+t_step], lt[:, i:i+t_step], ast_st,
@@ -4370,25 +4757,33 @@ def benchmark_cpu_2thread_and_int8(model: AetherAcousticModel, vocoder: CausalVo
                     total_samples += wc.shape[-1]
                     if wc.shape[-1] > 0:
                         first_emitted = True
-                        if ttfa_ms is None:
-                            ttfa_ms = (time.perf_counter() - t_start) * 1000.0
+                dt = time.perf_counter() - t0
+                # paced：文本块到达后才能算，此前的计算与等待重叠；非 paced：整句已在手，纯累加计算耗时
+                clock = (max(clock, arrival_s[ci]) if paced else clock) + dt
+                if ttfa_ms is None and first_emitted:
+                    ttfa_ms = clock * 1000.0
+                    first_need = (need_chars[ci], min(i + t_step, T - 1) - 1)
                 if is_last:
+                    t0 = time.perf_counter()
                     wc, voc_st = v_cpu.forward_step(mel_buf, voc_st, is_final=True)
                     total_samples += wc.shape[-1]
+                    clock += time.perf_counter() - t0
                     if ttfa_ms is None and wc.shape[-1] > 0:
-                        ttfa_ms = (time.perf_counter() - t_start) * 1000.0
-            elapsed = time.perf_counter() - t_start
-            return elapsed / max(total_samples / CFG["sample_rate"], 1e-3), (ttfa_ms or 0.0)
+                        ttfa_ms = clock * 1000.0
+            return clock / max(total_samples / CFG["sample_rate"], 1e-3), (ttfa_ms or 0.0), first_need
         t_start = time.perf_counter()
         mel = denorm_mel(m_cpu.infer_offline(pt, lt, boundary_ids=bt)[0])
         audio_sec = max((v_cpu(mel).shape[-1] if v_cpu is not None else mel.shape[-1] * CFG["hop_length"]) / CFG["sample_rate"], 1e-3)
         elapsed = time.perf_counter() - t_start
-        return elapsed / audio_sec, elapsed * 1000.0
+        return elapsed / audio_sec, elapsed * 1000.0, (len(norm_txt), T - 2)
 
-    _run_once()
-    runs = [_run_once() for _ in range(3)]
+    _run_once(False); _run_once(True)
+    runs = [_run_once(False) for _ in range(3)]
     rtf = float(np.median([x[0] for x in runs]))
     ttfa_ms = float(np.median([x[1] for x in runs]))
+    paced = [_run_once(True) for _ in range(3)]
+    ttfa_stream_ms = float(np.median([x[1] for x in paced]))
+    first_chars, first_ph = paced[0][2]
 
     # 校验动态 INT8 量化对声学输出 Mel 的真实数值漂移
     int8_mel_l1 = float("nan")
@@ -4409,8 +4804,7 @@ def benchmark_cpu_2thread_and_int8(model: AetherAcousticModel, vocoder: CausalVo
     if vocoder is not None:
         vocoder.to(DEVICE)
     torch.set_num_threads(prev_threads)
-    return round(rtf, 4), round(ttfa_ms, 1), round(int8_mel_l1, 4) if not math.isnan(int8_mel_l1) else None
-
+    return round(rtf, 4), round(ttfa_ms, 1), round(ttfa_stream_ms, 1), int(first_chars), int(first_ph), (round(int8_mel_l1, 4) if not math.isnan(int8_mel_l1) else None)
 
 def compute_fair_composite_score(mean_utmos: float, mean_mer: float, mean_sim: float, rtf_2t: float, ttfa_ms: float, mean_click: float) -> float:
     """无截断失真、缺项按可用权重自动归一的综合评分（彻底修复旧版 UTMOS<1.5 归零与 MER=NaN 反奖 20 分的失真）。"""
@@ -4457,9 +4851,14 @@ for exp_name, model in TRAINED_MODELS.items():
             utmos_pre_s.append(u_pre)
         utmos_s.append(u); pesq_s.append(pesq); sisdr_s.append(sisdr); stoi_s.append(stoi)
         mer_s.append(mer); sim_s.append(sim); hf_diff_s.append(hfd); click_s.append(clk); sdiff_s.append(r["stream_wav_max_diff"])
-        all_sample_rows.append({"model": exp_name, "utt_id": r["utt_id"], "text": r["text"], "UTMOS": u, "UTMOS_PreVocos": u_pre, "PESQ": pesq, "SI_SDR": sisdr, "MER": mer, "SIM": sim, "HF_2_8k_Diff": hfd, "Seam_Click": clk})
+        all_sample_rows.append({"model": exp_name, "utt_id": r["utt_id"], "text": r["text"], "UTMOS": u, "UTMOS_PreVocos": u_pre, "PESQ": pesq, "SI_SDR": sisdr, "MER": mer, "SIM": sim, "HF_2_8k_Diff": hfd, "Seam_Click": clk, "Boundary_Src": r["boundary_src"]})
 
-    rtf_2t, ttfa_ms, int8_mel_diff = benchmark_cpu_2thread_and_int8(model, CAUSAL_VOCODER, bench_text)
+    rtf_2t, ttfa_ms, ttfa_stream_ms, first_chars, first_ph, int8_mel_diff = benchmark_cpu_2thread_and_int8(model, CAUSAL_VOCODER, bench_text)
+    print(
+        f"[Latency] {exp_name}: 首声前需 {first_ph} 个音素（≈{first_chars} 字）| compute TTFA={ttfa_ms:.1f} ms（整句在 t=0 已就绪）| "
+        f"stream TTFA={ttfa_stream_ms:.1f} ms（t=0 为 LLM 首 token，按 {CFG['llm_tok_rate']:.0f} token/s × {CFG['llm_chars_per_tok']} 字/token 吐字，"
+        f"不含 LLM 首生成延迟）\n          RTF / TTFA 均为本机桌面 CPU 2 线程实测，不代表目标 ARM 板。"
+    )
     infer_params_m = sum(p.numel() for n, p in model.named_parameters() if not n.startswith("aligner.")) / 1e6
     int8_path = STORAGE_ROOT / "runs" / f"{exp_name}_{CFG['acoustic_suffix']}" / "model_int8.pt"
     ac_size_mb = (int8_path.stat().st_size / 1e6) if int8_path.exists() else (infer_params_m * 4.0)
@@ -4480,7 +4879,9 @@ for exp_name, model in TRAINED_MODELS.items():
         "SIM↑": round(mean_sim, 3) if not np.isnan(mean_sim) else None,
         "SQUIM_PESQ↑": round(mean_pesq, 3) if not np.isnan(mean_pesq) else None,
         "HF_2_8k_Diff↓": round(float(np.mean(hf_diff_s)), 4), "Seam_Click↓": round(mean_click, 4),
-        "Stream_MaxDiff": f"{max(sdiff_s):.1e}", "CPU2T_RTF↓": rtf_2t, "CPU2T_TTFA_ms↓": ttfa_ms,
+        "Stream_MaxDiff": f"{max(sdiff_s):.1e}", "CPU2T_RTF↓": rtf_2t,
+        "CPU2T_TTFA_ms↓": ttfa_ms, "Stream_TTFA_ms↓": ttfa_stream_ms,
+        "FirstAudio_TextChars": first_chars, "FirstAudio_Phonemes": first_ph,
         "Composite_Score↑": composite,
     })
 
@@ -4536,6 +4937,9 @@ for exp_name, hist in TRAIN_HISTORIES.items():
         ax.plot(hist["steps"], hist["val_mel"], marker="o", label=f"{exp_name} (mel)")
         if hist.get("val_f0"):
             ax.plot(hist["steps"], hist["val_f0"], linestyle="--", alpha=0.7, label=f"{exp_name} (voiced f0)")
+        if hist.get("val_infer_mel"):
+            # 真实推理路径 mel L1：best.pt 的选模分量（另有 dur_rel 相加）
+            ax.plot(hist["steps"], hist["val_infer_mel"], marker="^", markersize=3, label=f"{exp_name} (infer mel, best.pt 选模分量)")
 ax.set_title("Validation Mel & Voiced F0 L1 Convergence")
 ax.set_xlabel("Steps"); ax.set_ylabel("Validation L1"); ax.grid(True, alpha=0.3); ax.legend(fontsize=8)
 
@@ -4550,10 +4954,12 @@ ax.set_xticks(x); ax.set_xticklabels(LEADERBOARD["Model"], rotation=15, ha="righ
 ax.set_title("Naturalness (UTMOS)"); ax.set_ylim(0, 5.0); ax.grid(True, axis="y", alpha=0.3); ax.legend(fontsize=8)
 
 ax = axes[2]
-ax.bar(x, LEADERBOARD["CPU2T_TTFA_ms↓"], color="#4C78A8", alpha=0.85, label="Compute TTFA (ms)")
+_w = 0.38
+ax.bar(x - _w / 2, LEADERBOARD["CPU2T_TTFA_ms↓"], width=_w, color="#4C78A8", alpha=0.85, label="Compute TTFA (text ready at t=0)")
+ax.bar(x + _w / 2, LEADERBOARD["Stream_TTFA_ms↓"], width=_w, color="#E45756", alpha=0.85, label=f"Stream TTFA (LLM {CFG['llm_tok_rate']:.0f} tok/s)")
 ax.axhline(150.0, color="green", linestyle="--", label="Target TTFA (150ms)")
 ax.set_xticks(x); ax.set_xticklabels(LEADERBOARD["Model"], rotation=15, ha="right", fontsize=8)
-ax.set_title("CPU 2-Thread First-Audio Latency (ms)"); ax.grid(True, axis="y", alpha=0.3); ax.legend(fontsize=8)
+ax.set_title("CPU 2-Thread First-Audio Latency (ms; desktop x86)"); ax.grid(True, axis="y", alpha=0.3); ax.legend(fontsize=8)
 
 plt.tight_layout()
 chart_local = report_local / "comparison_charts.png"

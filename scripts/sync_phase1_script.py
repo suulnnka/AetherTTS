@@ -22,7 +22,7 @@ LIB_PATH = REPO_ROOT / "scripts" / "aethertts_lib.py"
 
 LIB_HEADER = '''#!/usr/bin/env python3
 """
-AetherTTS Phase 1 (a5) — 纯模型与前端基础设施定义库（import 零副作用）。
+AetherTTS Phase 1 (a6) — 纯模型与前端基础设施定义库（import 零副作用）。
 
 由 scripts/sync_phase1_script.py 从 notebooks/AetherTTS_Colab_Phase1_Experiment.ipynb
 的 Cell 3 与 Cell 5 确定性生成（请勿手改本文件，修改 Notebook 后运行 sync_phase1_script.py 即可同步）。
@@ -74,7 +74,7 @@ CFG = {
 
 HEADER = '''#!/usr/bin/env python3
 """
-AetherTTS Phase 1 (a5) — 独立 Python 运行器（无需 Notebook / 无 exec-cell）。
+AetherTTS Phase 1 (a6) — 独立 Python 运行器（无需 Notebook / 无 exec-cell）。
 
 由 scripts/sync_phase1_script.py 从 notebooks/AetherTTS_Colab_Phase1_Experiment.ipynb
 确定性 1:1 生成（请勿手改本文件，修改 Notebook 后运行 sync_phase1_script.py 即可同步）。
@@ -85,12 +85,12 @@ AetherTTS Phase 1 (a5) — 独立 Python 运行器（无需 Notebook / 无 exec-
 
 用法：
     python scripts/aethertts_phase1.py --profile full_quality --dataset bznsyp --root ./aethertts_exp
-    python scripts/aethertts_phase1.py --selftest          # 验证前端零 UNK + 向量化对齐 + 长流式局部 RoPE + 声码器谐波源流式等价门禁
+    python scripts/aethertts_phase1.py --selftest          # 验证前端零 UNK + 向量化对齐 + 长流式局部 RoPE + 声码器谐波源流式 + autocast 精度门禁
     python scripts/aethertts_phase1.py --profile-steps 20  # 打印单步训练耗时分解后退出
 """
 import argparse
 
-_AP = argparse.ArgumentParser(description="AetherTTS Phase 1 (a5) standalone runner (synced from notebook).")
+_AP = argparse.ArgumentParser(description="AetherTTS Phase 1 (a6) standalone runner (synced from notebook).")
 _AP.add_argument("--root", default="./aethertts_exp", help="Local directory for datasets, checkpoints, samples, reports.")
 _AP.add_argument("--profile", default="standard_phase1", choices=["quick_smoke", "standard_phase1", "full_quality"])
 _AP.add_argument("--dataset", default="bznsyp", choices=["bznsyp", "ljspeech", "custom_bilingual"])
@@ -178,7 +178,7 @@ if SELFTEST:
 
 SELFTEST_EXIT_BLOCK = '''
 if SELFTEST:
-    print("[SelfTest] 前端音系、长流式局部 RoPE、零前瞻膨胀、谐波源因果声码器及保留主干门禁全部通过，退出 --selftest 模式。")
+    print("[SelfTest] 前端音系、长流式局部 RoPE、零前瞻膨胀、谐波源因果声码器、autocast 精度及保留主干门禁全部通过，退出 --selftest 模式。")
     import sys as _sys
     _sys.exit(0)
 '''
@@ -283,8 +283,8 @@ CELL_PLAN = [
     ("328dae20", "Cell 2: 依赖安装"),
     ("609ce47a", "Cell 3: 基础设施（Mel/F0+UV/中英音系与韵律前端）"),
     ("da9fbbaa", "Cell 5: 核心模型（ChunkLookaheadBackbone 主力 + 保留主干 + 浊音感知声学模型 + 谐波源因果声码器）"),
-    ("7f900006", "Cell 6: 训练前硬门禁（前端音系 + 长流式局部 RoPE + 零前瞻膨胀 + 声码器流式等价）"),
-    ("439d2250", "Cell 4: 数据下载与 v3 预处理"),
+    ("7f900006", "Cell 6: 训练前硬门禁（前端音系 + 长流式局部 RoPE + 零前瞻膨胀 + 声码器流式等价 + autocast 精度）"),
+    ("439d2250", "Cell 4: 数据下载与 v4 预处理"),
     ("09610ad7", "Cell 7: DataLoader"),
     ("1f7a318d", "Cell 8: 声学主干训练（默认唯一主力 E3_chunk_attn_C4_L8）"),
     ("2df0111e", "Cell 9: GTA 预测谱导出与谐波源因果声码器闭环训练"),
