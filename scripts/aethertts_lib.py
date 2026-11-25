@@ -2375,9 +2375,10 @@ class PeriodDisc(nn.Module):
 
 
 class SpecDisc(nn.Module):
-    """修复版多分辨率频谱判别器 (UnivNet / Vocos MRD 标准布局)：
-    - 将 STFT 转置为 (B, 1, time_frames, freq_bins)，使核 (3, 9) 与步长 (1, 2) 沿频率轴跨 73 个 bin 聚合谐波簇！
-    - 采用幂律幅度压缩 pow(0.3)，防止低频高能量元音掩盖 2-8 kHz 齿音与自然气声梯度。"""
+    """标准 Vocos / UnivNet 多分辨率频谱判别器 (MRD)：
+    - 将 STFT 转置为 (B, 1, time_frames, freq_bins)，核 (3, 9) 与 3 次步长 (1, 2) 沿频率轴跨 97 个 bin 聚合谐波簇；
+    - 采用 Vocos 标准 32 通道宽度（避免 128 通道在无时间下采样 2D 频谱图上导致 50x+ FLOPs 爆炸）；
+    - 采用幂律幅度压缩 pow(0.3) 与 clamp(min=1e-5)，兼顾 2-8 kHz 高频纹理梯度与 FP16 反传数值稳定。"""
 
     def __init__(self, n_fft: int, hop: int):
         super().__init__()
@@ -2385,15 +2386,16 @@ class SpecDisc(nn.Module):
         self.register_buffer("win", torch.hann_window(n_fft))
         self.convs = nn.ModuleList([
             _apply_wn(nn.Conv2d(1, 32, (3, 9), (1, 1), (1, 4))),
-            _apply_wn(nn.Conv2d(32, 64, (3, 9), (1, 2), (1, 4))),
-            _apply_wn(nn.Conv2d(64, 128, (3, 9), (1, 2), (1, 4))),
-            _apply_wn(nn.Conv2d(128, 128, (3, 3), (1, 1), (1, 1))),
-            _apply_wn(nn.Conv2d(128, 1, (3, 3), (1, 1), (1, 1))),
+            _apply_wn(nn.Conv2d(32, 32, (3, 9), (1, 2), (1, 4))),
+            _apply_wn(nn.Conv2d(32, 32, (3, 9), (1, 2), (1, 4))),
+            _apply_wn(nn.Conv2d(32, 32, (3, 9), (1, 2), (1, 4))),
+            _apply_wn(nn.Conv2d(32, 32, (3, 3), (1, 1), (1, 1))),
+            _apply_wn(nn.Conv2d(32, 1, (3, 3), (1, 1), (1, 1))),
         ])
 
     def forward(self, x: torch.Tensor):
         spec = torch.stft(x.float(), self.n_fft, self.hop, self.n_fft, self.win, return_complex=True).abs()
-        h = spec.clamp(min=1e-6).pow(0.3).transpose(1, 2).unsqueeze(1).to(x.dtype)
+        h = spec.clamp(min=1e-5).pow(0.3).transpose(1, 2).unsqueeze(1).to(x.dtype)
         fmap = []
         for i, conv in enumerate(self.convs):
             h = conv(h)
@@ -2411,18 +2413,30 @@ class LiteVocoderDiscriminator(nn.Module):
             SpecDisc(512, 128), SpecDisc(1024, 256), SpecDisc(2048, 512),
         ])
 
-    def forward(self, y_real: torch.Tensor, y_fake: torch.Tensor):
+    def forward(self, y_real: torch.Tensor, y_fake: torch.Tensor, no_grad_real: bool = False):
         ro_l, fo_l, rf_l, ff_l = [], [], [], []
         for d in self.discs:
-            ro, rf = d(y_real); fo, ff = d(y_fake)
+            if no_grad_real:
+                with torch.no_grad():
+                    ro, rf = d(y_real)
+            else:
+                ro, rf = d(y_real)
+            fo, ff = d(y_fake)
             ro_l.append(ro); fo_l.append(fo); rf_l.append(rf); ff_l.append(ff)
         return ro_l, fo_l, rf_l, ff_l
+
+
+_MR_STFT_WIN_CACHE = {}
 
 
 def multi_res_stft_loss(y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
     loss = 0.0
     for n_fft, hop in [(512, 128), (1024, 256), (2048, 512)]:
-        win = torch.hann_window(n_fft, device=y_pred.device)
+        key = (n_fft, y_pred.device)
+        win = _MR_STFT_WIN_CACHE.get(key)
+        if win is None:
+            win = torch.hann_window(n_fft, device=y_pred.device)
+            _MR_STFT_WIN_CACHE[key] = win
         sp = torch.stft(y_pred.float(), n_fft, hop, n_fft, win, return_complex=True).abs().clamp(min=1e-5)
         st = torch.stft(y_true.float(), n_fft, hop, n_fft, win, return_complex=True).abs().clamp(min=1e-5)
         loss = loss + torch.norm(st - sp, p="fro") / (torch.norm(st, p="fro") + 1e-6) + F.l1_loss(torch.log(sp), torch.log(st))

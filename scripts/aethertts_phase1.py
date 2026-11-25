@@ -2673,9 +2673,10 @@ class PeriodDisc(nn.Module):
 
 
 class SpecDisc(nn.Module):
-    """修复版多分辨率频谱判别器 (UnivNet / Vocos MRD 标准布局)：
-    - 将 STFT 转置为 (B, 1, time_frames, freq_bins)，使核 (3, 9) 与步长 (1, 2) 沿频率轴跨 73 个 bin 聚合谐波簇！
-    - 采用幂律幅度压缩 pow(0.3)，防止低频高能量元音掩盖 2-8 kHz 齿音与自然气声梯度。"""
+    """标准 Vocos / UnivNet 多分辨率频谱判别器 (MRD)：
+    - 将 STFT 转置为 (B, 1, time_frames, freq_bins)，核 (3, 9) 与 3 次步长 (1, 2) 沿频率轴跨 97 个 bin 聚合谐波簇；
+    - 采用 Vocos 标准 32 通道宽度（避免 128 通道在无时间下采样 2D 频谱图上导致 50x+ FLOPs 爆炸）；
+    - 采用幂律幅度压缩 pow(0.3) 与 clamp(min=1e-5)，兼顾 2-8 kHz 高频纹理梯度与 FP16 反传数值稳定。"""
 
     def __init__(self, n_fft: int, hop: int):
         super().__init__()
@@ -2683,15 +2684,16 @@ class SpecDisc(nn.Module):
         self.register_buffer("win", torch.hann_window(n_fft))
         self.convs = nn.ModuleList([
             _apply_wn(nn.Conv2d(1, 32, (3, 9), (1, 1), (1, 4))),
-            _apply_wn(nn.Conv2d(32, 64, (3, 9), (1, 2), (1, 4))),
-            _apply_wn(nn.Conv2d(64, 128, (3, 9), (1, 2), (1, 4))),
-            _apply_wn(nn.Conv2d(128, 128, (3, 3), (1, 1), (1, 1))),
-            _apply_wn(nn.Conv2d(128, 1, (3, 3), (1, 1), (1, 1))),
+            _apply_wn(nn.Conv2d(32, 32, (3, 9), (1, 2), (1, 4))),
+            _apply_wn(nn.Conv2d(32, 32, (3, 9), (1, 2), (1, 4))),
+            _apply_wn(nn.Conv2d(32, 32, (3, 9), (1, 2), (1, 4))),
+            _apply_wn(nn.Conv2d(32, 32, (3, 3), (1, 1), (1, 1))),
+            _apply_wn(nn.Conv2d(32, 1, (3, 3), (1, 1), (1, 1))),
         ])
 
     def forward(self, x: torch.Tensor):
         spec = torch.stft(x.float(), self.n_fft, self.hop, self.n_fft, self.win, return_complex=True).abs()
-        h = spec.clamp(min=1e-6).pow(0.3).transpose(1, 2).unsqueeze(1).to(x.dtype)
+        h = spec.clamp(min=1e-5).pow(0.3).transpose(1, 2).unsqueeze(1).to(x.dtype)
         fmap = []
         for i, conv in enumerate(self.convs):
             h = conv(h)
@@ -2709,18 +2711,30 @@ class LiteVocoderDiscriminator(nn.Module):
             SpecDisc(512, 128), SpecDisc(1024, 256), SpecDisc(2048, 512),
         ])
 
-    def forward(self, y_real: torch.Tensor, y_fake: torch.Tensor):
+    def forward(self, y_real: torch.Tensor, y_fake: torch.Tensor, no_grad_real: bool = False):
         ro_l, fo_l, rf_l, ff_l = [], [], [], []
         for d in self.discs:
-            ro, rf = d(y_real); fo, ff = d(y_fake)
+            if no_grad_real:
+                with torch.no_grad():
+                    ro, rf = d(y_real)
+            else:
+                ro, rf = d(y_real)
+            fo, ff = d(y_fake)
             ro_l.append(ro); fo_l.append(fo); rf_l.append(rf); ff_l.append(ff)
         return ro_l, fo_l, rf_l, ff_l
+
+
+_MR_STFT_WIN_CACHE = {}
 
 
 def multi_res_stft_loss(y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
     loss = 0.0
     for n_fft, hop in [(512, 128), (1024, 256), (2048, 512)]:
-        win = torch.hann_window(n_fft, device=y_pred.device)
+        key = (n_fft, y_pred.device)
+        win = _MR_STFT_WIN_CACHE.get(key)
+        if win is None:
+            win = torch.hann_window(n_fft, device=y_pred.device)
+            _MR_STFT_WIN_CACHE[key] = win
         sp = torch.stft(y_pred.float(), n_fft, hop, n_fft, win, return_complex=True).abs().clamp(min=1e-5)
         st = torch.stft(y_true.float(), n_fft, hop, n_fft, win, return_complex=True).abs().clamp(min=1e-5)
         loss = loss + torch.norm(st - sp, p="fro") / (torch.norm(st, p="fro") + 1e-6) + F.l1_loss(torch.log(sp), torch.log(st))
@@ -3669,7 +3683,7 @@ class VocoderDataset(Dataset):
     """零 CPU-STFT 开销、逐样本对齐的声码器数据集：
     直接从缓存切片严格中心对齐的 (mel_seg, f0_seg, uv_seg, wav_seg)，并在 Stage 2 按 gta_prob 混入声学模型预测的 GTA Mel！"""
 
-    def __init__(self, entries, seg_frames: int = 96, gta_dir: Path = None, gta_prob: float = 0.0):
+    def __init__(self, entries, seg_frames: int = 64, gta_dir: Path = None, gta_prob: float = 0.0):
         self.entries = entries
         self.seg_frames = seg_frames
         self.hop = CFG["hop_length"]
@@ -4255,19 +4269,33 @@ def train_or_load_causal_vocoder(primary_acoustic_model: AetherAcousticModel = N
         save_progress_status("vocoder", {"status": "done_cached", "step": total_steps, "total_steps": total_steps})
         return voc.eval()
 
+    # Ampere+/4090 用 BF16，T4/V100 等非 BF16 GPU 用 FP16 + 独立双 GradScaler 激活 Tensor Core（iSTFT/基频头/振荡器/STFT 损失内部保持 FP32/FP64）
+    voc_amp_enabled = (DEVICE.type == "cuda")
+    voc_amp_dtype = torch.bfloat16 if (voc_amp_enabled and torch.cuda.is_bf16_supported()) else torch.float16
+    use_voc_fp16 = (voc_amp_enabled and voc_amp_dtype == torch.float16)
+    scaler_g = torch.amp.GradScaler("cuda", enabled=use_voc_fp16)
+    scaler_d = torch.amp.GradScaler("cuda", enabled=use_voc_fp16)
+
     step = 0
     if latest_storage.exists():
         print(f"[Mid-Run Resume] 检测到未完结声码器断点，正在恢复: {latest_storage}")
         ckpt = torch.load(latest_storage, map_location=DEVICE, weights_only=False)
         voc.load_state_dict(ckpt["voc"])
         opt_g.load_state_dict(ckpt["opt_g"])
-        disc.load_state_dict(ckpt["disc"])
-        opt_d.load_state_dict(ckpt["opt_d"])
         step = int(ckpt["step"])
         if "sched_g" in ckpt:
             sched_g.load_state_dict(ckpt["sched_g"])
-        if "sched_d" in ckpt:
-            sched_d.load_state_dict(ckpt["sched_d"])
+        if "scaler_g" in ckpt:
+            scaler_g.load_state_dict(ckpt["scaler_g"])
+        try:
+            disc.load_state_dict(ckpt["disc"])
+            opt_d.load_state_dict(ckpt["opt_d"])
+            if "sched_d" in ckpt:
+                sched_d.load_state_dict(ckpt["sched_d"])
+            if "scaler_d" in ckpt:
+                scaler_d.load_state_dict(ckpt["scaler_d"])
+        except RuntimeError as _e_disc:
+            print(f"  [Warn] 判别器结构已升级为轻量化 Vocos MRD，跳过旧 disc 权重并重新初始化判别器（生成器与步数完整保留）: {_e_disc}")
         print(f"  -> 从 step={step}/{total_steps} 无缝继续训练！")
 
     gta_dir = None
@@ -4275,21 +4303,22 @@ def train_or_load_causal_vocoder(primary_acoustic_model: AetherAcousticModel = N
     if primary_acoustic_model is not None and gta_prob > 0.0 and s2_steps > 0:
         gta_dir = build_gta_mel_cache(primary_acoustic_model, DATASET_META["train"], VOC_LOCAL_DIR / "gta_mels")
 
+    voc_seg_frames = 64  # 16,384 采样点 (~0.68s)，与官方 Vocos 24kHz 一致，兼顾低频覆盖与 T4/4090 训练吞吐
     voc_bs = 24 if GPU_MEM_GB >= 22 else min(16, CFG["batch_size"])
     drop_l = len(DATASET_META["train"]) >= voc_bs
     voc_loader_s1 = DataLoader(
-        VocoderDataset(DATASET_META["train"], seg_frames=96, gta_dir=None, gta_prob=0.0),
+        VocoderDataset(DATASET_META["train"], seg_frames=voc_seg_frames, gta_dir=None, gta_prob=0.0),
         batch_size=voc_bs, shuffle=True, num_workers=CFG["num_workers"],
         pin_memory=torch.cuda.is_available(), drop_last=drop_l,
     )
     voc_loader_s2 = DataLoader(
-        VocoderDataset(DATASET_META["train"], seg_frames=96, gta_dir=gta_dir, gta_prob=gta_prob),
+        VocoderDataset(DATASET_META["train"], seg_frames=voc_seg_frames, gta_dir=gta_dir, gta_prob=gta_prob),
         batch_size=voc_bs, shuffle=True, num_workers=CFG["num_workers"],
         pin_memory=torch.cuda.is_available(), drop_last=drop_l,
     )
     mel_gpu = VocosCompatibleMel(CFG["sample_rate"], CFG["n_fft"], CFG["hop_length"], CFG["n_mels"]).to(DEVICE)
-    # Ampere+/4090 开启 BF16 混合精度加速声码器与判别器卷积（iSTFT/振荡器/STFT 损失内部保持 FP32/FP64）
-    voc_bf16 = (DEVICE.type == "cuda" and torch.cuda.is_bf16_supported())
+    amp_tag = ("bf16" if voc_amp_dtype == torch.bfloat16 else "fp16+GradScaler") if voc_amp_enabled else "fp32"
+    print(f"[Vocoder Config] bs={voc_bs} | seg_frames={voc_seg_frames} ({voc_seg_frames * CFG['hop_length']} samples) | amp={amp_tag} | Stage1={s1_steps}, Stage2={s2_steps}", flush=True)
 
     t0 = time.time()
     last_backup_t = time.time()
@@ -4302,6 +4331,7 @@ def train_or_load_causal_vocoder(primary_acoustic_model: AetherAcousticModel = N
             "voc": voc.state_dict(), "disc": disc.state_dict(),
             "opt_g": opt_g.state_dict(), "opt_d": opt_d.state_dict(),
             "sched_g": sched_g.state_dict(), "sched_d": sched_d.state_dict(),
+            "scaler_g": scaler_g.state_dict(), "scaler_d": scaler_d.state_dict(),
         }
         atomic_torch_save(payload, latest_local)
         sync_file_to_storage(latest_local, latest_storage)
@@ -4337,19 +4367,21 @@ def train_or_load_causal_vocoder(primary_acoustic_model: AetherAcousticModel = N
                 wav_gt = wav_gt.to(DEVICE, non_blocking=True)
                 in_gan = step >= s1_steps
 
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=voc_bf16):
+                with torch.amp.autocast("cuda", dtype=voc_amp_dtype, enabled=voc_amp_enabled):
                     wav_pred, vf0_pred, vuv_logit = voc.forward_with_aux(mel_seg)
                 L_min = min(wav_pred.shape[-1], wav_gt.shape[-1])
                 wav_pred, wav_gt = wav_pred[:, :L_min], wav_gt[:, :L_min]
 
                 if in_gan:
                     opt_d.zero_grad(set_to_none=True)
-                    with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=voc_bf16):
+                    with torch.amp.autocast("cuda", dtype=voc_amp_dtype, enabled=voc_amp_enabled):
                         ro, fo, _, _ = disc(wav_gt, wav_pred.detach())
                         loss_d = sum(torch.mean((r.float() - 1.0) ** 2) + torch.mean(f.float() ** 2) for r, f in zip(ro, fo))
-                    loss_d.backward()
+                    scaler_d.scale(loss_d).backward()
+                    scaler_d.unscale_(opt_d)
                     torch.nn.utils.clip_grad_norm_(disc.parameters(), 1.0)
-                    opt_d.step()
+                    scaler_d.step(opt_d)
+                    scaler_d.update()
                     sched_d.step()
 
                 opt_g.zero_grad(set_to_none=True)
@@ -4362,22 +4394,32 @@ def train_or_load_causal_vocoder(primary_acoustic_model: AetherAcousticModel = N
                 loss_pitch_osc = loss_vf0 + 0.5 * loss_vuv
 
                 if in_gan:
-                    with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=voc_bf16):
-                        _, fo, rfmaps, ffmaps = disc(wav_gt, wav_pred)
-                        loss_adv = sum(torch.mean((f.float() - 1.0) ** 2) for f in fo)
-                        loss_fm = sum(
-                            F.l1_loss(ff.float(), rf.detach().float())
-                            for rf_l, ff_l in zip(rfmaps, ffmaps)
-                            for rf, ff in zip(rf_l[:-1], ff_l[:-1])
-                        )
-                    # Stage 2 将 Mel L1 权重适度下调至 15.0，防止频谱均值损失压死转置 SpecDisc 与 MPD 的高频纹理梯度
-                    loss_g = 2.0 * loss_stft + 15.0 * loss_mel + loss_adv + 2.0 * loss_fm + 1.0 * loss_pitch_osc
+                    # G-step 临时冻结判别器参数 + real 分支关梯度，跳过无用的判别器权重梯度 dw 与 real 激活图分配（数学 100% 等价）
+                    for _p in disc.parameters():
+                        _p.requires_grad_(False)
+                    try:
+                        with torch.amp.autocast("cuda", dtype=voc_amp_dtype, enabled=voc_amp_enabled):
+                            _, fo, rfmaps, ffmaps = disc(wav_gt, wav_pred, no_grad_real=True)
+                            loss_adv = sum(torch.mean((f.float() - 1.0) ** 2) for f in fo)
+                            loss_fm = sum(
+                                F.l1_loss(ff.float(), rf.float())
+                                for rf_l, ff_l in zip(rfmaps, ffmaps)
+                                for rf, ff in zip(rf_l[:-1], ff_l[:-1])
+                            )
+                        # Stage 2 将 Mel L1 权重适度下调至 15.0，防止频谱均值损失压死转置 SpecDisc 与 MPD 的高频纹理梯度
+                        loss_g = 2.0 * loss_stft + 15.0 * loss_mel + loss_adv + 2.0 * loss_fm + 1.0 * loss_pitch_osc
+                        scaler_g.scale(loss_g).backward()
+                    finally:
+                        for _p in disc.parameters():
+                            _p.requires_grad_(True)
                 else:
                     loss_g = 15.0 * (loss_stft + loss_mel) + 2.0 * loss_pitch_osc
+                    scaler_g.scale(loss_g).backward()
 
-                loss_g.backward()
+                scaler_g.unscale_(opt_g)
                 torch.nn.utils.clip_grad_norm_(voc.parameters(), 1.0)
-                opt_g.step()
+                scaler_g.step(opt_g)
+                scaler_g.update()
                 sched_g.step()
 
                 step += 1
