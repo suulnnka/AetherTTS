@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AetherTTS Phase 1 (a6) — 纯模型与前端基础设施定义库（import 零副作用）。
+AetherTTS Phase 1 (a7) — 纯模型与前端基础设施定义库（import 零副作用）。
 
 由 scripts/sync_phase1_script.py 从 notebooks/AetherTTS_Colab_Phase1_Experiment.ipynb
 的 Cell 3 与 Cell 5 确定性生成（请勿手改本文件，修改 Notebook 后运行 sync_phase1_script.py 即可同步）。
@@ -1668,36 +1668,29 @@ def build_beta_binomial_log_prior(text_lens: torch.Tensor, mel_lens: torch.Tenso
 
 
 class AlignmentEncoder(nn.Module):
-    """带有效帧掩码与轻量正弦位置编码的单调对齐编码器（消除批右填充污染与叠词同音素混淆）。"""
+    """带有效帧掩码与强对角先验约束的单调对齐编码器（a7 防 Z 字型坍缩版）：
+    - 去除易被句首/句尾元音偷懒锚定的绝对位置编码 pos_pe（key_proj 首层 Conv1d(k=3) 已提供局部上下文以区分叠词）；
+    - 将余弦相似度摆幅收紧为 scale=5.0（最大极差 10.0），配合 prior_weight=1.5 × Beta-Binomial 先验，
+      在保留局部 ±2~4 音素灵活停顿空间（Δt=2 惩罚仅 0.44）的同时，从数学上杜绝跨句 Z 字型坍缩。"""
 
-    def __init__(self, n_mels: int = 100, d_text: int = 256, d_attn: int = 80, scale: float = 10.0):
+    def __init__(self, n_mels: int = 100, d_text: int = 256, d_attn: int = 80, scale: float = 5.0, prior_weight: float = 1.5):
         super().__init__()
         self.d_text = d_text
         self.key_proj = nn.Sequential(nn.Conv1d(d_text, d_text, 3, padding=1), nn.ReLU(), nn.Conv1d(d_text, d_attn, 1))
         self.query_proj = nn.Sequential(nn.Conv1d(n_mels, n_mels * 2, 3, padding=1), nn.ReLU(), nn.Conv1d(n_mels * 2, d_attn, 1))
         self.scale = scale
-
-    @staticmethod
-    def _sinusoidal_pos(length: int, dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        pos = torch.arange(length, device=device, dtype=torch.float32)[:, None]
-        div = torch.exp(torch.arange(0, dim, 2, device=device, dtype=torch.float32) * (-math.log(1000.0) / dim))
-        pe = torch.zeros(length, dim, device=device, dtype=torch.float32)
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div)
-        return pe.to(dtype)
+        self.prior_weight = prior_weight
 
     def forward(self, mel: torch.Tensor, text_emb: torch.Tensor, text_mask: torch.Tensor, attn_log_prior: torch.Tensor = None, mel_mask: torch.Tensor = None):
-        # 对齐 logits 直接决定 Viterbi 硬时长，整段强制 FP32：autocast 下 .float() 挡不住 bmm / conv 被降到 bf16
+        # 对齐 logits 直接决定 Viterbi 硬时长，整段强制 FP32：autocast 下 .float() 挡不住 bmm / conv 被降精度
         with torch.autocast(mel.device.type, enabled=False):
-            T_max = text_emb.shape[1]
-            pos_pe = self._sinusoidal_pos(T_max, self.d_text, text_emb.device, torch.float32)[None, :, :]
-            t_in = (text_emb.float() + 0.15 * pos_pe) * text_mask[:, :, None]
+            t_in = text_emb.float() * text_mask[:, :, None].to(torch.float32)
             m_in = mel.float() * mel_mask[:, None, :].to(torch.float32) if mel_mask is not None else mel.float()
             keys = F.normalize(self.key_proj(t_in.transpose(1, 2)), dim=1)
             queries = F.normalize(self.query_proj(m_in), dim=1)
             logits = torch.bmm(queries.transpose(1, 2), keys) * self.scale
             if attn_log_prior is not None:
-                logits = logits + attn_log_prior.float()
+                logits = logits + self.prior_weight * attn_log_prior.float()
             logits = logits.masked_fill(~text_mask[:, None, :], -1e4)
             return F.log_softmax(logits, dim=-1), torch.softmax(logits, dim=-1)
 
@@ -1979,20 +1972,29 @@ class AetherAcousticModel(nn.Module):
         loss_align = forward_sum_loss(attn_logprob, text_lens, mel_lens)
         attn_hard, dur_gt = viterbi_monotonic_alignment(attn_logprob, text_lens, mel_lens)
 
-        # 平滑软硬对齐退火（0.15 -> 0.30 线性过渡至纯 STE 硬对齐，消除硬跳变震荡）
+        with torch.no_grad():
+            dur1_ratio = (((dur_gt == 1) & text_mask).float().sum() / text_mask.sum().clamp(min=1))
+            dur_max = (dur_gt * text_mask).max().float()
+
+        # 延迟软硬对齐退火（0.30 -> 0.50 线性过渡至纯 STE 硬对齐）：先让 Forward-Sum 充分锁定对角线，避免早期硬路径锁死坍缩
         attn_ste = attn_hard + (attn_soft - attn_soft.detach())
-        if (not self.training) or step_ratio >= 0.30:
+        if (not self.training) or step_ratio >= 0.50:
+            hard_alpha = 1.0
             attn_use = attn_ste
-        elif step_ratio <= 0.15:
+        elif step_ratio <= 0.30:
+            hard_alpha = 0.0
             attn_use = attn_soft
         else:
-            alpha = (step_ratio - 0.15) / 0.15
-            attn_use = (1.0 - alpha) * attn_soft + alpha * attn_ste
+            hard_alpha = (step_ratio - 0.30) / 0.20
+            attn_use = (1.0 - hard_alpha) * attn_soft + hard_alpha * attn_ste
 
-        h_frame = (torch.bmm(attn_use.to(h_txt.dtype), h_txt) + self._frame_phase_embed(dur_gt, F_max, h_txt.dtype)) * mel_mask[:, :, None].to(h_txt.dtype)
+        # 软对齐热身期温和衰减 dur_gt 相位特征，迫使解码器依赖真实音素内容对齐而非靠长段相位偷懒糊谱
+        phase_w = 1.0 if (not self.training) else (0.2 + 0.8 * hard_alpha)
+        h_frame = (torch.bmm(attn_use.to(h_txt.dtype), h_txt) + phase_w * self._frame_phase_embed(dur_gt, F_max, h_txt.dtype)) * mel_mask[:, :, None].to(h_txt.dtype)
 
         loss_bin = -(attn_hard * attn_logprob * mel_mask[:, :, None]).sum() / mel_mask.sum().clamp(min=1)
-        bin_weight = 0.0 if step_ratio < 0.15 else min(1.0, (step_ratio - 0.15) / 0.25)
+        # 二值化退火推迟至 0.30->0.60 且带防坍缩动态熔断：若 dur==1 > 35%，立即关停 loss_bin 绝不强化错误硬路径
+        bin_weight = 0.0 if (step_ratio < 0.30 or dur1_ratio.item() > 0.35) else min(1.0, (step_ratio - 0.30) / 0.30)
 
         # 对 dur_predictor 输入做 0.1x 梯度缩放（防止早期离散 Viterbi 时长噪声冲刷文本主干）
         h_dur_in = h_txt.detach() + 0.1 * (h_txt - h_txt.detach())
@@ -2017,8 +2019,8 @@ class AetherAcousticModel(nn.Module):
         loss_uv = (F.binary_cross_entropy_with_logits(uv_logit.float(), uv_gt.float(), reduction="none") * mel_mask).sum() / mel_mask.sum().clamp(min=1)
         loss_energy = (F.l1_loss(energy_pred, energy_gt, reduction="none") * mel_mask).sum() / mel_mask.sum().clamp(min=1)
 
-        # 平滑递增预测特征 Scheduled Sampling（0.20 -> 0.70 线性升至 60% 概率；验证期 100% 用预测特征）
-        p_sched = 1.0 if (not self.training) else (0.0 if step_ratio < 0.20 else min(0.60, (step_ratio - 0.20) / 0.50 * 0.60))
+        # 预测特征 Scheduled Sampling 推迟至对齐稳定后（0.35 -> 0.80 线性升至 50%；验证期 100% 用预测特征）
+        p_sched = 1.0 if (not self.training) else (0.0 if step_ratio < 0.35 else min(0.50, (step_ratio - 0.35) / 0.45 * 0.50))
         use_pred = (not self.training) or (p_sched > 0.0 and torch.rand(1).item() < p_sched)
         f0_in = f0_pred.detach() if use_pred else f0_gt
         uv_in = uv_prob.detach() if use_pred else uv_gt.to(h_frame.dtype)
@@ -2028,6 +2030,7 @@ class AetherAcousticModel(nn.Module):
         loss_mel = (F.l1_loss(mel_pred, mel_gt, reduction="none") * mel_mask[:, None, :]).sum() / (mel_mask.sum().clamp(min=1) * self.n_mels)
         loss_struct = mel_structure_loss(mel_pred, mel_gt, mel_mask)
 
+        # Forward-Sum 对齐主权重提至 1.0，温和二值化权重降至 0.15（杜绝 loss_bin 盖过 CTC 锁死 Z 字坍缩）
         total_loss = (
             loss_mel
             + 0.35 * loss_struct
@@ -2035,8 +2038,8 @@ class AetherAcousticModel(nn.Module):
             + 0.35 * loss_f0
             + 0.25 * loss_uv
             + 0.25 * loss_energy
-            + 0.50 * loss_align
-            + 0.50 * bin_weight * loss_bin
+            + 1.00 * loss_align
+            + 0.15 * bin_weight * loss_bin
         )
         bos_ratio = (dur_gt[:, 0].float() / mel_lens.float().clamp(min=1)).mean().detach()
         return {
@@ -2045,6 +2048,7 @@ class AetherAcousticModel(nn.Module):
             "energy": loss_energy.detach(), "align": loss_align.detach(),
             "bin": loss_bin.detach(), "bos_ratio": bos_ratio,
             "dur_mae": dur_mae, "dur_rel": dur_rel, "len_ratio": len_ratio,
+            "dur1_ratio": dur1_ratio, "dur_max": dur_max,
         }
 
     @torch.no_grad()
@@ -2222,7 +2226,7 @@ class CausalHarmonicSource(nn.Module):
         self.pitch_norm = nn.LayerNorm(hid)
         self.pitch_out = nn.Linear(hid, 2)
         with torch.no_grad():
-            self.pitch_out.bias[0] = math.log(210.0)
+            self.pitch_out.bias[0] = math.log(220.0)
             self.pitch_out.bias[1] = 1.0
         feat_dim = n_harmonics * 2 + 2
         self.in_proj = nn.Linear(feat_dim, dim)
@@ -2232,29 +2236,36 @@ class CausalHarmonicSource(nn.Module):
         self.register_buffer("harm_orders", torch.arange(1, n_harmonics + 1, dtype=torch.float64)[None, None, :], persistent=False)
 
     def _oscillate(self, log_f0_pred: torch.Tensor, uv_logit: torch.Tensor, out_dtype: torch.dtype, phi_init: torch.Tensor = None):
-        uv_prob = torch.sigmoid(uv_logit)
-        f0_hz = torch.exp(log_f0_pred.float().clamp(min=math.log(55.0), max=math.log(620.0)))
-        delta_phi = f0_hz.double() * (float(self.hop_length) / float(self.sample_rate))
-        csum = torch.cumsum(delta_phi, dim=1)
-        if phi_init is not None:
-            csum = phi_init + csum
-        phi = csum.fmod(1.0)
-        new_phi = phi[:, -1:] if phi.shape[1] > 0 else (phi_init if phi_init is not None else torch.zeros(log_f0_pred.shape[0], 1, device=log_f0_pred.device, dtype=torch.float64))
-        angles = (2.0 * math.pi * phi.unsqueeze(-1) * self.harm_orders).to(torch.float32)
-        harms = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1) * uv_prob.float().unsqueeze(-1)
-        f0_norm = ((log_f0_pred.float() - 5.3) / 0.5).unsqueeze(-1)
-        w = self.in_proj.weight
-        p_dtype = w.dtype if isinstance(w, torch.Tensor) else torch.float32
-        feats = torch.cat([harms, f0_norm, uv_prob.float().unsqueeze(-1)], dim=-1).to(p_dtype)
+        # ★ a7 关键修复：相位积分与 12 阶谐波正余弦整段置于 no_grad() 中彻底截断对 log_f0_pred / uv_logit 的反向传播！
+        # 否则 GAN/Mel 梯度经 sin(2π·12·cumsum(exp(log_f0))) 放大 ~10^4 倍反冲 pitch_out，会把女声基频打偏整整一个八度产生电音分层。
+        # in_proj / head_proj 仍在梯度图内，正常学习如何融合精准基频谐波。
+        with torch.no_grad():
+            f0_in = log_f0_pred.detach().float()
+            uv_prob = torch.sigmoid(uv_logit.detach().float())
+            f0_hz = torch.exp(f0_in.clamp(min=math.log(55.0), max=math.log(620.0)))
+            delta_phi = f0_hz.double() * (float(self.hop_length) / float(self.sample_rate))
+            csum = torch.cumsum(delta_phi, dim=1)
+            if phi_init is not None:
+                csum = phi_init + csum
+            phi = csum.fmod(1.0)
+            new_phi = phi[:, -1:] if phi.shape[1] > 0 else (phi_init if phi_init is not None else torch.zeros(f0_in.shape[0], 1, device=f0_in.device, dtype=torch.float64))
+            angles = (2.0 * math.pi * phi.unsqueeze(-1) * self.harm_orders).to(torch.float32)
+            harms = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1) * uv_prob.unsqueeze(-1)
+            f0_norm = ((f0_in - 5.3) / 0.5).unsqueeze(-1)
+            w = self.in_proj.weight
+            p_dtype = w.dtype if isinstance(w, torch.Tensor) else torch.float32
+            feats = torch.cat([harms, f0_norm, uv_prob.unsqueeze(-1)], dim=-1).to(p_dtype)
         return self.in_proj(feats).to(out_dtype), self.head_proj(feats).to(out_dtype), new_phi
 
-    def forward(self, h: torch.Tensor):
+    def forward(self, h: torch.Tensor, f0_override: torch.Tensor = None, uv_override: torch.Tensor = None):
         p_hid = F.silu(self.pitch_norm(self.pitch_conv(h.transpose(1, 2)).transpose(1, 2)))
-        # 基频头强制 FP32：bf16 的 log_f0 量化一步 ≈ 54 音分，稳态元音期间参考谐波相位会随时间漂移
+        # 基频头强制 FP32：bf16/fp16 的 log_f0 量化会导致稳态元音期间参考谐波相位漂移
         with torch.autocast(h.device.type, enabled=False):
             p_out = self.pitch_out(p_hid.float())
         log_f0_pred, uv_logit = p_out[..., 0], p_out[..., 1]
-        harm_in, harm_head, _ = self._oscillate(log_f0_pred, uv_logit, h.dtype, phi_init=None)
+        osc_f0 = f0_override if f0_override is not None else log_f0_pred
+        osc_uv = (uv_override.float() * 10.0 - 5.0) if uv_override is not None else uv_logit
+        harm_in, harm_head, _ = self._oscillate(osc_f0, osc_uv, h.dtype, phi_init=None)
         return harm_in, harm_head, log_f0_pred, uv_logit
 
     def init_state(self, batch_size: int, device, dtype):
@@ -2301,10 +2312,10 @@ class CausalVocosLite(nn.Module):
     def _norm_input(self, mel: torch.Tensor) -> torch.Tensor:
         return (mel - self.mel_mean.to(mel.dtype)) / self.mel_std.to(mel.dtype)
 
-    def forward_with_aux(self, mel: torch.Tensor):
+    def forward_with_aux(self, mel: torch.Tensor, f0_override: torch.Tensor = None, uv_override: torch.Tensor = None):
         x = self._norm_input(mel)
         h = self.norm_in(self.embed(x).transpose(1, 2))
-        harm_in, harm_head, log_f0_pred, uv_logit = self.harm_source(h)
+        harm_in, harm_head, log_f0_pred, uv_logit = self.harm_source(h, f0_override=f0_override, uv_override=uv_override)
         h = h + harm_in
         for blk in self.blocks:
             h = blk(h)
@@ -2395,7 +2406,7 @@ class SpecDisc(nn.Module):
 
     def forward(self, x: torch.Tensor):
         spec = torch.stft(x.float(), self.n_fft, self.hop, self.n_fft, self.win, return_complex=True).abs()
-        h = spec.clamp(min=1e-5).pow(0.3).transpose(1, 2).unsqueeze(1).to(x.dtype)
+        h = spec.clamp(min=1e-4).pow(0.3).transpose(1, 2).unsqueeze(1).to(x.dtype)
         fmap = []
         for i, conv in enumerate(self.convs):
             h = conv(h)
