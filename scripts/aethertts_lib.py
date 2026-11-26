@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AetherTTS Phase 1 (a7) — 纯模型与前端基础设施定义库（import 零副作用）。
+AetherTTS Phase 1 (a8) — 纯模型与前端基础设施定义库（import 零副作用）。
 
 由 scripts/sync_phase1_script.py 从 notebooks/AetherTTS_Colab_Phase1_Experiment.ipynb
 的 Cell 3 与 Cell 5 确定性生成（请勿手改本文件，修改 Notebook 后运行 sync_phase1_script.py 即可同步）。
@@ -1668,16 +1668,28 @@ def build_beta_binomial_log_prior(text_lens: torch.Tensor, mel_lens: torch.Tenso
 
 
 class AlignmentEncoder(nn.Module):
-    """带有效帧掩码与强对角先验约束的单调对齐编码器（a7 防 Z 字型坍缩版）：
-    - 去除易被句首/句尾元音偷懒锚定的绝对位置编码 pos_pe（key_proj 首层 Conv1d(k=3) 已提供局部上下文以区分叠词）；
-    - 将余弦相似度摆幅收紧为 scale=5.0（最大极差 10.0），配合 prior_weight=1.5 × Beta-Binomial 先验，
-      在保留局部 ±2~4 音素灵活停顿空间（Δt=2 惩罚仅 0.44）的同时，从数学上杜绝跨句 Z 字型坍缩。"""
+    """RAD-TTS / FastPitch / NeMo 规范单调对齐编码器（a8 根治稀疏锚点坍缩版）：
+    - 去除绝对 pos_pe，升级为 3 层 query_proj + 2 层宽通道 key_proj 增强局部音素/频谱分辨力；
+    - 先在有效 text_mask 上仅对内容相似度（单位球余弦 × scale=10.0，对 AdamW weight_decay=1e-2 尺度不变）做 F.log_softmax，
+      再在 log_softmax 外部叠加 Beta-Binomial 对数先验：attn_logprob = log_softmax(content) + prior_weight * attn_log_prior；
+    - 配合 forward_sum_loss 中 blank_logprob=-1.0 + 二次 log_softmax，保证所有音素分数 <= log_prior < blank，
+      从能量地形上彻底消除“少数锚点吞帧 + 其余音素 1 帧”的 CTC 捷径吸引子。"""
 
-    def __init__(self, n_mels: int = 100, d_text: int = 256, d_attn: int = 80, scale: float = 5.0, prior_weight: float = 1.5):
+    def __init__(self, n_mels: int = 100, d_text: int = 256, d_attn: int = 80, scale: float = 10.0, prior_weight: float = 1.0):
         super().__init__()
         self.d_text = d_text
-        self.key_proj = nn.Sequential(nn.Conv1d(d_text, d_text, 3, padding=1), nn.ReLU(), nn.Conv1d(d_text, d_attn, 1))
-        self.query_proj = nn.Sequential(nn.Conv1d(n_mels, n_mels * 2, 3, padding=1), nn.ReLU(), nn.Conv1d(n_mels * 2, d_attn, 1))
+        self.key_proj = nn.Sequential(
+            nn.Conv1d(d_text, d_text * 2, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(d_text * 2, d_attn, 1),
+        )
+        self.query_proj = nn.Sequential(
+            nn.Conv1d(n_mels, n_mels * 2, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(n_mels * 2, n_mels, 1),
+            nn.ReLU(),
+            nn.Conv1d(n_mels, d_attn, 1),
+        )
         self.scale = scale
         self.prior_weight = prior_weight
 
@@ -1688,17 +1700,29 @@ class AlignmentEncoder(nn.Module):
             m_in = mel.float() * mel_mask[:, None, :].to(torch.float32) if mel_mask is not None else mel.float()
             keys = F.normalize(self.key_proj(t_in.transpose(1, 2)), dim=1)
             queries = F.normalize(self.query_proj(m_in), dim=1)
-            logits = torch.bmm(queries.transpose(1, 2), keys) * self.scale
+            content_logits = torch.bmm(queries.transpose(1, 2), keys) * self.scale
+            content_logits = content_logits.masked_fill(~text_mask[:, None, :], -1e4)
+            # 1) 仅对内容相似度在有效 token 上做 log_softmax
+            attn_logprob = F.log_softmax(content_logits, dim=-1)
+            # 2) 在 log_softmax 外部叠加 Beta-Binomial 对数先验（避免先验惩罚在 softmax 分母中被锚点自消）
             if attn_log_prior is not None:
-                logits = logits + self.prior_weight * attn_log_prior.float()
-            logits = logits.masked_fill(~text_mask[:, None, :], -1e4)
-            return F.log_softmax(logits, dim=-1), torch.softmax(logits, dim=-1)
+                attn_logprob = attn_logprob + self.prior_weight * attn_log_prior.float()
+            attn_logprob = attn_logprob.masked_fill(~text_mask[:, None, :], -1e4)
+            return attn_logprob, torch.softmax(attn_logprob, dim=-1)
 
-def forward_sum_loss(attn_logprob: torch.Tensor, text_lens: torch.Tensor, mel_lens: torch.Tensor) -> torch.Tensor:
-    B, F_max, _ = attn_logprob.shape
-    blank = torch.full((B, F_max, 1), -1e4, device=attn_logprob.device, dtype=torch.float32)
-    log_probs = torch.cat([blank, attn_logprob.float()], dim=-1).transpose(0, 1)
-    targets = torch.cat([torch.arange(1, tl + 1, device=attn_logprob.device, dtype=torch.long) for tl in text_lens])
+
+def forward_sum_loss(attn_logprob: torch.Tensor, text_lens: torch.Tensor, mel_lens: torch.Tensor, blank_logprob: float = -1.0) -> torch.Tensor:
+    """RAD-TTS / FastPitch / NeMo 规范 Forward-Sum (CTC) 对齐损失：
+    在 attn_logprob (= log_softmax(content) + log_prior) 左侧拼接 blank_logprob=-1.0，
+    屏蔽超出 text_lens 的填充列后再做二次 log_softmax，彻底消除禁用 blank (-1e4) 时的稀疏锚点坍缩捷径。"""
+    B, F_max, T_max = attn_logprob.shape
+    device = attn_logprob.device
+    blank = torch.full((B, F_max, 1), float(blank_logprob), device=device, dtype=torch.float32)
+    lp = torch.cat([blank, attn_logprob.float()], dim=-1)
+    key_inds = torch.arange(T_max + 1, device=device, dtype=torch.long)
+    lp = lp.masked_fill(key_inds.view(1, 1, -1) > text_lens.view(B, 1, 1), -1e9)
+    log_probs = F.log_softmax(lp, dim=-1).transpose(0, 1)
+    targets = torch.cat([torch.arange(1, int(tl.item()) + 1, device=device, dtype=torch.long) for tl in text_lens])
     return F.ctc_loss(log_probs, targets, mel_lens, text_lens, blank=0, zero_infinity=True)
 
 
@@ -1970,7 +1994,8 @@ class AetherAcousticModel(nn.Module):
         attn_log_prior = build_beta_binomial_log_prior(text_lens, mel_lens, T_max, F_max, scaling=1.0)
         attn_logprob, attn_soft = self.aligner(mel_gt, x_emb, text_mask, attn_log_prior=attn_log_prior, mel_mask=mel_mask)
         loss_align = forward_sum_loss(attn_logprob, text_lens, mel_lens)
-        attn_hard, dur_gt = viterbi_monotonic_alignment(attn_logprob, text_lens, mel_lens)
+        attn_logprob_norm = F.log_softmax(attn_logprob, dim=-1)
+        attn_hard, dur_gt = viterbi_monotonic_alignment(attn_logprob_norm, text_lens, mel_lens)
 
         with torch.no_grad():
             dur1_ratio = (((dur_gt == 1) & text_mask).float().sum() / text_mask.sum().clamp(min=1))
@@ -1992,7 +2017,8 @@ class AetherAcousticModel(nn.Module):
         phase_w = 1.0 if (not self.training) else (0.2 + 0.8 * hard_alpha)
         h_frame = (torch.bmm(attn_use.to(h_txt.dtype), h_txt) + phase_w * self._frame_phase_embed(dur_gt, F_max, h_txt.dtype)) * mel_mask[:, :, None].to(h_txt.dtype)
 
-        loss_bin = -(attn_hard * attn_logprob * mel_mask[:, :, None]).sum() / mel_mask.sum().clamp(min=1)
+        # 二值化损失严格对归一化 log(attn_soft) 求交叉熵（与 NeMo/FastPitch BinLoss 一致，不混入未归一化先验偏置）
+        loss_bin = -(attn_hard * attn_logprob_norm * mel_mask[:, :, None]).sum() / mel_mask.sum().clamp(min=1)
         # 二值化退火推迟至 0.30->0.60 且带防坍缩动态熔断：若 dur==1 > 35%，立即关停 loss_bin 绝不强化错误硬路径
         bin_weight = 0.0 if (step_ratio < 0.30 or dur1_ratio.item() > 0.35) else min(1.0, (step_ratio - 0.30) / 0.30)
 
@@ -2030,7 +2056,7 @@ class AetherAcousticModel(nn.Module):
         loss_mel = (F.l1_loss(mel_pred, mel_gt, reduction="none") * mel_mask[:, None, :]).sum() / (mel_mask.sum().clamp(min=1) * self.n_mels)
         loss_struct = mel_structure_loss(mel_pred, mel_gt, mel_mask)
 
-        # Forward-Sum 对齐主权重提至 1.0，温和二值化权重降至 0.15（杜绝 loss_bin 盖过 CTC 锁死 Z 字坍缩）
+        # a8 规范 Forward-Sum (blank=-1.0) 量级约 0.9~1.8，配 0.50 权重与 z-score Mel L1 均衡协同，保留 0.15 温和二值化
         total_loss = (
             loss_mel
             + 0.35 * loss_struct
@@ -2038,7 +2064,7 @@ class AetherAcousticModel(nn.Module):
             + 0.35 * loss_f0
             + 0.25 * loss_uv
             + 0.25 * loss_energy
-            + 1.00 * loss_align
+            + 0.50 * loss_align
             + 0.15 * bin_weight * loss_bin
         )
         bos_ratio = (dur_gt[:, 0].float() / mel_lens.float().clamp(min=1)).mean().detach()
@@ -2062,7 +2088,7 @@ class AetherAcousticModel(nn.Module):
         h_txt = self.backbone(x_emb, mask=text_mask)
         prior = build_beta_binomial_log_prior(text_lens, mel_lens, T_max, F_max, scaling=1.0)
         alp, _ = self.aligner(mel_gt, x_emb, text_mask, attn_log_prior=prior, mel_mask=mel_mask)
-        attn_hard, dur_gt = viterbi_monotonic_alignment(alp, text_lens, mel_lens)
+        attn_hard, dur_gt = viterbi_monotonic_alignment(F.log_softmax(alp, dim=-1), text_lens, mel_lens)
         h_frame = (torch.bmm(attn_hard.to(h_txt.dtype), h_txt) + self._frame_phase_embed(dur_gt, F_max, h_txt.dtype)) * mel_mask[:, :, None].to(h_txt.dtype)
         f0_uv_out = self.f0_uv_predictor(h_frame)
         f0_pred, uv_prob = f0_uv_out[..., 0], torch.sigmoid(f0_uv_out[..., 1])
