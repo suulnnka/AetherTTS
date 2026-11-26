@@ -44,7 +44,8 @@ def find_checkpoint(root: Path, model_name: str, profile: str, dataset: str, exp
         return p
     runs_dir = root / "runs"
     cands = (
-        sorted(runs_dir.glob(f"{model_name}_{dataset}_{profile}_a7*"))
+        sorted(runs_dir.glob(f"{model_name}_{dataset}_{profile}_a8*"))
+        or sorted(runs_dir.glob(f"{model_name}_{dataset}_{profile}_a7*"))
         or sorted(runs_dir.glob(f"{model_name}_{dataset}_{profile}_a6*"))
     ) if runs_dir.exists() else []
     if not cands and runs_dir.exists():
@@ -64,7 +65,8 @@ def find_vocoder_ckpt(root: Path, profile: str, dataset: str, explicit: str = ""
     if not voc_dir.exists():
         return None
     cands = (
-        sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_a7*"))
+        sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_a8*"))
+        or sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_a7*"))
         or sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_a6*"))
         or sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_*"))
         or sorted(voc_dir.glob("causal_vocos_lite_*"))
@@ -272,7 +274,7 @@ def section_b_train_val_loss(model, meta: dict, manifest_dir: Path, stats: dict,
         db_err = acc["mel_raw"] * 8.6858896
         print(
             f"  [{split:5s}] mel_norm={acc['mel']:.4f} | strc={acc['struct']:.4f} | mel_raw={acc['mel_raw']:.4f} (~{db_err:.1f}dB) | "
-            f"dur={acc['dur']:.4f} | f0_v={acc['f0']:.4f} | uv={acc['uv']:.4f} | bos={acc['bos_ratio']*100:.1f}%"
+            f"align={acc['align']:.3f} | dur={acc['dur']:.4f} | f0_v={acc['f0']:.4f} | uv={acc['uv']:.4f} | bos={acc['bos_ratio']*100:.1f}%"
         )
         res[split] = acc
     return res

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AetherTTS Phase 1 (a7) — 独立 Python 运行器（无需 Notebook / 无 exec-cell）。
+AetherTTS Phase 1 (a8) — 独立 Python 运行器（无需 Notebook / 无 exec-cell）。
 
 由 scripts/sync_phase1_script.py 从 notebooks/AetherTTS_Colab_Phase1_Experiment.ipynb
 确定性 1:1 生成（请勿手改本文件，修改 Notebook 后运行 sync_phase1_script.py 即可同步）。
@@ -16,7 +16,7 @@ AetherTTS Phase 1 (a7) — 独立 Python 运行器（无需 Notebook / 无 exec-
 """
 import argparse
 
-_AP = argparse.ArgumentParser(description="AetherTTS Phase 1 (a7) standalone runner (synced from notebook).")
+_AP = argparse.ArgumentParser(description="AetherTTS Phase 1 (a8) standalone runner (synced from notebook).")
 _AP.add_argument("--root", default="./aethertts_exp", help="Local directory for datasets, checkpoints, samples, reports.")
 _AP.add_argument("--profile", default="standard_phase1", choices=["quick_smoke", "standard_phase1", "full_quality"])
 _AP.add_argument("--dataset", default="bznsyp", choices=["bznsyp", "ljspeech", "custom_bilingual"])
@@ -156,12 +156,12 @@ elif _filter_models:
 else:
     EXPERIMENTS = list(DEFAULT_EXPERIMENTS)
 
-# 架构版本号 a7（复用 v4 特征缓存，零重抽）：针对 a6 在 Colab T4 实测暴露的两大核心缺陷与速度 Bug 定点根治——
-# 1) Aligner 防坍缩：去绝对 pos_pe、收紧余弦 scale=5.0 + 1.5x Beta-Binomial 对角先验、推迟硬对齐/loss_bin 至 0.30 + dur==1>35% 动态熔断与选模惩罚；
-# 2) 声码器去电音分层：CausalHarmonicSource._oscillate 内彻底隔离 log_f0/uv 梯度（根治 128Hz 次谐波打偏）、F0 Scheduled Sampling、Stage2 恢复 35x Mel L1 + 前 40% 纯 GT 热身 + 声学健康门控 GTA；
-# 3) T4 原生 FP16 Tensor Core 修复：仅 sm_80+ 启用 BF16，消除 PyTorch 2.5+ 在 T4 上误走软件模拟 BF16 导致的 6.5h 拖慢。
-ARCH_TAG = "a7"
-DATASET_CACHE_VER = "v4"  # 与 a6 共享 v4 特征缓存，Colab 秒命中 Drive 分片零重抽
+# 架构版本号 a8（复用 v4 特征缓存，零重抽）：在保留 a7 声码器谐波梯度隔离与 T4 原生 FP16 修复的基础上，根治 a7 实机暴露的稀疏锚点对齐坍缩（dur1=72%~74%）——
+# 1) Aligner + Forward-Sum 对齐 NVIDIA FastPitch/RAD-TTS/NeMo 规范：先仅对内容相似度做 log_softmax 再在外部叠加 Beta-Binomial 先验，
+#    forward_sum_loss 左侧拼接 blank_logprob=-1.0 并做二次 log_softmax（消除禁用 blank=-1e4 导致的稀疏锚点捷径），loss_bin 改用归一化 log_softmax(attn_logprob)；
+# 2) 补齐训练进度条与 history.json 的 align/bin 指标记录，升级 --selftest 为能量地形 + 零声学偏置自愈硬门禁。
+ARCH_TAG = "a8"
+DATASET_CACHE_VER = "v4"  # 与 a6/a7 共享 v4 特征缓存，本地与 Colab 秒命中零重抽
 FIXED_VAL_UTTS = 100
 
 SKIP_IF_DONE = True
@@ -1980,16 +1980,28 @@ def build_beta_binomial_log_prior(text_lens: torch.Tensor, mel_lens: torch.Tenso
 
 
 class AlignmentEncoder(nn.Module):
-    """带有效帧掩码与强对角先验约束的单调对齐编码器（a7 防 Z 字型坍缩版）：
-    - 去除易被句首/句尾元音偷懒锚定的绝对位置编码 pos_pe（key_proj 首层 Conv1d(k=3) 已提供局部上下文以区分叠词）；
-    - 将余弦相似度摆幅收紧为 scale=5.0（最大极差 10.0），配合 prior_weight=1.5 × Beta-Binomial 先验，
-      在保留局部 ±2~4 音素灵活停顿空间（Δt=2 惩罚仅 0.44）的同时，从数学上杜绝跨句 Z 字型坍缩。"""
+    """RAD-TTS / FastPitch / NeMo 规范单调对齐编码器（a8 根治稀疏锚点坍缩版）：
+    - 去除绝对 pos_pe，升级为 3 层 query_proj + 2 层宽通道 key_proj 增强局部音素/频谱分辨力；
+    - 先在有效 text_mask 上仅对内容相似度（单位球余弦 × scale=10.0，对 AdamW weight_decay=1e-2 尺度不变）做 F.log_softmax，
+      再在 log_softmax 外部叠加 Beta-Binomial 对数先验：attn_logprob = log_softmax(content) + prior_weight * attn_log_prior；
+    - 配合 forward_sum_loss 中 blank_logprob=-1.0 + 二次 log_softmax，保证所有音素分数 <= log_prior < blank，
+      从能量地形上彻底消除“少数锚点吞帧 + 其余音素 1 帧”的 CTC 捷径吸引子。"""
 
-    def __init__(self, n_mels: int = 100, d_text: int = 256, d_attn: int = 80, scale: float = 5.0, prior_weight: float = 1.5):
+    def __init__(self, n_mels: int = 100, d_text: int = 256, d_attn: int = 80, scale: float = 10.0, prior_weight: float = 1.0):
         super().__init__()
         self.d_text = d_text
-        self.key_proj = nn.Sequential(nn.Conv1d(d_text, d_text, 3, padding=1), nn.ReLU(), nn.Conv1d(d_text, d_attn, 1))
-        self.query_proj = nn.Sequential(nn.Conv1d(n_mels, n_mels * 2, 3, padding=1), nn.ReLU(), nn.Conv1d(n_mels * 2, d_attn, 1))
+        self.key_proj = nn.Sequential(
+            nn.Conv1d(d_text, d_text * 2, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(d_text * 2, d_attn, 1),
+        )
+        self.query_proj = nn.Sequential(
+            nn.Conv1d(n_mels, n_mels * 2, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(n_mels * 2, n_mels, 1),
+            nn.ReLU(),
+            nn.Conv1d(n_mels, d_attn, 1),
+        )
         self.scale = scale
         self.prior_weight = prior_weight
 
@@ -2000,17 +2012,29 @@ class AlignmentEncoder(nn.Module):
             m_in = mel.float() * mel_mask[:, None, :].to(torch.float32) if mel_mask is not None else mel.float()
             keys = F.normalize(self.key_proj(t_in.transpose(1, 2)), dim=1)
             queries = F.normalize(self.query_proj(m_in), dim=1)
-            logits = torch.bmm(queries.transpose(1, 2), keys) * self.scale
+            content_logits = torch.bmm(queries.transpose(1, 2), keys) * self.scale
+            content_logits = content_logits.masked_fill(~text_mask[:, None, :], -1e4)
+            # 1) 仅对内容相似度在有效 token 上做 log_softmax
+            attn_logprob = F.log_softmax(content_logits, dim=-1)
+            # 2) 在 log_softmax 外部叠加 Beta-Binomial 对数先验（避免先验惩罚在 softmax 分母中被锚点自消）
             if attn_log_prior is not None:
-                logits = logits + self.prior_weight * attn_log_prior.float()
-            logits = logits.masked_fill(~text_mask[:, None, :], -1e4)
-            return F.log_softmax(logits, dim=-1), torch.softmax(logits, dim=-1)
+                attn_logprob = attn_logprob + self.prior_weight * attn_log_prior.float()
+            attn_logprob = attn_logprob.masked_fill(~text_mask[:, None, :], -1e4)
+            return attn_logprob, torch.softmax(attn_logprob, dim=-1)
 
-def forward_sum_loss(attn_logprob: torch.Tensor, text_lens: torch.Tensor, mel_lens: torch.Tensor) -> torch.Tensor:
-    B, F_max, _ = attn_logprob.shape
-    blank = torch.full((B, F_max, 1), -1e4, device=attn_logprob.device, dtype=torch.float32)
-    log_probs = torch.cat([blank, attn_logprob.float()], dim=-1).transpose(0, 1)
-    targets = torch.cat([torch.arange(1, tl + 1, device=attn_logprob.device, dtype=torch.long) for tl in text_lens])
+
+def forward_sum_loss(attn_logprob: torch.Tensor, text_lens: torch.Tensor, mel_lens: torch.Tensor, blank_logprob: float = -1.0) -> torch.Tensor:
+    """RAD-TTS / FastPitch / NeMo 规范 Forward-Sum (CTC) 对齐损失：
+    在 attn_logprob (= log_softmax(content) + log_prior) 左侧拼接 blank_logprob=-1.0，
+    屏蔽超出 text_lens 的填充列后再做二次 log_softmax，彻底消除禁用 blank (-1e4) 时的稀疏锚点坍缩捷径。"""
+    B, F_max, T_max = attn_logprob.shape
+    device = attn_logprob.device
+    blank = torch.full((B, F_max, 1), float(blank_logprob), device=device, dtype=torch.float32)
+    lp = torch.cat([blank, attn_logprob.float()], dim=-1)
+    key_inds = torch.arange(T_max + 1, device=device, dtype=torch.long)
+    lp = lp.masked_fill(key_inds.view(1, 1, -1) > text_lens.view(B, 1, 1), -1e9)
+    log_probs = F.log_softmax(lp, dim=-1).transpose(0, 1)
+    targets = torch.cat([torch.arange(1, int(tl.item()) + 1, device=device, dtype=torch.long) for tl in text_lens])
     return F.ctc_loss(log_probs, targets, mel_lens, text_lens, blank=0, zero_infinity=True)
 
 
@@ -2282,7 +2306,8 @@ class AetherAcousticModel(nn.Module):
         attn_log_prior = build_beta_binomial_log_prior(text_lens, mel_lens, T_max, F_max, scaling=1.0)
         attn_logprob, attn_soft = self.aligner(mel_gt, x_emb, text_mask, attn_log_prior=attn_log_prior, mel_mask=mel_mask)
         loss_align = forward_sum_loss(attn_logprob, text_lens, mel_lens)
-        attn_hard, dur_gt = viterbi_monotonic_alignment(attn_logprob, text_lens, mel_lens)
+        attn_logprob_norm = F.log_softmax(attn_logprob, dim=-1)
+        attn_hard, dur_gt = viterbi_monotonic_alignment(attn_logprob_norm, text_lens, mel_lens)
 
         with torch.no_grad():
             dur1_ratio = (((dur_gt == 1) & text_mask).float().sum() / text_mask.sum().clamp(min=1))
@@ -2304,7 +2329,8 @@ class AetherAcousticModel(nn.Module):
         phase_w = 1.0 if (not self.training) else (0.2 + 0.8 * hard_alpha)
         h_frame = (torch.bmm(attn_use.to(h_txt.dtype), h_txt) + phase_w * self._frame_phase_embed(dur_gt, F_max, h_txt.dtype)) * mel_mask[:, :, None].to(h_txt.dtype)
 
-        loss_bin = -(attn_hard * attn_logprob * mel_mask[:, :, None]).sum() / mel_mask.sum().clamp(min=1)
+        # 二值化损失严格对归一化 log(attn_soft) 求交叉熵（与 NeMo/FastPitch BinLoss 一致，不混入未归一化先验偏置）
+        loss_bin = -(attn_hard * attn_logprob_norm * mel_mask[:, :, None]).sum() / mel_mask.sum().clamp(min=1)
         # 二值化退火推迟至 0.30->0.60 且带防坍缩动态熔断：若 dur==1 > 35%，立即关停 loss_bin 绝不强化错误硬路径
         bin_weight = 0.0 if (step_ratio < 0.30 or dur1_ratio.item() > 0.35) else min(1.0, (step_ratio - 0.30) / 0.30)
 
@@ -2342,7 +2368,7 @@ class AetherAcousticModel(nn.Module):
         loss_mel = (F.l1_loss(mel_pred, mel_gt, reduction="none") * mel_mask[:, None, :]).sum() / (mel_mask.sum().clamp(min=1) * self.n_mels)
         loss_struct = mel_structure_loss(mel_pred, mel_gt, mel_mask)
 
-        # Forward-Sum 对齐主权重提至 1.0，温和二值化权重降至 0.15（杜绝 loss_bin 盖过 CTC 锁死 Z 字坍缩）
+        # a8 规范 Forward-Sum (blank=-1.0) 量级约 0.9~1.8，配 0.50 权重与 z-score Mel L1 均衡协同，保留 0.15 温和二值化
         total_loss = (
             loss_mel
             + 0.35 * loss_struct
@@ -2350,7 +2376,7 @@ class AetherAcousticModel(nn.Module):
             + 0.35 * loss_f0
             + 0.25 * loss_uv
             + 0.25 * loss_energy
-            + 1.00 * loss_align
+            + 0.50 * loss_align
             + 0.15 * bin_weight * loss_bin
         )
         bos_ratio = (dur_gt[:, 0].float() / mel_lens.float().clamp(min=1)).mean().detach()
@@ -2374,7 +2400,7 @@ class AetherAcousticModel(nn.Module):
         h_txt = self.backbone(x_emb, mask=text_mask)
         prior = build_beta_binomial_log_prior(text_lens, mel_lens, T_max, F_max, scaling=1.0)
         alp, _ = self.aligner(mel_gt, x_emb, text_mask, attn_log_prior=prior, mel_mask=mel_mask)
-        attn_hard, dur_gt = viterbi_monotonic_alignment(alp, text_lens, mel_lens)
+        attn_hard, dur_gt = viterbi_monotonic_alignment(F.log_softmax(alp, dim=-1), text_lens, mel_lens)
         h_frame = (torch.bmm(attn_hard.to(h_txt.dtype), h_txt) + self._frame_phase_embed(dur_gt, F_max, h_txt.dtype)) * mel_mask[:, :, None].to(h_txt.dtype)
         f0_uv_out = self.f0_uv_predictor(h_frame)
         f0_pred, uv_prob = f0_uv_out[..., 0], torch.sigmoid(f0_uv_out[..., 1])
@@ -3169,16 +3195,43 @@ def run_architecture_and_streaming_tests():
         ro, fo, _, _ = disc(wav_off, wav_off)
         assert len(ro) == 8 and all(torch.isfinite(r).all() for r in ro)
 
-        # a7 新增硬门禁 1：Aligner 防 Z 字型坍缩先验界（跨句偏离对角线的先验惩罚必须严格大于余弦全量程 2*scale）
+        # a8 硬门禁 1a：Forward-Sum 能量地形检验（在 T=39, F=387 上，稀疏锚点捷径的 CTC loss 必须严格远高于均匀对角线！）
         enc_gate = AlignmentEncoder()
-        p_gate = build_beta_binomial_log_prior(torch.tensor([25]), torch.tensor([229]), 25, 229, scaling=1.0)[0]
-        edge_pen = enc_gate.prior_weight * (p_gate[114, 12] - p_gate[114, 2]).item()
-        max_cos_swing = 2.0 * enc_gate.scale
-        assert edge_pen > max_cos_swing, f"Aligner prior edge penalty ({edge_pen:.2f}) <= cosine swing ({max_cos_swing:.2f}), Z-collapse possible!"
         assert not hasattr(enc_gate, "_sinusoidal_pos"), "AlignmentEncoder must not inject absolute pos_pe"
+        tl_g, ml_g = torch.tensor([39]), torch.tensor([387])
+        p_gate = build_beta_binomial_log_prior(tl_g, ml_g, 39, 387, scaling=1.0)
+        s_unif = torch.zeros(1, 387, 39)
+        s_anch = torch.full((1, 387, 39), -enc_gate.scale)
+        s_anch[:, :, [0, 1, 9, 19, 27, 35, 38]] = enc_gate.scale
+        lp_unif = F.log_softmax(s_unif, dim=-1) + enc_gate.prior_weight * p_gate
+        lp_anch = F.log_softmax(s_anch, dim=-1) + enc_gate.prior_weight * p_gate
+        ctc_unif = forward_sum_loss(lp_unif, tl_g, ml_g).item()
+        ctc_anch = forward_sum_loss(lp_anch, tl_g, ml_g).item()
+        assert ctc_anch > ctc_unif + 2.0, f"BUG: sparse-anchor shortcut ({ctc_anch:.2f}) not penalized over uniform ({ctc_unif:.2f})!"
 
-        print(f"  [PASS] {'Aligner Anti-Collapse (a7)':26s} | edge_pen={edge_pen:.2f} > cos_swing={max_cos_swing:.2f} | prior_w={enc_gate.prior_weight} | no_pos_pe")
-        print(f"  [PASS] {'CausalVocosLite+Harm (a7)':26s} | ★ ACTIVE | {count_params_m(voc):.2f}M | Adaptive(6->16) OLA Diff: {vdiff:.2e}")
+        print(f"  [PASS] {'CausalVocosLite+Harm (a8)':26s} | ★ ACTIVE | {count_params_m(voc):.2f}M | Adaptive(6->16) OLA Diff: {vdiff:.2e}")
+
+    # a8 硬门禁 1b：零声学信息梯度自愈检验（纯随机偏置在 forward_sum_loss 梯度下降 60 步后必须自愈回对角线，绝不坍缩成稀疏锚点！）
+    torch.manual_seed(42)
+    tl_h, ml_h = torch.tensor([25]), torch.tensor([240])
+    p_heal = build_beta_binomial_log_prior(tl_h, ml_h, 25, 240, scaling=1.0)
+    tok_bias = nn.Parameter(torch.randn(1, 1, 25) * 0.5)
+    with torch.no_grad():
+        lp0 = F.log_softmax(tok_bias.expand(1, 240, 25), dim=-1) + p_heal
+        _, d0 = viterbi_monotonic_alignment(F.log_softmax(lp0, dim=-1), tl_h, ml_h)
+        d1_init = (d0 == 1).float().mean().item()
+    opt_h = torch.optim.Adam([tok_bias], lr=0.08)
+    for _ in range(60):
+        opt_h.zero_grad()
+        lph = F.log_softmax(tok_bias.expand(1, 240, 25), dim=-1) + p_heal
+        forward_sum_loss(lph, tl_h, ml_h).backward()
+        opt_h.step()
+    with torch.no_grad():
+        lp1 = F.log_softmax(tok_bias.expand(1, 240, 25), dim=-1) + p_heal
+        _, d1_fin_t = viterbi_monotonic_alignment(F.log_softmax(lp1, dim=-1), tl_h, ml_h)
+        d1_fin = (d1_fin_t == 1).float().mean().item()
+    assert d1_fin < 0.15 and d1_fin <= d1_init, f"BUG: Forward-Sum amplified random bias into anchor collapse! dur1: {d1_init:.1%} -> {d1_fin:.1%}"
+    print(f"  [PASS] {'Aligner Anti-Collapse (a8)':26s} | ctc(anch={ctc_anch:.2f} > unif={ctc_unif:.2f}) | bias_heal dur1: {d1_init:.0%}->{d1_fin:.0%} | blank=-1.0")
 
     # a7 新增硬门禁 2：CausalHarmonicSource 梯度隔离校验（波形/GAN 梯度绝不可经 cumsum(exp(log_f0)) 反冲 pitch_out！）
     voc_g = CausalVocosLite(
@@ -3976,7 +4029,8 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     scaler = torch.amp.GradScaler("cuda", enabled=(DEVICE.type == "cuda" and AMP_DTYPE == torch.float16))
 
-    history = {"steps": [], "train_loss": [], "val_mel": [], "val_struct": [], "val_dur": [], "val_f0": [], "val_uv": [],
+    history = {"steps": [], "train_loss": [], "train_align": [], "val_mel": [], "val_struct": [], "val_dur": [], "val_f0": [], "val_uv": [],
+               "val_align": [], "val_bin": [],
                "val_infer_mel": [], "val_infer_score": [], "val_dur_mae": [], "val_dur_rel": [], "val_len_ratio": [],
                "val_dur1_pct": [], "val_dur_max": [], "elapsed_min": 0.0}
     best_val_mel = float("inf")
@@ -4112,6 +4166,7 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
                 if step % 100 == 0:
                     pbar.set_postfix(
                         loss=f"{loss.item():.3f}", mel=f"{out['mel'].item():.3f}",
+                        aln=f"{out['align'].item():.3f}", bin=f"{out['bin'].item():.3f}",
                         dur=f"{out['dur'].item():.3f}", f0=f"{out['f0'].item():.3f}",
                         d1=f"{out['dur1_ratio'].item():.0%}", dmax=f"{int(out['dur_max'].item())}",
                     )
@@ -4123,7 +4178,7 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
 
                 if step % eval_every == 0 or step == total_steps:
                     model.eval()
-                    v_mel, v_strc, v_dur, v_f0, v_uv, v_bos, v_cnt = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0
+                    v_mel, v_strc, v_dur, v_f0, v_uv, v_bos, v_align, v_bin, v_cnt = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0
                     v_infer_mel, v_dur_mae, v_dur_rel, v_len_ratio = 0.0, 0.0, 0.0, 0.0
                     v_dur1, v_dur_max = 0.0, 0.0
                     with torch.no_grad():
@@ -4137,23 +4192,28 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
                             v_mel += vo["mel"].item(); v_strc += vo["struct"].item()
                             v_dur += vo["dur"].item(); v_f0 += vo["f0"].item(); v_uv += vo["uv"].item()
                             v_bos += vo["bos_ratio"].item()
+                            v_align += vo["align"].item(); v_bin += vo["bin"].item()
                             v_dur_mae += vo["dur_mae"].item(); v_dur_rel += vo["dur_rel"].item(); v_len_ratio += vo["len_ratio"].item()
                             v_dur1 += vo["dur1_ratio"].item(); v_dur_max = max(v_dur_max, vo["dur_max"].item())
                             # 真实推理路径（预测时长 + 预测 F0/UV/Energy 全走 infer_offline）的 mel L1
                             v_infer_mel += _infer_mel_l1(vp, vl, vb, vtl, vm, vml).item(); v_cnt += 1
                     d_cnt = max(v_cnt, 1)
                     v_mel /= d_cnt; v_strc /= d_cnt; v_dur /= d_cnt; v_f0 /= d_cnt; v_uv /= d_cnt; v_bos /= d_cnt
+                    v_align /= d_cnt; v_bin /= d_cnt
                     v_infer_mel /= d_cnt; v_dur_mae /= d_cnt; v_dur_rel /= d_cnt; v_len_ratio /= d_cnt; v_dur1 /= d_cnt
                     # best.pt 选模分 = 推理路径 mel L1 + 相对时长误差 + 防坍缩惩罚（dur==1 > 30% 时重罚，杜绝选中坍缩权重）
                     collapse_pen = 2.0 * max(0.0, v_dur1 - 0.30)
                     v_infer_score = v_infer_mel + v_dur_rel + collapse_pen
                     history["steps"].append(step)
                     history["train_loss"].append(round(loss.item(), 4))
+                    history.setdefault("train_align", []).append(round(out["align"].item(), 4))
                     history["val_mel"].append(round(v_mel, 4))
                     history.setdefault("val_struct", []).append(round(v_strc, 4))
                     history["val_dur"].append(round(v_dur, 4))
                     history.setdefault("val_f0", []).append(round(v_f0, 4))
                     history.setdefault("val_uv", []).append(round(v_uv, 4))
+                    history.setdefault("val_align", []).append(round(v_align, 4))
+                    history.setdefault("val_bin", []).append(round(v_bin, 4))
                     history.setdefault("val_bos_ratio", []).append(round(v_bos, 3))
                     history.setdefault("val_infer_mel", []).append(round(v_infer_mel, 4))
                     history.setdefault("val_infer_score", []).append(round(v_infer_score, 4))
@@ -4164,8 +4224,8 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
                     history.setdefault("val_dur_max", []).append(round(v_dur_max, 1))
                     _warn_c = "  [WARN: ALIGNER COLLAPSE!]" if v_dur1 > 0.35 else ""
                     print(
-                        f"\n  [Val step={step:5d}] mel={v_mel:.4f} | infer_mel={v_infer_mel:.4f} | dur_rel={v_dur_rel:.3f} | "
-                        f"len_ratio={v_len_ratio:.3f} | f0={v_f0:.3f} | dur1={v_dur1:.1%} | dur_max={v_dur_max:.0f}{_warn_c}",
+                        f"\n  [Val step={step:5d}] mel={v_mel:.4f} | infer_mel={v_infer_mel:.4f} | align={v_align:.3f} | "
+                        f"dur_rel={v_dur_rel:.3f} | len_ratio={v_len_ratio:.3f} | f0={v_f0:.3f} | dur1={v_dur1:.1%} | dur_max={v_dur_max:.0f}{_warn_c}",
                         flush=True,
                     )
                     last_val = {"mel": v_mel, "infer_mel": v_infer_mel, "dur_rel": v_dur_rel, "infer_score": v_infer_score}

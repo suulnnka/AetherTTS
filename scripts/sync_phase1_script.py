@@ -22,7 +22,7 @@ LIB_PATH = REPO_ROOT / "scripts" / "aethertts_lib.py"
 
 LIB_HEADER = '''#!/usr/bin/env python3
 """
-AetherTTS Phase 1 (a7) — 纯模型与前端基础设施定义库（import 零副作用）。
+AetherTTS Phase 1 (a8) — 纯模型与前端基础设施定义库（import 零副作用）。
 
 由 scripts/sync_phase1_script.py 从 notebooks/AetherTTS_Colab_Phase1_Experiment.ipynb
 的 Cell 3 与 Cell 5 确定性生成（请勿手改本文件，修改 Notebook 后运行 sync_phase1_script.py 即可同步）。
@@ -74,7 +74,7 @@ CFG = {
 
 HEADER = '''#!/usr/bin/env python3
 """
-AetherTTS Phase 1 (a7) — 独立 Python 运行器（无需 Notebook / 无 exec-cell）。
+AetherTTS Phase 1 (a8) — 独立 Python 运行器（无需 Notebook / 无 exec-cell）。
 
 由 scripts/sync_phase1_script.py 从 notebooks/AetherTTS_Colab_Phase1_Experiment.ipynb
 确定性 1:1 生成（请勿手改本文件，修改 Notebook 后运行 sync_phase1_script.py 即可同步）。
@@ -90,7 +90,7 @@ AetherTTS Phase 1 (a7) — 独立 Python 运行器（无需 Notebook / 无 exec-
 """
 import argparse
 
-_AP = argparse.ArgumentParser(description="AetherTTS Phase 1 (a7) standalone runner (synced from notebook).")
+_AP = argparse.ArgumentParser(description="AetherTTS Phase 1 (a8) standalone runner (synced from notebook).")
 _AP.add_argument("--root", default="./aethertts_exp", help="Local directory for datasets, checkpoints, samples, reports.")
 _AP.add_argument("--profile", default="standard_phase1", choices=["quick_smoke", "standard_phase1", "full_quality"])
 _AP.add_argument("--dataset", default="bznsyp", choices=["bznsyp", "ljspeech", "custom_bilingual"])
