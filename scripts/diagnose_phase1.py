@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-AetherTTS Phase 1 (a6) 深度诊断与 ChunkAttn 提速校验脚本。
+AetherTTS Phase 1 (a9) 深度诊断与 ChunkAttn 提速校验脚本。
 
 直接 import scripts/aethertts_lib.py（零正则 exec 脆弱耦合），复用 `./aethertts_exp` 产物，
 一次性检查：
-  A. 模型训练历史 (history.json) 收敛趋势（val_mel / val_struct / val_f0 / val_uv / val_dur）
+  A. 模型训练历史 (history.json) 收敛轨迹（val_mel / val_infer_mel / val_f0 / val_dur / best_step）
   B. Train vs Val 各分项损失分解（含归一化与原始 log-mel L1、共振峰结构损失、浊音 F0 与 UV 准确率）
   C. Aligner 深度体检（锐度、对角偏离、dur==1 塌缩率、dur_gt vs dur_pred 相关性 + 热力图 PNG）
   D. 前端一致性审计（v4 缓存标贝儿化/韵律音素 vs 推理端文本 G2P 差异与 0-<unk> 校验）
-  E. 8 链路逐级隔离评测（含 Teacher-Forced + 真/预测 F0+UV -> 预训练 Vocos / 谐波源 CausalVocosLite + CPU int8 Whisper CER + UTMOS + DTW Raw Mel L1）
-  F. ChunkLookaheadBackbone 零循环并行 & 局部相对 RoPE 超长流式等价校验 + GPU/CPU 提速实测
+  E. 8 链路逐级隔离评测（含 Teacher-Forced + 真/预测 F0+UV -> PreVocos / CausalVoc+Harm + CER + UTMOS + DTW RawL1 + Mod_93Hz + Energy_Holes）
+  F. ChunkLookaheadBackbone 零循环并行 & 局部相对 RoPE 超长流式等价校验
 
 用法：
     python scripts/diagnose_phase1.py --root ./aethertts_exp
@@ -44,7 +44,8 @@ def find_checkpoint(root: Path, model_name: str, profile: str, dataset: str, exp
         return p
     runs_dir = root / "runs"
     cands = (
-        sorted(runs_dir.glob(f"{model_name}_{dataset}_{profile}_a8*"))
+        sorted(runs_dir.glob(f"{model_name}_{dataset}_{profile}_a9*"))
+        or sorted(runs_dir.glob(f"{model_name}_{dataset}_{profile}_a8*"))
         or sorted(runs_dir.glob(f"{model_name}_{dataset}_{profile}_a7*"))
         or sorted(runs_dir.glob(f"{model_name}_{dataset}_{profile}_a6*"))
     ) if runs_dir.exists() else []
@@ -65,7 +66,8 @@ def find_vocoder_ckpt(root: Path, profile: str, dataset: str, explicit: str = ""
     if not voc_dir.exists():
         return None
     cands = (
-        sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_a8*"))
+        sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_a9*"))
+        or sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_a8*"))
         or sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_a7*"))
         or sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_a6*"))
         or sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_*"))
@@ -300,7 +302,7 @@ def section_c_aligner_forensics(model, frontend, meta: dict, manifest_dir: Path,
             h_txt = model.backbone(x_emb, mask=tmask)
             prior = lib.build_beta_binomial_log_prior(tl, ml, T_b, F_b)
             alp, asoft = model.aligner(mels, x_emb, tmask, attn_log_prior=prior, mel_mask=mmask)
-            ahard, dur_gt_t = lib.viterbi_monotonic_alignment(alp, tl, ml)
+            ahard, dur_gt_t = lib.viterbi_monotonic_alignment(F.log_softmax(alp, dim=-1), tl, ml)
             dur_pred_t = torch.clamp(torch.round(torch.exp(model.dur_predictor(h_txt)) - 1.0), min=1, max=60).long()
 
             asoft_np = asoft[0].cpu().numpy()
@@ -427,6 +429,27 @@ def section_e_link_isolation(
         hyp = "".join(s.text for s in segs).strip()
         return compute_cer(ref_text, hyp), hyp
 
+    def _mod93(wav_np):
+        env = np.abs(np.asarray(wav_np, dtype=np.float64))
+        dc = float(env.sum())
+        if dc < 1e-8 or env.size < 1024:
+            return float("nan")
+        t = np.arange(env.size, dtype=np.float64)
+        ang = (-2.0 * math.pi * (float(sr) / 256.0) / float(sr)) * t
+        return float(math.hypot(float(np.dot(env, np.cos(ang))), float(np.dot(env, np.sin(ang)))) / dc)
+
+    def _holes(wav_np):
+        w = np.asarray(wav_np, dtype=np.float64)
+        nf = w.size // 256
+        if nf < 5:
+            return 0
+        rms = np.sqrt(np.mean(w[: nf * 256].reshape(nf, 256) ** 2, axis=1) + 1e-12)
+        return int(sum(
+            1 for f in range(2, nf - 2)
+            if min(max(rms[f - 2], rms[f - 1]), max(rms[f + 1], rms[f + 2])) > 0.05
+            and rms[f] < 0.35 * min(max(rms[f - 2], rms[f - 1]), max(rms[f + 1], rms[f + 2]))
+        ))
+
     mel_mean = torch.tensor(stats["mel_mean"], device=device, dtype=torch.float32)[None, :, None]
     mel_std = torch.tensor(stats["mel_std"], device=device, dtype=torch.float32)[None, :, None]
     def denorm(m): return m * mel_std + mel_mean
@@ -443,7 +466,7 @@ def section_e_link_isolation(
         ("6_inf_text_prevocos",    "Infer(text_g2p) -> PreVocos"),
         ("7_inf_text_causal",      "Infer(text_g2p) -> CausalVoc+Harm"),
     ]
-    scores = {k: {"utmos": [], "cer": [], "norm_l1": [], "raw_l1": [], "dtw_raw_l1": []} for k, _ in links}
+    scores = {k: {"utmos": [], "cer": [], "norm_l1": [], "raw_l1": [], "dtw_raw_l1": [], "mod93": [], "holes": []} for k, _ in links}
     wav_root = out_dir / "wavs"
     wav_root.mkdir(parents=True, exist_ok=True)
     model.eval()
@@ -463,10 +486,11 @@ def section_e_link_isolation(
         h_txt = model.backbone(x_emb, mask=tmask)
         prior = lib.build_beta_binomial_log_prior(tl, ml, T_b, F_b)
         alp, _ = model.aligner(mels_norm, x_emb, tmask, attn_log_prior=prior, mel_mask=mmask)
-        ahard, dur_gt = lib.viterbi_monotonic_alignment(alp, tl, ml)
+        ahard, dur_gt = lib.viterbi_monotonic_alignment(F.log_softmax(alp, dim=-1), tl, ml)
 
         h_frame = torch.bmm(ahard.to(h_txt.dtype), h_txt) + model._frame_phase_embed(dur_gt, F_b, h_txt.dtype)
-        mel3_norm = model._condition_decoder(h_frame, f0s, uvs, es)
+        h_pre = model.frame_pre(h_frame) if hasattr(model, "frame_pre") else h_frame
+        mel3_norm = model._condition_decoder(h_pre, f0s, uvs, es)
         mel3_raw = denorm(mel3_norm)
 
         mel4_norm = model.extract_gta_mel(pids, lids, tl, mels_norm, ml, boundary_ids=bids)
@@ -502,6 +526,8 @@ def section_e_link_isolation(
                 scores[k]["utmos"].append(_utmos(w))
                 cer, _ = _asr(w, text)
                 scores[k]["cer"].append(cer)
+                scores[k]["mod93"].append(_mod93(w))
+                scores[k]["holes"].append(_holes(w))
             if m_n is not None and m_n.shape[-1] == mels_norm.shape[-1]:
                 scores[k]["norm_l1"].append(float(F.l1_loss(m_n, mels_norm).item()))
                 scores[k]["raw_l1"].append(float(F.l1_loss(m_r, gt_mel_raw).item()))
@@ -512,15 +538,16 @@ def section_e_link_isolation(
         v = [x for x in arr if not math.isnan(x)]
         return float(np.mean(v)) if v else float("nan")
 
-    print(f"\n  {'链路':38s} | {'UTMOS↑':>7s} | {'CER↓':>7s} | {'NormL1':>7s} | {'RawL1':>7s} | {'DTW_RawL1':>9s}")
-    print("  " + "-" * 90)
+    print(f"\n  {'链路':38s} | {'UTMOS↑':>7s} | {'CER↓':>7s} | {'NormL1':>7s} | {'RawL1':>7s} | {'DTW_RawL1':>9s} | {'Mod93↓':>7s} | {'Holes↓':>6s}")
+    print("  " + "-" * 108)
     table = {}
     for k, label in links:
-        u, c, nl, rl, dl = (_m(scores[k][m]) for m in ("utmos", "cer", "norm_l1", "raw_l1", "dtw_raw_l1"))
+        u, c, nl, rl, dl, m93 = (_m(scores[k][m]) for m in ("utmos", "cer", "norm_l1", "raw_l1", "dtw_raw_l1", "mod93"))
+        hl = int(sum(scores[k]["holes"]))
         fmt = lambda v, p=3: (f"{v:.{p}f}" if not math.isnan(v) else "   -   ")
         fmt_c = lambda v: (f"{v*100:6.1f}%" if not math.isnan(v) else "   -   ")
-        print(f"  {label:38s} | {fmt(u):>7s} | {fmt_c(c):>7s} | {fmt(nl,4):>7s} | {fmt(rl,4):>7s} | {fmt(dl,4):>9s}")
-        table[k] = {"utmos": u, "cer": c, "norm_l1": nl, "raw_l1": rl, "dtw_raw_l1": dl}
+        print(f"  {label:38s} | {fmt(u):>7s} | {fmt_c(c):>7s} | {fmt(nl,4):>7s} | {fmt(rl,4):>7s} | {fmt(dl,4):>9s} | {fmt(m93,4):>7s} | {hl:6d}")
+        table[k] = {"utmos": u, "cer": c, "norm_l1": nl, "raw_l1": rl, "dtw_raw_l1": dl, "mod93": m93, "holes": hl}
     return table
 
 
@@ -534,7 +561,7 @@ def section_f_chunk_attn_benchmark(model, device: torch.device):
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
-    bb_f32 = bb.float().train()
+    bb_f32 = bb.float().eval()  # a9: eval 态屏蔽 dropout 以精确校验前反向图数值等价
     torch.manual_seed(123)
     T_lens = [75, 43, 19, 3]
     B_t, T_t, D = len(T_lens), max(T_lens), model.d_model
@@ -581,7 +608,7 @@ def section_f_chunk_attn_benchmark(model, device: torch.device):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="AetherTTS Phase 1 (a6) 深度诊断脚本")
+    ap = argparse.ArgumentParser(description="AetherTTS Phase 1 (a9) 深度诊断脚本")
     ap.add_argument("--root", default="./aethertts_exp")
     ap.add_argument("--profile", default="standard_phase1")
     ap.add_argument("--dataset", default="bznsyp")
@@ -618,10 +645,11 @@ def main():
         swa_window=int(cfg.get("swa_window", 48)),
         chunk_size=int(cfg.get("chunk_attn_size", 4)),
         frame_lookahead=int(cfg.get("frame_lookahead", 2)),
+        dropout=float(cfg.get("dropout_acoustic", 0.0)),
     ).to(device)
     model.load_state_dict(ckpt["model"], strict=True)
     model.eval()
-    print(f"[Load] 声学权重加载成功: {ckpt_path} (step={ckpt.get('step')}, best_val_mel={ckpt.get('best_val_mel')})")
+    print(f"[Load] 声学权重加载成功: {ckpt_path} (arch={ckpt.get('arch_tag')}, step={ckpt.get('step')}, best_val_mel={ckpt.get('best_val_mel')}, best_val_infer={ckpt.get('best_val_infer')})")
 
     manifest_path = find_manifest(root, args.dataset, cfg.get("max_train_hours"), args.cache_dir)
     meta = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -632,9 +660,10 @@ def main():
     if voc_ckpt is not None:
         causal_voc = lib.CausalVocosLite(
             n_mels=int(cfg.get("n_mels", 100)),
+            dim=int(cfg.get("vocoder_dim", 320)),
             n_fft=int(cfg.get("n_fft", 1024)),
             hop_length=int(cfg.get("hop_length", 256)),
-            lookahead=int(cfg.get("vocoder_lookahead", 2)),
+            lookahead=int(cfg.get("vocoder_lookahead", 4)),
             sample_rate=int(cfg.get("sample_rate", 24000)),
         ).to(device)
         causal_voc.load_state_dict(torch.load(voc_ckpt, map_location=device, weights_only=True), strict=True)
