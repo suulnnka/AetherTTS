@@ -22,7 +22,7 @@ LIB_PATH = REPO_ROOT / "scripts" / "aethertts_lib.py"
 
 LIB_HEADER = '''#!/usr/bin/env python3
 """
-AetherTTS Phase 1 (a8) — 纯模型与前端基础设施定义库（import 零副作用）。
+AetherTTS Phase 1 (a9) — 纯模型与前端基础设施定义库（import 零副作用）。
 
 由 scripts/sync_phase1_script.py 从 notebooks/AetherTTS_Colab_Phase1_Experiment.ipynb
 的 Cell 3 与 Cell 5 确定性生成（请勿手改本文件，修改 Notebook 后运行 sync_phase1_script.py 即可同步）。
@@ -49,6 +49,7 @@ IS_KAGGLE = (ENV_MODE == "kaggle")
 STORAGE_ROOT = Path(os.environ.get("AETHER_ROOT", "./aethertts_exp")).expanduser().resolve()
 LOCAL_WORK = STORAGE_ROOT
 DRIVE_ROOT = STORAGE_ROOT
+_VOC_LA_DEFAULT = int(os.environ.get("AETHER_VOCODER_LOOKAHEAD", "4"))
 CFG = {
     "seed": 42,
     "sample_rate": 24000,
@@ -63,10 +64,12 @@ CFG = {
     "swa_window": 48,
     "chunk_attn_size": 4,
     "stream_text_chunk": 4,
-    "stream_mel_first_chunk": 6,
+    "stream_mel_first_chunk": max(6, _VOC_LA_DEFAULT + 4),
     "stream_mel_chunk": 16,
+    "dropout_acoustic": float(os.environ.get("AETHER_DROPOUT", "0.1")),
+    "vocoder_dim": int(os.environ.get("AETHER_VOCODER_DIM", "320")),
     "frame_lookahead": int(os.environ.get("AETHER_FRAME_LOOKAHEAD", "2")),
-    "vocoder_lookahead": int(os.environ.get("AETHER_VOCODER_LOOKAHEAD", "2")),
+    "vocoder_lookahead": _VOC_LA_DEFAULT,
     "profile": os.environ.get("AETHER_PROFILE", "standard_phase1"),
     "dataset_source": os.environ.get("AETHER_DATASET", "bznsyp"),
 }
@@ -74,32 +77,34 @@ CFG = {
 
 HEADER = '''#!/usr/bin/env python3
 """
-AetherTTS Phase 1 (a8) — 独立 Python 运行器（无需 Notebook / 无 exec-cell）。
+AetherTTS Phase 1 (a9) — 独立 Python 运行器（无需 Notebook / 无 exec-cell）。
 
 由 scripts/sync_phase1_script.py 从 notebooks/AetherTTS_Colab_Phase1_Experiment.ipynb
 确定性 1:1 生成（请勿手改本文件，修改 Notebook 后运行 sync_phase1_script.py 即可同步）。
 
 默认聚焦唯一主力路线 E3_chunk_attn_C4_L8（5 层深双向分块前瞻 ChunkLookaheadBackbone + 局部窗口相对 RoPE +
-防坍缩单调对齐 + 浊音感知 F0/UV + 2D 共振峰结构损失 + 梯度隔离谐波源 CausalVocosLite + 健康门控 GTA 闭环精调），
+防坍缩单调对齐 + 共享帧前瞻与多尺度空洞 F0/UV/帧解码器 + 连续相位谐波源-滤波器 CausalVocosLite + 相位一致性损失 + GT-F0 对齐 GTA 闭环精调），
 同时保留 E0/E1/E2/E4 代码供归档对照（可通过 --models 显式指定）。
 
 用法：
     python scripts/aethertts_phase1.py --profile full_quality --dataset bznsyp --root ./aethertts_exp
-    python scripts/aethertts_phase1.py --selftest          # 验证前端零 UNK + 防坍缩对齐 + 长流式局部 RoPE + 声码器梯度隔离与流式 + autocast 精度门禁
+    python scripts/aethertts_phase1.py --selftest          # 验证前端零 UNK + 防坍缩对齐 + 长流式局部 RoPE + 谐波 STFT COLA + 相位损失/声码器流式 + autocast 精度门禁
     python scripts/aethertts_phase1.py --profile-steps 20  # 打印单步训练耗时分解后退出
 """
 import argparse
 
-_AP = argparse.ArgumentParser(description="AetherTTS Phase 1 (a8) standalone runner (synced from notebook).")
+_AP = argparse.ArgumentParser(description="AetherTTS Phase 1 (a9) standalone runner (synced from notebook).")
 _AP.add_argument("--root", default="./aethertts_exp", help="Local directory for datasets, checkpoints, samples, reports.")
 _AP.add_argument("--profile", default="standard_phase1", choices=["quick_smoke", "standard_phase1", "full_quality"])
 _AP.add_argument("--dataset", default="bznsyp", choices=["bznsyp", "ljspeech", "custom_bilingual"])
 _AP.add_argument("--vocoder", default="both", choices=["both", "pretrained_vocos", "causal_vocos_lite"])
 _AP.add_argument("--models", default="", help="Optional comma-separated model override (default: only E3_chunk_attn_C4_L8).")
-_AP.add_argument("--frame-lookahead", type=int, default=None, help="声学 frame_decoder 首层集中式右前瞻帧数（默认 2 帧；0 表示关闭）.")
-_AP.add_argument("--vocoder-lookahead", type=int, default=None, help="CausalVocosLite 集中式右前瞻帧数（默认 2 帧；0 表示关闭前瞻）.")
+_AP.add_argument("--frame-lookahead", type=int, default=None, help="声学 frame_pre 共享帧级右前瞻帧数（默认 2 帧；0 表示关闭）.")
+_AP.add_argument("--vocoder-lookahead", type=int, default=None, help="CausalVocosLite 集中式右前瞻帧数（a9 默认 4 帧，覆盖完整 1024 点 iSTFT 右半窗）.")
+_AP.add_argument("--vocoder-dim", type=int, default=None, help="CausalVocosLite 通道宽度（a9 默认 320）.")
+_AP.add_argument("--dropout", type=float, default=None, help="声学模型 Dropout 比例（a9 默认 0.1）.")
 _AP.add_argument("--batch-size", type=int, default=None, help="可选覆写声学训练 batch_size（如 RTX 4090 覆写为 64）.")
-_AP.add_argument("--gta-prob", type=float, default=None, help="声码器 Stage 2 后段混入声学 GTA 预测 Mel 的概率（默认 0.35；0 表示关闭）.")
+_AP.add_argument("--gta-prob", type=float, default=None, help="声码器 Stage 2 末 25% 混入 GT-F0 对齐 GTA 预测 Mel 的概率（a9 默认 0.25；0 表示关闭）.")
 _AP.add_argument("--backup-steps", type=int, default=1000)
 _AP.add_argument("--backup-minutes", type=float, default=8.0)
 _AP.add_argument("--skip-pip", action="store_true")
@@ -122,6 +127,10 @@ if _ARGS.frame_lookahead is not None:
     _os.environ["AETHER_FRAME_LOOKAHEAD"] = str(_ARGS.frame_lookahead)
 if _ARGS.vocoder_lookahead is not None:
     _os.environ["AETHER_VOCODER_LOOKAHEAD"] = str(_ARGS.vocoder_lookahead)
+if _ARGS.vocoder_dim is not None:
+    _os.environ["AETHER_VOCODER_DIM"] = str(_ARGS.vocoder_dim)
+if _ARGS.dropout is not None:
+    _os.environ["AETHER_DROPOUT"] = str(_ARGS.dropout)
 if _ARGS.batch_size is not None:
     _os.environ["AETHER_BATCH_SIZE"] = str(_ARGS.batch_size)
 if _ARGS.gta_prob is not None:
