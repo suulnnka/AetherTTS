@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-AetherTTS Phase 1 (a6) — 独立 Python 运行器（无需 Notebook / 无 exec-cell）。
+AetherTTS Phase 1 (a7) — 独立 Python 运行器（无需 Notebook / 无 exec-cell）。
 
 由 scripts/sync_phase1_script.py 从 notebooks/AetherTTS_Colab_Phase1_Experiment.ipynb
 确定性 1:1 生成（请勿手改本文件，修改 Notebook 后运行 sync_phase1_script.py 即可同步）。
 
 默认聚焦唯一主力路线 E3_chunk_attn_C4_L8（5 层深双向分块前瞻 ChunkLookaheadBackbone + 局部窗口相对 RoPE +
-音素边界与完备中英音系前端 + 浊音感知 F0/UV + 2D 共振峰结构损失 + 声学->声码器 GTA 闭环精调 + 帧率谐波源 CausalVocosLite），
+防坍缩单调对齐 + 浊音感知 F0/UV + 2D 共振峰结构损失 + 梯度隔离谐波源 CausalVocosLite + 健康门控 GTA 闭环精调），
 同时保留 E0/E1/E2/E4 代码供归档对照（可通过 --models 显式指定）。
 
 用法：
     python scripts/aethertts_phase1.py --profile full_quality --dataset bznsyp --root ./aethertts_exp
-    python scripts/aethertts_phase1.py --selftest          # 验证前端零 UNK + 向量化对齐 + 长流式局部 RoPE + 声码器谐波源流式 + autocast 精度门禁
+    python scripts/aethertts_phase1.py --selftest          # 验证前端零 UNK + 防坍缩对齐 + 长流式局部 RoPE + 声码器梯度隔离与流式 + autocast 精度门禁
     python scripts/aethertts_phase1.py --profile-steps 20  # 打印单步训练耗时分解后退出
 """
 import argparse
 
-_AP = argparse.ArgumentParser(description="AetherTTS Phase 1 (a6) standalone runner (synced from notebook).")
+_AP = argparse.ArgumentParser(description="AetherTTS Phase 1 (a7) standalone runner (synced from notebook).")
 _AP.add_argument("--root", default="./aethertts_exp", help="Local directory for datasets, checkpoints, samples, reports.")
 _AP.add_argument("--profile", default="standard_phase1", choices=["quick_smoke", "standard_phase1", "full_quality"])
 _AP.add_argument("--dataset", default="bznsyp", choices=["bznsyp", "ljspeech", "custom_bilingual"])
@@ -25,7 +25,7 @@ _AP.add_argument("--models", default="", help="Optional comma-separated model ov
 _AP.add_argument("--frame-lookahead", type=int, default=None, help="声学 frame_decoder 首层集中式右前瞻帧数（默认 2 帧；0 表示关闭）.")
 _AP.add_argument("--vocoder-lookahead", type=int, default=None, help="CausalVocosLite 集中式右前瞻帧数（默认 2 帧；0 表示关闭前瞻）.")
 _AP.add_argument("--batch-size", type=int, default=None, help="可选覆写声学训练 batch_size（如 RTX 4090 覆写为 64）.")
-_AP.add_argument("--gta-prob", type=float, default=None, help="声码器 Stage 2 混入声学 GTA 预测 Mel 的概率（默认 0.5；0 表示关闭）.")
+_AP.add_argument("--gta-prob", type=float, default=None, help="声码器 Stage 2 后段混入声学 GTA 预测 Mel 的概率（默认 0.35；0 表示关闭）.")
 _AP.add_argument("--backup-steps", type=int, default=1000)
 _AP.add_argument("--backup-minutes", type=float, default=8.0)
 _AP.add_argument("--skip-pip", action="store_true")
@@ -156,11 +156,12 @@ elif _filter_models:
 else:
     EXPERIMENTS = list(DEFAULT_EXPERIMENTS)
 
-# 架构版本号 a6：在 a5（v3 音系前端 / 浊音感知 F0/UV / 局部窗口相对 RoPE / 转置 SpecDisc + PeriodDisc(11) / 帧率谐波源与 GTA 闭环）基础上——
-# 韵律边界分级 (boundary_ids 0-4)、对齐器 / GDN / 谐波源基频头 / iSTFT 头强制 FP32、best.pt 改按真实推理路径选模、
-# 推理期韵律词边界改用分词近似、英文数字转写。模型结构或输入语义变更后必须递增
-ARCH_TAG = "a6"
-DATASET_CACHE_VER = "v4"  # boundary_ids 语义变更（#1/#2/#3 分级），v3 特征不可复用
+# 架构版本号 a7（复用 v4 特征缓存，零重抽）：针对 a6 在 Colab T4 实测暴露的两大核心缺陷与速度 Bug 定点根治——
+# 1) Aligner 防坍缩：去绝对 pos_pe、收紧余弦 scale=5.0 + 1.5x Beta-Binomial 对角先验、推迟硬对齐/loss_bin 至 0.30 + dur==1>35% 动态熔断与选模惩罚；
+# 2) 声码器去电音分层：CausalHarmonicSource._oscillate 内彻底隔离 log_f0/uv 梯度（根治 128Hz 次谐波打偏）、F0 Scheduled Sampling、Stage2 恢复 35x Mel L1 + 前 40% 纯 GT 热身 + 声学健康门控 GTA；
+# 3) T4 原生 FP16 Tensor Core 修复：仅 sm_80+ 启用 BF16，消除 PyTorch 2.5+ 在 T4 上误走软件模拟 BF16 导致的 6.5h 拖慢。
+ARCH_TAG = "a7"
+DATASET_CACHE_VER = "v4"  # 与 a6 共享 v4 特征缓存，Colab 秒命中 Drive 分片零重抽
 FIXED_VAL_UTTS = 100
 
 SKIP_IF_DONE = True
@@ -189,10 +190,10 @@ PROFILE_PRESETS = {
     "standard_phase1": {
         "max_train_hours": 8.0,
         "val_utts": 80,
-        "vocoder_stage1_steps": 4000,
-        "vocoder_stage2_steps": 14000,
-        "acoustic_steps": 15000,
-        "batch_size": 32 if GPU_MEM_GB >= 22 else (24 if GPU_MEM_GB >= 18 else 16),
+        "vocoder_stage1_steps": 5000,
+        "vocoder_stage2_steps": 20000,
+        "acoustic_steps": 20000,
+        "batch_size": 32 if GPU_MEM_GB >= 14 else 16,  # T4 (15.6GB) 开启原生 FP16 可稳定跑 bs=32，单步吞吐翻倍且避免小 batch 对齐震荡
         "eval_max_utts": 25,
     },
     "full_quality": {
@@ -222,7 +223,7 @@ CFG = {
     "stream_text_chunk": 4,         # 流式评测/测速每次喂入 4 音素（与 C=4 对齐）
     "stream_mel_first_chunk": 6,    # ★ 动态低延迟首包：首块攒够 6 帧 (~64ms) 立即触发声码器出声，避免首块干等 16 帧
     "stream_mel_chunk": 16,         # 稳态声码器块长 16 帧 (~171ms)，兼顾高吞吐与零接缝爆音
-    "vocoder_gta_prob": float(os.environ.get("AETHER_GTA_PROB", "0.5")),  # Stage 2 混入声学 GTA 预测 Mel 的比例
+    "vocoder_gta_prob": float(os.environ.get("AETHER_GTA_PROB", "0.35")),  # Stage 2 后段混入声学 GTA 预测 Mel 的比例（前 40% 纯 GT 锁谐波）
     # 流式首包 TTFA 评测口径：t=0 记为 LLM 第一个 token 到达，文本按 tok_rate × chars_per_tok 的节奏逐字到达
     "llm_tok_rate": float(os.environ.get("AETHER_LLM_TOK_RATE", "25.0")),          # LLM 解码吞吐 (token/s)
     "llm_chars_per_tok": float(os.environ.get("AETHER_LLM_CHARS_PER_TOK", "1.5")), # 中文平均每 token 汉字数
@@ -245,12 +246,25 @@ CFG["run_suffix"] = f"{CFG['dataset_source']}_{CFG['profile']}_{ARCH_TAG}"
 CFG["acoustic_suffix"] = f"{CFG['run_suffix']}_fL{CFG['frame_lookahead']}"
 CFG["eval_suffix"] = f"{CFG['acoustic_suffix']}_vL{CFG['vocoder_lookahead']}"
 
+def _supports_native_bf16() -> bool:
+    """仅在 Ampere+ (sm_80+) 且原生硬件支持 BF16 时返回 True；T4/V100 (sm_75/70) 强制走原生 FP16 Tensor Core，避免软件模拟 BF16。"""
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability(0)
+    if major < 8:
+        return False
+    try:
+        return bool(torch.cuda.is_bf16_supported(including_emulation=False))
+    except TypeError:
+        return bool(torch.cuda.is_bf16_supported())
+
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-AMP_DTYPE = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+AMP_DTYPE = torch.bfloat16 if _supports_native_bf16() else torch.float16
 
 print("=" * 72)
 print(f"Environment   : {ENV_MODE.upper()} ({'纯本地模式，无云盘拷贝' if IS_LOCAL else '云盘同步备份模式'})")
-print(f"Device        : {DEVICE}" + (f" | {torch.cuda.get_device_name(0)} ({GPU_MEM_GB:.1f} GB)" if torch.cuda.is_available() else ""))
+print(f"Device        : {DEVICE}" + (f" | {torch.cuda.get_device_name(0)} ({GPU_MEM_GB:.1f} GB, amp={str(AMP_DTYPE).split('.')[-1]})" if torch.cuda.is_available() else ""))
 print(f"CPU Cores     : {CPU_CORES} (DataLoader workers={NUM_WORKERS})")
 print(f"Storage Root  : {STORAGE_ROOT}")
 print(f"Local Work    : {LOCAL_WORK}")
@@ -1966,36 +1980,29 @@ def build_beta_binomial_log_prior(text_lens: torch.Tensor, mel_lens: torch.Tenso
 
 
 class AlignmentEncoder(nn.Module):
-    """带有效帧掩码与轻量正弦位置编码的单调对齐编码器（消除批右填充污染与叠词同音素混淆）。"""
+    """带有效帧掩码与强对角先验约束的单调对齐编码器（a7 防 Z 字型坍缩版）：
+    - 去除易被句首/句尾元音偷懒锚定的绝对位置编码 pos_pe（key_proj 首层 Conv1d(k=3) 已提供局部上下文以区分叠词）；
+    - 将余弦相似度摆幅收紧为 scale=5.0（最大极差 10.0），配合 prior_weight=1.5 × Beta-Binomial 先验，
+      在保留局部 ±2~4 音素灵活停顿空间（Δt=2 惩罚仅 0.44）的同时，从数学上杜绝跨句 Z 字型坍缩。"""
 
-    def __init__(self, n_mels: int = 100, d_text: int = 256, d_attn: int = 80, scale: float = 10.0):
+    def __init__(self, n_mels: int = 100, d_text: int = 256, d_attn: int = 80, scale: float = 5.0, prior_weight: float = 1.5):
         super().__init__()
         self.d_text = d_text
         self.key_proj = nn.Sequential(nn.Conv1d(d_text, d_text, 3, padding=1), nn.ReLU(), nn.Conv1d(d_text, d_attn, 1))
         self.query_proj = nn.Sequential(nn.Conv1d(n_mels, n_mels * 2, 3, padding=1), nn.ReLU(), nn.Conv1d(n_mels * 2, d_attn, 1))
         self.scale = scale
-
-    @staticmethod
-    def _sinusoidal_pos(length: int, dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        pos = torch.arange(length, device=device, dtype=torch.float32)[:, None]
-        div = torch.exp(torch.arange(0, dim, 2, device=device, dtype=torch.float32) * (-math.log(1000.0) / dim))
-        pe = torch.zeros(length, dim, device=device, dtype=torch.float32)
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div)
-        return pe.to(dtype)
+        self.prior_weight = prior_weight
 
     def forward(self, mel: torch.Tensor, text_emb: torch.Tensor, text_mask: torch.Tensor, attn_log_prior: torch.Tensor = None, mel_mask: torch.Tensor = None):
-        # 对齐 logits 直接决定 Viterbi 硬时长，整段强制 FP32：autocast 下 .float() 挡不住 bmm / conv 被降到 bf16
+        # 对齐 logits 直接决定 Viterbi 硬时长，整段强制 FP32：autocast 下 .float() 挡不住 bmm / conv 被降精度
         with torch.autocast(mel.device.type, enabled=False):
-            T_max = text_emb.shape[1]
-            pos_pe = self._sinusoidal_pos(T_max, self.d_text, text_emb.device, torch.float32)[None, :, :]
-            t_in = (text_emb.float() + 0.15 * pos_pe) * text_mask[:, :, None]
+            t_in = text_emb.float() * text_mask[:, :, None].to(torch.float32)
             m_in = mel.float() * mel_mask[:, None, :].to(torch.float32) if mel_mask is not None else mel.float()
             keys = F.normalize(self.key_proj(t_in.transpose(1, 2)), dim=1)
             queries = F.normalize(self.query_proj(m_in), dim=1)
             logits = torch.bmm(queries.transpose(1, 2), keys) * self.scale
             if attn_log_prior is not None:
-                logits = logits + attn_log_prior.float()
+                logits = logits + self.prior_weight * attn_log_prior.float()
             logits = logits.masked_fill(~text_mask[:, None, :], -1e4)
             return F.log_softmax(logits, dim=-1), torch.softmax(logits, dim=-1)
 
@@ -2277,20 +2284,29 @@ class AetherAcousticModel(nn.Module):
         loss_align = forward_sum_loss(attn_logprob, text_lens, mel_lens)
         attn_hard, dur_gt = viterbi_monotonic_alignment(attn_logprob, text_lens, mel_lens)
 
-        # 平滑软硬对齐退火（0.15 -> 0.30 线性过渡至纯 STE 硬对齐，消除硬跳变震荡）
+        with torch.no_grad():
+            dur1_ratio = (((dur_gt == 1) & text_mask).float().sum() / text_mask.sum().clamp(min=1))
+            dur_max = (dur_gt * text_mask).max().float()
+
+        # 延迟软硬对齐退火（0.30 -> 0.50 线性过渡至纯 STE 硬对齐）：先让 Forward-Sum 充分锁定对角线，避免早期硬路径锁死坍缩
         attn_ste = attn_hard + (attn_soft - attn_soft.detach())
-        if (not self.training) or step_ratio >= 0.30:
+        if (not self.training) or step_ratio >= 0.50:
+            hard_alpha = 1.0
             attn_use = attn_ste
-        elif step_ratio <= 0.15:
+        elif step_ratio <= 0.30:
+            hard_alpha = 0.0
             attn_use = attn_soft
         else:
-            alpha = (step_ratio - 0.15) / 0.15
-            attn_use = (1.0 - alpha) * attn_soft + alpha * attn_ste
+            hard_alpha = (step_ratio - 0.30) / 0.20
+            attn_use = (1.0 - hard_alpha) * attn_soft + hard_alpha * attn_ste
 
-        h_frame = (torch.bmm(attn_use.to(h_txt.dtype), h_txt) + self._frame_phase_embed(dur_gt, F_max, h_txt.dtype)) * mel_mask[:, :, None].to(h_txt.dtype)
+        # 软对齐热身期温和衰减 dur_gt 相位特征，迫使解码器依赖真实音素内容对齐而非靠长段相位偷懒糊谱
+        phase_w = 1.0 if (not self.training) else (0.2 + 0.8 * hard_alpha)
+        h_frame = (torch.bmm(attn_use.to(h_txt.dtype), h_txt) + phase_w * self._frame_phase_embed(dur_gt, F_max, h_txt.dtype)) * mel_mask[:, :, None].to(h_txt.dtype)
 
         loss_bin = -(attn_hard * attn_logprob * mel_mask[:, :, None]).sum() / mel_mask.sum().clamp(min=1)
-        bin_weight = 0.0 if step_ratio < 0.15 else min(1.0, (step_ratio - 0.15) / 0.25)
+        # 二值化退火推迟至 0.30->0.60 且带防坍缩动态熔断：若 dur==1 > 35%，立即关停 loss_bin 绝不强化错误硬路径
+        bin_weight = 0.0 if (step_ratio < 0.30 or dur1_ratio.item() > 0.35) else min(1.0, (step_ratio - 0.30) / 0.30)
 
         # 对 dur_predictor 输入做 0.1x 梯度缩放（防止早期离散 Viterbi 时长噪声冲刷文本主干）
         h_dur_in = h_txt.detach() + 0.1 * (h_txt - h_txt.detach())
@@ -2315,8 +2331,8 @@ class AetherAcousticModel(nn.Module):
         loss_uv = (F.binary_cross_entropy_with_logits(uv_logit.float(), uv_gt.float(), reduction="none") * mel_mask).sum() / mel_mask.sum().clamp(min=1)
         loss_energy = (F.l1_loss(energy_pred, energy_gt, reduction="none") * mel_mask).sum() / mel_mask.sum().clamp(min=1)
 
-        # 平滑递增预测特征 Scheduled Sampling（0.20 -> 0.70 线性升至 60% 概率；验证期 100% 用预测特征）
-        p_sched = 1.0 if (not self.training) else (0.0 if step_ratio < 0.20 else min(0.60, (step_ratio - 0.20) / 0.50 * 0.60))
+        # 预测特征 Scheduled Sampling 推迟至对齐稳定后（0.35 -> 0.80 线性升至 50%；验证期 100% 用预测特征）
+        p_sched = 1.0 if (not self.training) else (0.0 if step_ratio < 0.35 else min(0.50, (step_ratio - 0.35) / 0.45 * 0.50))
         use_pred = (not self.training) or (p_sched > 0.0 and torch.rand(1).item() < p_sched)
         f0_in = f0_pred.detach() if use_pred else f0_gt
         uv_in = uv_prob.detach() if use_pred else uv_gt.to(h_frame.dtype)
@@ -2326,6 +2342,7 @@ class AetherAcousticModel(nn.Module):
         loss_mel = (F.l1_loss(mel_pred, mel_gt, reduction="none") * mel_mask[:, None, :]).sum() / (mel_mask.sum().clamp(min=1) * self.n_mels)
         loss_struct = mel_structure_loss(mel_pred, mel_gt, mel_mask)
 
+        # Forward-Sum 对齐主权重提至 1.0，温和二值化权重降至 0.15（杜绝 loss_bin 盖过 CTC 锁死 Z 字坍缩）
         total_loss = (
             loss_mel
             + 0.35 * loss_struct
@@ -2333,8 +2350,8 @@ class AetherAcousticModel(nn.Module):
             + 0.35 * loss_f0
             + 0.25 * loss_uv
             + 0.25 * loss_energy
-            + 0.50 * loss_align
-            + 0.50 * bin_weight * loss_bin
+            + 1.00 * loss_align
+            + 0.15 * bin_weight * loss_bin
         )
         bos_ratio = (dur_gt[:, 0].float() / mel_lens.float().clamp(min=1)).mean().detach()
         return {
@@ -2343,6 +2360,7 @@ class AetherAcousticModel(nn.Module):
             "energy": loss_energy.detach(), "align": loss_align.detach(),
             "bin": loss_bin.detach(), "bos_ratio": bos_ratio,
             "dur_mae": dur_mae, "dur_rel": dur_rel, "len_ratio": len_ratio,
+            "dur1_ratio": dur1_ratio, "dur_max": dur_max,
         }
 
     @torch.no_grad()
@@ -2520,7 +2538,7 @@ class CausalHarmonicSource(nn.Module):
         self.pitch_norm = nn.LayerNorm(hid)
         self.pitch_out = nn.Linear(hid, 2)
         with torch.no_grad():
-            self.pitch_out.bias[0] = math.log(210.0)
+            self.pitch_out.bias[0] = math.log(220.0)
             self.pitch_out.bias[1] = 1.0
         feat_dim = n_harmonics * 2 + 2
         self.in_proj = nn.Linear(feat_dim, dim)
@@ -2530,29 +2548,36 @@ class CausalHarmonicSource(nn.Module):
         self.register_buffer("harm_orders", torch.arange(1, n_harmonics + 1, dtype=torch.float64)[None, None, :], persistent=False)
 
     def _oscillate(self, log_f0_pred: torch.Tensor, uv_logit: torch.Tensor, out_dtype: torch.dtype, phi_init: torch.Tensor = None):
-        uv_prob = torch.sigmoid(uv_logit)
-        f0_hz = torch.exp(log_f0_pred.float().clamp(min=math.log(55.0), max=math.log(620.0)))
-        delta_phi = f0_hz.double() * (float(self.hop_length) / float(self.sample_rate))
-        csum = torch.cumsum(delta_phi, dim=1)
-        if phi_init is not None:
-            csum = phi_init + csum
-        phi = csum.fmod(1.0)
-        new_phi = phi[:, -1:] if phi.shape[1] > 0 else (phi_init if phi_init is not None else torch.zeros(log_f0_pred.shape[0], 1, device=log_f0_pred.device, dtype=torch.float64))
-        angles = (2.0 * math.pi * phi.unsqueeze(-1) * self.harm_orders).to(torch.float32)
-        harms = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1) * uv_prob.float().unsqueeze(-1)
-        f0_norm = ((log_f0_pred.float() - 5.3) / 0.5).unsqueeze(-1)
-        w = self.in_proj.weight
-        p_dtype = w.dtype if isinstance(w, torch.Tensor) else torch.float32
-        feats = torch.cat([harms, f0_norm, uv_prob.float().unsqueeze(-1)], dim=-1).to(p_dtype)
+        # ★ a7 关键修复：相位积分与 12 阶谐波正余弦整段置于 no_grad() 中彻底截断对 log_f0_pred / uv_logit 的反向传播！
+        # 否则 GAN/Mel 梯度经 sin(2π·12·cumsum(exp(log_f0))) 放大 ~10^4 倍反冲 pitch_out，会把女声基频打偏整整一个八度产生电音分层。
+        # in_proj / head_proj 仍在梯度图内，正常学习如何融合精准基频谐波。
+        with torch.no_grad():
+            f0_in = log_f0_pred.detach().float()
+            uv_prob = torch.sigmoid(uv_logit.detach().float())
+            f0_hz = torch.exp(f0_in.clamp(min=math.log(55.0), max=math.log(620.0)))
+            delta_phi = f0_hz.double() * (float(self.hop_length) / float(self.sample_rate))
+            csum = torch.cumsum(delta_phi, dim=1)
+            if phi_init is not None:
+                csum = phi_init + csum
+            phi = csum.fmod(1.0)
+            new_phi = phi[:, -1:] if phi.shape[1] > 0 else (phi_init if phi_init is not None else torch.zeros(f0_in.shape[0], 1, device=f0_in.device, dtype=torch.float64))
+            angles = (2.0 * math.pi * phi.unsqueeze(-1) * self.harm_orders).to(torch.float32)
+            harms = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1) * uv_prob.unsqueeze(-1)
+            f0_norm = ((f0_in - 5.3) / 0.5).unsqueeze(-1)
+            w = self.in_proj.weight
+            p_dtype = w.dtype if isinstance(w, torch.Tensor) else torch.float32
+            feats = torch.cat([harms, f0_norm, uv_prob.unsqueeze(-1)], dim=-1).to(p_dtype)
         return self.in_proj(feats).to(out_dtype), self.head_proj(feats).to(out_dtype), new_phi
 
-    def forward(self, h: torch.Tensor):
+    def forward(self, h: torch.Tensor, f0_override: torch.Tensor = None, uv_override: torch.Tensor = None):
         p_hid = F.silu(self.pitch_norm(self.pitch_conv(h.transpose(1, 2)).transpose(1, 2)))
-        # 基频头强制 FP32：bf16 的 log_f0 量化一步 ≈ 54 音分，稳态元音期间参考谐波相位会随时间漂移
+        # 基频头强制 FP32：bf16/fp16 的 log_f0 量化会导致稳态元音期间参考谐波相位漂移
         with torch.autocast(h.device.type, enabled=False):
             p_out = self.pitch_out(p_hid.float())
         log_f0_pred, uv_logit = p_out[..., 0], p_out[..., 1]
-        harm_in, harm_head, _ = self._oscillate(log_f0_pred, uv_logit, h.dtype, phi_init=None)
+        osc_f0 = f0_override if f0_override is not None else log_f0_pred
+        osc_uv = (uv_override.float() * 10.0 - 5.0) if uv_override is not None else uv_logit
+        harm_in, harm_head, _ = self._oscillate(osc_f0, osc_uv, h.dtype, phi_init=None)
         return harm_in, harm_head, log_f0_pred, uv_logit
 
     def init_state(self, batch_size: int, device, dtype):
@@ -2599,10 +2624,10 @@ class CausalVocosLite(nn.Module):
     def _norm_input(self, mel: torch.Tensor) -> torch.Tensor:
         return (mel - self.mel_mean.to(mel.dtype)) / self.mel_std.to(mel.dtype)
 
-    def forward_with_aux(self, mel: torch.Tensor):
+    def forward_with_aux(self, mel: torch.Tensor, f0_override: torch.Tensor = None, uv_override: torch.Tensor = None):
         x = self._norm_input(mel)
         h = self.norm_in(self.embed(x).transpose(1, 2))
-        harm_in, harm_head, log_f0_pred, uv_logit = self.harm_source(h)
+        harm_in, harm_head, log_f0_pred, uv_logit = self.harm_source(h, f0_override=f0_override, uv_override=uv_override)
         h = h + harm_in
         for blk in self.blocks:
             h = blk(h)
@@ -2693,7 +2718,7 @@ class SpecDisc(nn.Module):
 
     def forward(self, x: torch.Tensor):
         spec = torch.stft(x.float(), self.n_fft, self.hop, self.n_fft, self.win, return_complex=True).abs()
-        h = spec.clamp(min=1e-5).pow(0.3).transpose(1, 2).unsqueeze(1).to(x.dtype)
+        h = spec.clamp(min=1e-4).pow(0.3).transpose(1, 2).unsqueeze(1).to(x.dtype)
         fmap = []
         for i, conv in enumerate(self.convs):
             h = conv(h)
@@ -2936,24 +2961,26 @@ def run_chunk_attn_parallel_and_long_stream_tests():
     print(f"  [PASS] {'ChunkAttn Parallel+LongRoPE':26s} | Fwd: {fwd_diff:.2e} | Grad: {pgrad_diff:.2e} | T=605 Diff: {long_diff:.2e}")
 
 def run_autocast_precision_tests():
-    """训练实际数值配置（CUDA + bf16 autocast）门禁：对齐器 / GDN 分块扫描 / 谐波源基频头 / iSTFT 头不得被 autocast 降精度。
+    """训练实际数值配置（Ampere+ BF16 / T4 原生 FP16 autocast）门禁：对齐器 / GDN 分块扫描 / 谐波源基频头 / iSTFT 头不得被 autocast 降精度。
     CPU fp32 门禁覆盖不到这条路径——训练时这些敏感段正是跑在 autocast 里的。"""
-    if not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()):
-        print(f"  [SKIP] {'Autocast Precision':26s} | 无 CUDA bf16（训练不走 autocast，CPU fp32 门禁已覆盖）")
+    if not torch.cuda.is_available():
+        print(f"  [SKIP] {'Autocast Precision':26s} | 无 CUDA（训练不走 autocast，CPU fp32 门禁已覆盖）")
         return
     dev = torch.device("cuda")
+    amp_dt = torch.bfloat16 if _supports_native_bf16() else torch.float16
+    amp_name = "bf16" if amp_dt == torch.bfloat16 else "fp16"
     tf32_mm, tf32_cudnn = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False  # 门禁期间关 TF32，隔离出纯 autocast 影响
     try:
         torch.manual_seed(0)
 
         def _ac():
-            return torch.autocast("cuda", dtype=torch.bfloat16)
+            return torch.autocast("cuda", dtype=amp_dt)
 
         with torch.no_grad():
             with _ac():
                 probe = torch.bmm(torch.randn(4, 4, 4, device=dev), torch.randn(4, 4, 4, device=dev))
-            assert probe.dtype == torch.bfloat16, "autocast 未生效，门禁无意义"
+            assert probe.dtype == amp_dt, f"autocast ({amp_name}) 未生效，门禁无意义"
 
             # 1) 对齐器：autocast 开 / 关必须得到同一份 logits（它们直接决定 Viterbi 硬时长）
             enc = AlignmentEncoder(n_mels=100, d_text=256, d_attn=80).to(dev).eval()
@@ -2989,9 +3016,9 @@ def run_autocast_precision_tests():
             voc.set_mel_stats(torch.linspace(-7.0, -3.0, 100), torch.linspace(1.5, 2.5, 100))
             with _ac():
                 wav_amp, f0_amp, _ = voc.forward_with_aux(torch.randn(2, 100, 50, device=dev) * 2.0 - 5.0)
-            on_bf16_grid = (f0_amp.to(torch.bfloat16).float() == f0_amp).float().mean().item()
+            on_amp_grid = (f0_amp.to(amp_dt).float() == f0_amp).float().mean().item()
             assert f0_amp.dtype == torch.float32 and wav_amp.dtype == torch.float32, f"vocoder sensitive heads downcast: f0={f0_amp.dtype} wav={wav_amp.dtype}"
-            assert torch.isfinite(wav_amp).all() and on_bf16_grid < 0.05, f"log_f0 quantized to bf16 grid: {on_bf16_grid:.1%}"
+            assert torch.isfinite(wav_amp).all() and on_amp_grid < 0.05, f"log_f0 quantized to {amp_name} grid: {on_amp_grid:.1%}"
 
         # 4) 主力 E3：autocast 下并行训练路径 vs 逐块串行 / 流式路径只应相差 bf16 舍入量级，且无 NaN / Inf
         torch.manual_seed(7)
@@ -3005,7 +3032,7 @@ def run_autocast_precision_tests():
             assert torch.isfinite(y_par[valid]).all(), "E3 non-finite output under autocast"
             e3_rel = (y_par.float() - y_seq.float()).abs().max().item() / (y_par.float()[valid].abs().max().item() + 1e-6)
             assert e3_rel < 0.1, f"E3 parallel/sequential drift under autocast too large: {e3_rel:.3f}"
-        print(f"  [PASS] {'Autocast Precision':26s} | Aligner Δ={al_diff:.1e} | GDN Δ={gdn_y:.1e} | log_f0 on bf16 grid={on_bf16_grid:.1%} | E3 par/seq rel={e3_rel:.3f}")
+        print(f"  [PASS] {'Autocast Precision':26s} | dtype={amp_name} | Aligner Δ={al_diff:.1e} | GDN Δ={gdn_y:.1e} | log_f0 on {amp_name}={on_amp_grid:.1%} | E3 par/seq rel={e3_rel:.3f}")
     finally:
         torch.backends.cuda.matmul.allow_tf32 = tf32_mm
         torch.backends.cudnn.allow_tf32 = tf32_cudnn
@@ -3137,11 +3164,39 @@ def run_architecture_and_streaming_tests():
         )
         assert vdiff < 1e-4, f"Vocoder Harmonic+OLA mismatch: {vdiff}"
 
-        # 验证 SpecDisc 转置后输出维度正常（确保 (B,1,T,F) 下 73-bin 频率感受野无形状异常）
+        # 验证 SpecDisc 转置后输出维度正常（确保 (B,1,T,F) 下 97-bin 频率感受野无形状异常）
         disc = LiteVocoderDiscriminator().eval()
         ro, fo, _, _ = disc(wav_off, wav_off)
         assert len(ro) == 8 and all(torch.isfinite(r).all() for r in ro)
-        print(f"  [PASS] {'CausalVocosLite+Harm (a5)':26s} | ★ ACTIVE | {count_params_m(voc):.2f}M | Adaptive(6->16) OLA Diff: {vdiff:.2e}")
+
+        # a7 新增硬门禁 1：Aligner 防 Z 字型坍缩先验界（跨句偏离对角线的先验惩罚必须严格大于余弦全量程 2*scale）
+        enc_gate = AlignmentEncoder()
+        p_gate = build_beta_binomial_log_prior(torch.tensor([25]), torch.tensor([229]), 25, 229, scaling=1.0)[0]
+        edge_pen = enc_gate.prior_weight * (p_gate[114, 12] - p_gate[114, 2]).item()
+        max_cos_swing = 2.0 * enc_gate.scale
+        assert edge_pen > max_cos_swing, f"Aligner prior edge penalty ({edge_pen:.2f}) <= cosine swing ({max_cos_swing:.2f}), Z-collapse possible!"
+        assert not hasattr(enc_gate, "_sinusoidal_pos"), "AlignmentEncoder must not inject absolute pos_pe"
+
+        print(f"  [PASS] {'Aligner Anti-Collapse (a7)':26s} | edge_pen={edge_pen:.2f} > cos_swing={max_cos_swing:.2f} | prior_w={enc_gate.prior_weight} | no_pos_pe")
+        print(f"  [PASS] {'CausalVocosLite+Harm (a7)':26s} | ★ ACTIVE | {count_params_m(voc):.2f}M | Adaptive(6->16) OLA Diff: {vdiff:.2e}")
+
+    # a7 新增硬门禁 2：CausalHarmonicSource 梯度隔离校验（波形/GAN 梯度绝不可经 cumsum(exp(log_f0)) 反冲 pitch_out！）
+    voc_g = CausalVocosLite(
+        n_mels=CFG["n_mels"], n_fft=CFG["n_fft"], hop_length=CFG["hop_length"],
+        lookahead=CFG["vocoder_lookahead"], sample_rate=CFG["sample_rate"],
+    ).train()
+    voc_g.set_mel_stats(torch.linspace(-7.0, -3.0, CFG["n_mels"]), torch.linspace(1.5, 2.5, CFG["n_mels"]))
+    mel_g = torch.randn(2, CFG["n_mels"], 32) * 2.0 - 5.0
+    wav_g, vf0_g, _ = voc_g.forward_with_aux(mel_g)
+    wav_g.pow(2).mean().backward()
+    assert voc_g.harm_source.pitch_out.weight.grad is None, "BUG: waveform/GAN gradient leaked into pitch_out through _oscillate!"
+    assert voc_g.harm_source.in_proj.weight.grad is not None and voc_g.harm_source.in_proj.weight.grad.abs().sum().item() > 0.0
+    assert voc_g.harm_source.head_proj.weight.grad is not None and voc_g.harm_source.head_proj.weight.grad.abs().sum().item() > 0.0
+    voc_g.zero_grad()
+    _, vf0_g2, _ = voc_g.forward_with_aux(mel_g)
+    F.l1_loss(vf0_g2, torch.full_like(vf0_g2, 5.48)).backward()
+    assert voc_g.harm_source.pitch_out.weight.grad is not None and voc_g.harm_source.pitch_out.weight.grad.abs().sum().item() > 0.0
+    print(f"  [PASS] {'Harmonic Pitch Grad Iso':26s} | wav->pitch_out grad=0 | wav->proj grad>0 | loss_vf0->pitch_out grad>0")
     print("=" * 72)
 
 
@@ -3922,7 +3977,8 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
     scaler = torch.amp.GradScaler("cuda", enabled=(DEVICE.type == "cuda" and AMP_DTYPE == torch.float16))
 
     history = {"steps": [], "train_loss": [], "val_mel": [], "val_struct": [], "val_dur": [], "val_f0": [], "val_uv": [],
-               "val_infer_mel": [], "val_infer_score": [], "val_dur_mae": [], "val_dur_rel": [], "val_len_ratio": [], "elapsed_min": 0.0}
+               "val_infer_mel": [], "val_infer_score": [], "val_dur_mae": [], "val_dur_rel": [], "val_len_ratio": [],
+               "val_dur1_pct": [], "val_dur_max": [], "elapsed_min": 0.0}
     best_val_mel = float("inf")
     # best.pt 选模分（推理路径 mel L1 + 相对时长误差）及其分量；teacher-forced 的 best_val_mel 仅作记录
     best_val_infer, best_val_infer_mel, best_val_dur_rel = float("inf"), float("inf"), float("inf")
@@ -4056,8 +4112,8 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
                 if step % 100 == 0:
                     pbar.set_postfix(
                         loss=f"{loss.item():.3f}", mel=f"{out['mel'].item():.3f}",
-                        strc=f"{out['struct'].item():.3f}", dur=f"{out['dur'].item():.3f}",
-                        f0=f"{out['f0'].item():.3f}", uv=f"{out['uv'].item():.3f}",
+                        dur=f"{out['dur'].item():.3f}", f0=f"{out['f0'].item():.3f}",
+                        d1=f"{out['dur1_ratio'].item():.0%}", dmax=f"{int(out['dur_max'].item())}",
                     )
 
                 if _STOP_REQUESTED:
@@ -4069,6 +4125,7 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
                     model.eval()
                     v_mel, v_strc, v_dur, v_f0, v_uv, v_bos, v_cnt = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0
                     v_infer_mel, v_dur_mae, v_dur_rel, v_len_ratio = 0.0, 0.0, 0.0, 0.0
+                    v_dur1, v_dur_max = 0.0, 0.0
                     with torch.no_grad():
                         for vp, vl, vb, vtl, vm, vf0, ve, vuv, vml in val_loader:
                             vp, vl, vb, vtl = vp.to(DEVICE), vl.to(DEVICE), vb.to(DEVICE), vtl.to(DEVICE)
@@ -4081,14 +4138,15 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
                             v_dur += vo["dur"].item(); v_f0 += vo["f0"].item(); v_uv += vo["uv"].item()
                             v_bos += vo["bos_ratio"].item()
                             v_dur_mae += vo["dur_mae"].item(); v_dur_rel += vo["dur_rel"].item(); v_len_ratio += vo["len_ratio"].item()
+                            v_dur1 += vo["dur1_ratio"].item(); v_dur_max = max(v_dur_max, vo["dur_max"].item())
                             # 真实推理路径（预测时长 + 预测 F0/UV/Energy 全走 infer_offline）的 mel L1
                             v_infer_mel += _infer_mel_l1(vp, vl, vb, vtl, vm, vml).item(); v_cnt += 1
                     d_cnt = max(v_cnt, 1)
                     v_mel /= d_cnt; v_strc /= d_cnt; v_dur /= d_cnt; v_f0 /= d_cnt; v_uv /= d_cnt; v_bos /= d_cnt
-                    v_infer_mel /= d_cnt; v_dur_mae /= d_cnt; v_dur_rel /= d_cnt; v_len_ratio /= d_cnt
-                    # best.pt 选模分 = 推理路径 mel L1 + 相对时长误差（后者含整体语速偏快 / 偏慢），越低越好。
-                    # teacher-forced 的 val_mel 用 GT 谱上的 Viterbi 对齐，衡量不到真实推理质量，只记录不选模
-                    v_infer_score = v_infer_mel + v_dur_rel
+                    v_infer_mel /= d_cnt; v_dur_mae /= d_cnt; v_dur_rel /= d_cnt; v_len_ratio /= d_cnt; v_dur1 /= d_cnt
+                    # best.pt 选模分 = 推理路径 mel L1 + 相对时长误差 + 防坍缩惩罚（dur==1 > 30% 时重罚，杜绝选中坍缩权重）
+                    collapse_pen = 2.0 * max(0.0, v_dur1 - 0.30)
+                    v_infer_score = v_infer_mel + v_dur_rel + collapse_pen
                     history["steps"].append(step)
                     history["train_loss"].append(round(loss.item(), 4))
                     history["val_mel"].append(round(v_mel, 4))
@@ -4102,6 +4160,14 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
                     history.setdefault("val_dur_mae", []).append(round(v_dur_mae, 3))
                     history.setdefault("val_dur_rel", []).append(round(v_dur_rel, 4))
                     history.setdefault("val_len_ratio", []).append(round(v_len_ratio, 4))
+                    history.setdefault("val_dur1_pct", []).append(round(v_dur1, 4))
+                    history.setdefault("val_dur_max", []).append(round(v_dur_max, 1))
+                    _warn_c = "  [WARN: ALIGNER COLLAPSE!]" if v_dur1 > 0.35 else ""
+                    print(
+                        f"\n  [Val step={step:5d}] mel={v_mel:.4f} | infer_mel={v_infer_mel:.4f} | dur_rel={v_dur_rel:.3f} | "
+                        f"len_ratio={v_len_ratio:.3f} | f0={v_f0:.3f} | dur1={v_dur1:.1%} | dur_max={v_dur_max:.0f}{_warn_c}",
+                        flush=True,
+                    )
                     last_val = {"mel": v_mel, "infer_mel": v_infer_mel, "dur_rel": v_dur_rel, "infer_score": v_infer_score}
 
                     if not math.isnan(v_infer_score) and v_infer_score < best_val_infer:
@@ -4269,9 +4335,9 @@ def train_or_load_causal_vocoder(primary_acoustic_model: AetherAcousticModel = N
         save_progress_status("vocoder", {"status": "done_cached", "step": total_steps, "total_steps": total_steps})
         return voc.eval()
 
-    # Ampere+/4090 用 BF16，T4/V100 等非 BF16 GPU 用 FP16 + 独立双 GradScaler 激活 Tensor Core（iSTFT/基频头/振荡器/STFT 损失内部保持 FP32/FP64）
+    # Ampere+/4090 用原生 BF16，T4/V100 (sm_75/70) 强制走原生 FP16 Tensor Core + 独立双 GradScaler（规避 PyTorch 2.5+ 慢速软件模拟 BF16）
     voc_amp_enabled = (DEVICE.type == "cuda")
-    voc_amp_dtype = torch.bfloat16 if (voc_amp_enabled and torch.cuda.is_bf16_supported()) else torch.float16
+    voc_amp_dtype = torch.bfloat16 if _supports_native_bf16() else torch.float16
     use_voc_fp16 = (voc_amp_enabled and voc_amp_dtype == torch.float16)
     scaler_g = torch.amp.GradScaler("cuda", enabled=use_voc_fp16)
     scaler_d = torch.amp.GradScaler("cuda", enabled=use_voc_fp16)
@@ -4299,12 +4365,20 @@ def train_or_load_causal_vocoder(primary_acoustic_model: AetherAcousticModel = N
         print(f"  -> 从 step={step}/{total_steps} 无缝继续训练！")
 
     gta_dir = None
-    gta_prob = float(CFG.get("vocoder_gta_prob", 0.5))
+    gta_prob = float(CFG.get("vocoder_gta_prob", 0.35))
+    # 声学对齐健康门控：若主力声学模型发生 dur==1 > 35% 坍缩，自动禁用 GTA 混合以防糊谱污染声码器
+    _primary_hist = TRAIN_HISTORIES.get("E3_chunk_attn_C4_L8") or (next(iter(TRAIN_HISTORIES.values())) if TRAIN_HISTORIES else {})
+    _d1_list = _primary_hist.get("val_dur1_pct") or []
+    if _d1_list and min(_d1_list) > 0.35:
+        print(f"[GTA Gate Warn] 检测到声学模型最小 dur==1 比例为 {min(_d1_list):.1%} (>35%)，自动禁用 GTA 混合以保护声码器音质！", flush=True)
+        gta_prob = 0.0
     if primary_acoustic_model is not None and gta_prob > 0.0 and s2_steps > 0:
         gta_dir = build_gta_mel_cache(primary_acoustic_model, DATASET_META["train"], VOC_LOCAL_DIR / "gta_mels")
+    # Stage 2 前 40% 先用纯真声 Mel 做 GAN 对抗锁死自然谐波与相位，后 60% 再切入 GTA 混合做闭环适应
+    gta_start_step = s1_steps + int(s2_steps * 0.40) if gta_dir is not None else total_steps + 1
 
     voc_seg_frames = 64  # 16,384 采样点 (~0.68s)，与官方 Vocos 24kHz 一致，兼顾低频覆盖与 T4/4090 训练吞吐
-    voc_bs = 24 if GPU_MEM_GB >= 22 else min(16, CFG["batch_size"])
+    voc_bs = 24 if GPU_MEM_GB >= 22 else (16 if GPU_MEM_GB >= 14 else 8)
     drop_l = len(DATASET_META["train"]) >= voc_bs
     voc_loader_s1 = DataLoader(
         VocoderDataset(DATASET_META["train"], seg_frames=voc_seg_frames, gta_dir=None, gta_prob=0.0),
@@ -4318,11 +4392,16 @@ def train_or_load_causal_vocoder(primary_acoustic_model: AetherAcousticModel = N
     )
     mel_gpu = VocosCompatibleMel(CFG["sample_rate"], CFG["n_fft"], CFG["hop_length"], CFG["n_mels"]).to(DEVICE)
     amp_tag = ("bf16" if voc_amp_dtype == torch.bfloat16 else "fp16+GradScaler") if voc_amp_enabled else "fp32"
-    print(f"[Vocoder Config] bs={voc_bs} | seg_frames={voc_seg_frames} ({voc_seg_frames * CFG['hop_length']} samples) | amp={amp_tag} | Stage1={s1_steps}, Stage2={s2_steps}", flush=True)
+    print(f"[Vocoder Config] bs={voc_bs} | seg_frames={voc_seg_frames} ({voc_seg_frames * CFG['hop_length']} samples) | amp={amp_tag} | Stage1={s1_steps}, Stage2={s2_steps} (GTA@{gta_start_step}, p={gta_prob:.2f})", flush=True)
 
+    voc_hist_storage = VOC_STORAGE_DIR / "history.json"
+    voc_hist_local = VOC_LOCAL_DIR / "history.json"
+    voc_history = json.loads(voc_hist_storage.read_text(encoding="utf-8")) if (step > 0 and voc_hist_storage.exists()) else {
+        "steps": [], "stft": [], "mel": [], "vf0": [], "vuv": [], "adv": [], "loss_d": []
+    }
     t0 = time.time()
     last_backup_t = time.time()
-    pbar = tqdm(total=total_steps, initial=step, desc="Train CausalVocosLite+Harm (Stage1->GAN+GTA)")
+    pbar = tqdm(total=total_steps, initial=step, desc="Train CausalVocosLite+Harm (Stage1->GAN->GAN+GTA)")
 
     def _backup_voc(cur_step: int, is_final: bool = False):
         nonlocal last_backup_t
@@ -4335,6 +4414,8 @@ def train_or_load_causal_vocoder(primary_acoustic_model: AetherAcousticModel = N
         }
         atomic_torch_save(payload, latest_local)
         sync_file_to_storage(latest_local, latest_storage)
+        atomic_write_text(json.dumps(voc_history, indent=2), voc_hist_local)
+        sync_file_to_storage(voc_hist_local, voc_hist_storage)
         if is_final:
             atomic_torch_save(voc.state_dict(), final_local)
             sync_file_to_storage(final_local, final_storage)
@@ -4353,12 +4434,13 @@ def train_or_load_causal_vocoder(primary_acoustic_model: AetherAcousticModel = N
 
     try:
         while step < total_steps:
-            cur_loader = voc_loader_s2 if step >= s1_steps else voc_loader_s1
+            use_gta_now = (gta_dir is not None) and (step >= gta_start_step)
+            cur_loader = voc_loader_s2 if use_gta_now else voc_loader_s1
             for mel_seg, f0_seg, uv_seg, wav_gt in cur_loader:
                 if step >= total_steps:
                     break
-                # 若本轮中跨越了 s1_steps 边界，立即跳出切换到带 GTA 混合的 voc_loader_s2！
-                if (cur_loader is voc_loader_s1) and (step >= s1_steps):
+                # 跨越 gta_start_step 边界时立即跳出切换到带 GTA 混合的 voc_loader_s2
+                if (cur_loader is voc_loader_s1) and (gta_dir is not None) and (step >= gta_start_step):
                     break
 
                 mel_seg = mel_seg.to(DEVICE, non_blocking=True)
@@ -4367,16 +4449,31 @@ def train_or_load_causal_vocoder(primary_acoustic_model: AetherAcousticModel = N
                 wav_gt = wav_gt.to(DEVICE, non_blocking=True)
                 in_gan = step >= s1_steps
 
+                # 谐波振荡器 F0 Scheduled Sampling：Stage 1 50% 用真声 F0 帮助 in_proj/head_proj 对齐真谐波，
+                # Stage 2 前半段线性衰减 40% -> 0%，后半段 100% 用预测 F0 做到训推零落差
+                if not in_gan:
+                    p_gt_f0 = 0.50
+                else:
+                    s2_prog = float(step - s1_steps) / float(max(1, s2_steps))
+                    p_gt_f0 = max(0.0, 0.40 * (1.0 - s2_prog / 0.50))
+                use_gt_f0 = (p_gt_f0 > 0.0 and random.random() < p_gt_f0)
+
                 with torch.amp.autocast("cuda", dtype=voc_amp_dtype, enabled=voc_amp_enabled):
-                    wav_pred, vf0_pred, vuv_logit = voc.forward_with_aux(mel_seg)
+                    wav_pred, vf0_pred, vuv_logit = voc.forward_with_aux(
+                        mel_seg,
+                        f0_override=(f0_seg if use_gt_f0 else None),
+                        uv_override=(uv_seg if use_gt_f0 else None),
+                    )
                 L_min = min(wav_pred.shape[-1], wav_gt.shape[-1])
                 wav_pred, wav_gt = wav_pred[:, :L_min], wav_gt[:, :L_min]
 
+                loss_d_val = 0.0
                 if in_gan:
                     opt_d.zero_grad(set_to_none=True)
                     with torch.amp.autocast("cuda", dtype=voc_amp_dtype, enabled=voc_amp_enabled):
                         ro, fo, _, _ = disc(wav_gt, wav_pred.detach())
                         loss_d = sum(torch.mean((r.float() - 1.0) ** 2) + torch.mean(f.float() ** 2) for r, f in zip(ro, fo))
+                    loss_d_val = float(loss_d.item())
                     scaler_d.scale(loss_d).backward()
                     scaler_d.unscale_(opt_d)
                     torch.nn.utils.clip_grad_norm_(disc.parameters(), 1.0)
@@ -4387,12 +4484,13 @@ def train_or_load_causal_vocoder(primary_acoustic_model: AetherAcousticModel = N
                 opt_g.zero_grad(set_to_none=True)
                 loss_stft = multi_res_stft_loss(wav_pred, wav_gt)
                 loss_mel = F.l1_loss(mel_gpu(wav_pred), mel_gpu(wav_gt))
-                # 显式监督帧率谐波振荡器的基频与清浊音头，确保稳态元音相位精准锁频
+                # 独立监督帧率谐波振荡器的基频与清浊音头（_oscillate 已截断反向梯度，pitch_out 纯由本项精准锁频）
                 v_mask = uv_seg > 0.5
                 loss_vf0 = (F.l1_loss(vf0_pred.float(), f0_seg.float(), reduction="none") * v_mask).sum() / v_mask.sum().clamp(min=1)
                 loss_vuv = F.binary_cross_entropy_with_logits(vuv_logit.float(), uv_seg.float())
-                loss_pitch_osc = loss_vf0 + 0.5 * loss_vuv
+                loss_pitch_osc = 3.0 * loss_vf0 + 1.0 * loss_vuv
 
+                loss_adv_val = 0.0
                 if in_gan:
                     # G-step 临时冻结判别器参数 + real 分支关梯度，跳过无用的判别器权重梯度 dw 与 real 激活图分配（数学 100% 等价）
                     for _p in disc.parameters():
@@ -4406,8 +4504,9 @@ def train_or_load_causal_vocoder(primary_acoustic_model: AetherAcousticModel = N
                                 for rf_l, ff_l in zip(rfmaps, ffmaps)
                                 for rf, ff in zip(rf_l[:-1], ff_l[:-1])
                             )
-                        # Stage 2 将 Mel L1 权重适度下调至 15.0，防止频谱均值损失压死转置 SpecDisc 与 MPD 的高频纹理梯度
-                        loss_g = 2.0 * loss_stft + 15.0 * loss_mel + loss_adv + 2.0 * loss_fm + 1.0 * loss_pitch_osc
+                        loss_adv_val = float(loss_adv.item())
+                        # Stage 2 恢复高保真 Mel L1 权重至 35.0（接近官方 Vocos 45.0），兼顾低频谱重建精度与 MRD/MPD 高频纹理
+                        loss_g = 1.0 * loss_stft + 35.0 * loss_mel + loss_adv + 2.0 * loss_fm + 1.0 * loss_pitch_osc
                         scaler_g.scale(loss_g).backward()
                     finally:
                         for _p in disc.parameters():
@@ -4425,9 +4524,24 @@ def train_or_load_causal_vocoder(primary_acoustic_model: AetherAcousticModel = N
                 step += 1
                 pbar.update(1)
                 if step % 200 == 0 or step == total_steps:
+                    st_name = "GAN+GTA" if (in_gan and gta_dir is not None and step >= gta_start_step) else ("GAN" if in_gan else "SPEC")
                     pbar.set_postfix(
-                        stage="GAN+GTA" if (in_gan and gta_dir is not None) else ("GAN" if in_gan else "SPEC"),
-                        stft=f"{loss_stft.item():.3f}", mel=f"{loss_mel.item():.3f}", f0=f"{loss_vf0.item():.3f}",
+                        stage=st_name,
+                        stft=f"{loss_stft.item():.3f}", mel=f"{loss_mel.item():.3f}",
+                        vf0=f"{loss_vf0.item():.3f}", d=f"{loss_d_val:.2f}",
+                    )
+                if step % 1000 == 0 or step == total_steps:
+                    voc_history["steps"].append(step)
+                    voc_history["stft"].append(round(loss_stft.item(), 4))
+                    voc_history["mel"].append(round(loss_mel.item(), 4))
+                    voc_history["vf0"].append(round(loss_vf0.item(), 4))
+                    voc_history["vuv"].append(round(loss_vuv.item(), 4))
+                    voc_history["adv"].append(round(loss_adv_val, 4))
+                    voc_history["loss_d"].append(round(loss_d_val, 4))
+                    print(
+                        f"\n  [Voc step={step:5d}] stage={st_name} | stft={loss_stft.item():.3f} | mel={loss_mel.item():.3f} | "
+                        f"vf0={loss_vf0.item():.3f} | vuv={loss_vuv.item():.3f} | adv={loss_adv_val:.3f} | d={loss_d_val:.3f}",
+                        flush=True,
                     )
 
                 if _STOP_REQUESTED:
@@ -4988,7 +5102,7 @@ LEADERBOARD.to_json(report_local / "leaderboard.json", orient="records", force_a
 PER_SAMPLE_DF.to_csv(report_local / "per_sample_scores.csv", index=False)
 sync_dir_to_storage(report_local, report_storage)
 
-print("\n================ AetherTTS Phase 1 (a5) 评测报告 ================")
+print(f"\n================ AetherTTS Phase 1 ({ARCH_TAG}) 评测报告 ================")
 _in_nb = False
 try:
     from IPython import get_ipython
@@ -5029,7 +5143,7 @@ for exp_name, hist in TRAIN_HISTORIES.items():
             ax.plot(hist["steps"], hist["val_f0"], linestyle="--", alpha=0.7, label=f"{exp_name} (voiced f0)")
         if hist.get("val_infer_mel"):
             # 真实推理路径 mel L1：best.pt 的选模分量（另有 dur_rel 相加）
-            ax.plot(hist["steps"], hist["val_infer_mel"], marker="^", markersize=3, label=f"{exp_name} (infer mel, best.pt 选模分量)")
+            ax.plot(hist["steps"], hist["val_infer_mel"], marker="^", markersize=3, label=f"{exp_name} (infer mel, best.pt)")
 ax.set_title("Validation Mel & Voiced F0 L1 Convergence")
 ax.set_xlabel("Steps"); ax.set_ylabel("Validation L1"); ax.grid(True, alpha=0.3); ax.legend(fontsize=8)
 

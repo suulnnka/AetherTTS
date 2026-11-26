@@ -43,7 +43,10 @@ def find_checkpoint(root: Path, model_name: str, profile: str, dataset: str, exp
         assert p.exists(), f"指定 checkpoint 不存在: {p}"
         return p
     runs_dir = root / "runs"
-    cands = sorted(runs_dir.glob(f"{model_name}_{dataset}_{profile}_a6*")) if runs_dir.exists() else []
+    cands = (
+        sorted(runs_dir.glob(f"{model_name}_{dataset}_{profile}_a7*"))
+        or sorted(runs_dir.glob(f"{model_name}_{dataset}_{profile}_a6*"))
+    ) if runs_dir.exists() else []
     if not cands and runs_dir.exists():
         cands = sorted(runs_dir.glob(f"{model_name}_{dataset}_{profile}_*")) or sorted(runs_dir.glob(f"{model_name}*"))
     for d in reversed(cands):
@@ -61,7 +64,8 @@ def find_vocoder_ckpt(root: Path, profile: str, dataset: str, explicit: str = ""
     if not voc_dir.exists():
         return None
     cands = (
-        sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_a6*"))
+        sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_a7*"))
+        or sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_a6*"))
         or sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_*"))
         or sorted(voc_dir.glob("causal_vocos_lite_*"))
     )
