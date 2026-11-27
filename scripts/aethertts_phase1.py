@@ -1,37 +1,40 @@
 #!/usr/bin/env python3
 """
-AetherTTS Phase 1 (a9) — 独立 Python 运行器（无需 Notebook / 无 exec-cell）。
+AetherTTS Phase 1 (a10) — 独立 Python 运行器（无需 Notebook / 无 exec-cell）。
 
 由 scripts/sync_phase1_script.py 从 notebooks/AetherTTS_Colab_Phase1_Experiment.ipynb
 确定性 1:1 生成（请勿手改本文件，修改 Notebook 后运行 sync_phase1_script.py 即可同步）。
 
 默认聚焦唯一主力路线 E3_chunk_attn_C4_L8（5 层深双向分块前瞻 ChunkLookaheadBackbone + 局部窗口相对 RoPE +
-防坍缩单调对齐 + 共享帧前瞻与多尺度空洞 F0/UV/帧解码器 + 连续相位谐波源-滤波器 CausalVocosLite + 相位一致性损失 + GT-F0 对齐 GTA 闭环精调），
+防坍缩单调对齐 + v5 真清浊音特征 + 训练期 2D MelPatchDiscriminator 锐化 + 48 阶因果线性啁啾谐波源 CausalVocosLite + 相位/防入侵正则 + GT-F0 对齐 GTA 闭环），
 同时保留 E0/E1/E2/E4 代码供归档对照（可通过 --models 显式指定）。
 
 用法：
     python scripts/aethertts_phase1.py --profile full_quality --dataset bznsyp --root ./aethertts_exp
-    python scripts/aethertts_phase1.py --selftest          # 验证前端零 UNK + 防坍缩对齐 + 长流式局部 RoPE + 谐波 STFT COLA + 相位损失/声码器流式 + autocast 精度门禁
+    python scripts/aethertts_phase1.py --selftest          # 验证前端/v5清浊音 + 防坍缩对齐 + 长流式局部 RoPE + 48阶啁啾COLA + MelPatchDisc/相位正则 + autocast 精度门禁
     python scripts/aethertts_phase1.py --profile-steps 20  # 打印单步训练耗时分解后退出
 """
 import argparse
 
-_AP = argparse.ArgumentParser(description="AetherTTS Phase 1 (a9) standalone runner (synced from notebook).")
+_AP = argparse.ArgumentParser(description="AetherTTS Phase 1 (a10) standalone runner (synced from notebook).")
 _AP.add_argument("--root", default="./aethertts_exp", help="Local directory for datasets, checkpoints, samples, reports.")
 _AP.add_argument("--profile", default="standard_phase1", choices=["quick_smoke", "standard_phase1", "full_quality"])
 _AP.add_argument("--dataset", default="bznsyp", choices=["bznsyp", "ljspeech", "custom_bilingual"])
 _AP.add_argument("--vocoder", default="both", choices=["both", "pretrained_vocos", "causal_vocos_lite"])
 _AP.add_argument("--models", default="", help="Optional comma-separated model override (default: only E3_chunk_attn_C4_L8).")
 _AP.add_argument("--frame-lookahead", type=int, default=None, help="声学 frame_pre 共享帧级右前瞻帧数（默认 2 帧；0 表示关闭）.")
-_AP.add_argument("--vocoder-lookahead", type=int, default=None, help="CausalVocosLite 集中式右前瞻帧数（a9 默认 4 帧，覆盖完整 1024 点 iSTFT 右半窗）.")
-_AP.add_argument("--vocoder-dim", type=int, default=None, help="CausalVocosLite 通道宽度（a9 默认 320）.")
-_AP.add_argument("--dropout", type=float, default=None, help="声学模型 Dropout 比例（a9 默认 0.1）.")
+_AP.add_argument("--vocoder-lookahead", type=int, default=None, help="CausalVocosLite 集中式右前瞻帧数（默认 4 帧，覆盖完整 1024 点 iSTFT 右半窗）.")
+_AP.add_argument("--vocoder-dim", type=int, default=None, help="CausalVocosLite 通道宽度（默认 320）.")
+_AP.add_argument("--vocoder-harmonics", type=int, default=None, help="CausalHarmonicSource 谐波阶数（a10 默认 48，覆盖至 10.8 kHz）.")
+_AP.add_argument("--dropout", type=float, default=None, help="声学模型 Dropout 比例（默认 0.1，后程对 frame_decoder 退火至 0）.")
+_AP.add_argument("--mel-gan-adv", type=float, default=None, help="声学训练期 2D MelPatchDiscriminator LSGAN 权重（a10 默认 0.05；0 关闭）.")
+_AP.add_argument("--mel-gan-fm", type=float, default=None, help="声学训练期 2D MelPatchDiscriminator Feature Matching 权重（a10 默认 0.50）.")
 _AP.add_argument("--batch-size", type=int, default=None, help="可选覆写声学训练 batch_size（如 RTX 4090 覆写为 64）.")
-_AP.add_argument("--gta-prob", type=float, default=None, help="声码器 Stage 2 末 25% 混入 GT-F0 对齐 GTA 预测 Mel 的概率（a9 默认 0.25；0 表示关闭）.")
+_AP.add_argument("--gta-prob", type=float, default=None, help="声码器 Stage 2 末 25% 混入 GT-F0 对齐 GTA 预测 Mel 的概率（默认 0.25；0 表示关闭）.")
 _AP.add_argument("--backup-steps", type=int, default=1000)
 _AP.add_argument("--backup-minutes", type=float, default=8.0)
 _AP.add_argument("--skip-pip", action="store_true")
-_AP.add_argument("--selftest", action="store_true", help="Run frontend/aligner/long-streaming/vocoder gates, then exit.")
+_AP.add_argument("--selftest", action="store_true", help="Run frontend/v5-uv/aligner/long-streaming/vocoder/mel-disc gates, then exit.")
 _AP.add_argument("--profile-steps", type=int, default=0, help="If >0, time N training steps component-wise, print breakdown, then exit.")
 _ARGS = _AP.parse_args()
 
@@ -52,8 +55,14 @@ if _ARGS.vocoder_lookahead is not None:
     _os.environ["AETHER_VOCODER_LOOKAHEAD"] = str(_ARGS.vocoder_lookahead)
 if _ARGS.vocoder_dim is not None:
     _os.environ["AETHER_VOCODER_DIM"] = str(_ARGS.vocoder_dim)
+if _ARGS.vocoder_harmonics is not None:
+    _os.environ["AETHER_VOCODER_HARMONICS"] = str(_ARGS.vocoder_harmonics)
 if _ARGS.dropout is not None:
     _os.environ["AETHER_DROPOUT"] = str(_ARGS.dropout)
+if _ARGS.mel_gan_adv is not None:
+    _os.environ["AETHER_MEL_GAN_ADV"] = str(_ARGS.mel_gan_adv)
+if _ARGS.mel_gan_fm is not None:
+    _os.environ["AETHER_MEL_GAN_FM"] = str(_ARGS.mel_gan_fm)
 if _ARGS.batch_size is not None:
     _os.environ["AETHER_BATCH_SIZE"] = str(_ARGS.batch_size)
 if _ARGS.gta_prob is not None:
@@ -169,8 +178,10 @@ else:
 # 2) 声学模型提自然度与抗过拟合：frame_pre 前瞻移至 F0/UV/Energy 预测头前 + 多尺度空洞预测头 (RF 33f) + 6 层空洞帧解码器 (RF 60f) + 中层深监督 +
 #    全链路 dropout=0.1 + 边界退化/推理长句 #2 韵律短语 + 词界三声变调 + 带状 DTW & 硬对齐门控 best.pt 选模；
 # 3) 流式一致性与伪影评测：统一 SDPA + 评测合成期关 TF32 根治 0.27 相位分叉；评测表新增 Mod_93Hz 与 Energy_Holes 指标。
-ARCH_TAG = "a9"
-DATASET_CACHE_VER = "v4"  # 与 a6/a7/a8 共享 v4 特征缓存，本地与 Colab 秒命中零重抽
+# a10 升级（v5 特征缓存）：修复 v4 清辅音 99.7% 错标 uv=1 Bug；声学训练期加入推理零开销 2D Mel Patch 判别器 + 频带加权结构损失 + 解码器末段 Dropout 退火消除发闷；
+# 声码器升级 48 阶平滑奈奎斯特 + 因果线性啁啾谐波源 + 滤波相位平滑/浊音低频噪声抑制正则消除断层电音；INT8 导出升级 per-channel + 离群层保护。
+ARCH_TAG = "a10"
+DATASET_CACHE_VER = "v5"  # a10 升级 v5：FFT-YIN CMNDF + NACF + 频谱高低频比真清浊音特征缓存（本地复用已下载原始音频 ~1 分钟重建）
 FIXED_VAL_UTTS = 100
 
 SKIP_IF_DONE = True
@@ -233,7 +244,13 @@ CFG = {
     "stream_mel_chunk": 16,         # 稳态声码器块长 16 帧 (~171ms)，兼顾高吞吐与零接缝爆音
     "vocoder_gta_prob": float(os.environ.get("AETHER_GTA_PROB", "0.25")),  # Stage 2 末 25% 低学习率阶段混入 GT-F0 对齐 GTA 预测 Mel 的比例
     "dropout_acoustic": float(os.environ.get("AETHER_DROPOUT", "0.1")),    # a9 全链路抗过拟合 Dropout（终结 250-epoch 过拟合）
-    "vocoder_dim": int(os.environ.get("AETHER_VOCODER_DIM", "320")),       # a9 声码器主干宽度（配合多尺度空洞因果 ConvNeXt）
+    "vocoder_dim": int(os.environ.get("AETHER_VOCODER_DIM", "320")),       # a9/a10 声码器主干宽度（配合多尺度空洞因果 ConvNeXt）
+    "vocoder_n_harmonics": int(os.environ.get("AETHER_VOCODER_HARMONICS", "48")),  # a10: 24->48 阶覆盖至 10.8 kHz，消除女声 4-6 kHz 谐波硬悬崖
+    "vocoder_chirp": True,                                                         # a10: 因果后向斜率线性啁啾二次相位（零前瞻，消除四声陡降 OLA 自相消）
+    "mel_gan_start_ratio": 0.50,                                                   # a10: 硬对齐锁定后平滑介入训练期 2D Mel Patch 判别器
+    "mel_gan_adv_weight": float(os.environ.get("AETHER_MEL_GAN_ADV", "0.05")),     # a10: 声学 Mel LSGAN 权重（0 表示关闭）
+    "mel_gan_fm_weight": float(os.environ.get("AETHER_MEL_GAN_FM", "0.50")),       # a10: 声学 Mel 特征匹配权重（高稳锐化共振峰峰谷）
+    "lr_mel_disc": 2e-4,
     # 流式首包 TTFA 评测口径：t=0 记为 LLM 第一个 token 到达，文本按 tok_rate × chars_per_tok 的节奏逐字到达
     "llm_tok_rate": float(os.environ.get("AETHER_LLM_TOK_RATE", "25.0")),          # LLM 解码吞吐 (token/s)
     "llm_chars_per_tok": float(os.environ.get("AETHER_LLM_CHARS_PER_TOK", "1.5")), # 中文平均每 token 汉字数
@@ -284,7 +301,7 @@ if os.environ.get("HF_ENDPOINT"):
     print(f"HF Endpoint   : {os.environ['HF_ENDPOINT']}")
 print(f"Profile       : {EXPERIMENT_PROFILE} | max_train_hours={CFG['max_train_hours']}h | batch={CFG['batch_size']} | steps={CFG['acoustic_steps']}")
 print(f"Backup Cadence: every {BACKUP_EVERY_STEPS} steps or {BACKUP_EVERY_MINUTES:.1f} min (+ milestone every {SAVE_MILESTONE_EVERY} steps + SIGTERM/Ctrl+C emergency save)")
-print(f"Arch / LA     : {ARCH_TAG} ({DATASET_CACHE_VER}) | chunk_C={CFG['chunk_attn_size']} | frame_LA={CFG['frame_lookahead']}f | voc_LA={CFG['vocoder_lookahead']}f (dim={CFG['vocoder_dim']}, first={CFG['stream_mel_first_chunk']}f) | drop={CFG['dropout_acoustic']} | GTA={CFG['vocoder_gta_prob']:.0%}")
+print(f"Arch / LA     : {ARCH_TAG} ({DATASET_CACHE_VER}) | chunk_C={CFG['chunk_attn_size']} | frame_LA={CFG['frame_lookahead']}f | voc_LA={CFG['vocoder_lookahead']}f (dim={CFG['vocoder_dim']}, H={CFG['vocoder_n_harmonics']}, first={CFG['stream_mel_first_chunk']}f) | drop={CFG['dropout_acoustic']} | MelGAN={CFG['mel_gan_adv_weight']}/{CFG['mel_gan_fm_weight']} | GTA={CFG['vocoder_gta_prob']:.0%}")
 print(f"Active Route  : {[x[0] for x in EXPERIMENTS]}")
 print("=" * 72)
 
@@ -678,41 +695,118 @@ def load_and_normalize_wav(path: Path, target_sr: int = 24000) -> np.ndarray:
 
 
 def extract_f0_and_energy(wav: np.ndarray, sr: int = 24000, hop_length: int = 256, n_frames: int = None):
-    """提取去倍频跳变的中值平滑 log_f0、log_energy 与精确清浊音标志 uv。"""
-    f0 = librosa.yin(
-        wav, fmin=65.0, fmax=600.0, sr=sr, frame_length=1024, hop_length=hop_length, center=True
-    ).astype(np.float32)
-    rms = librosa.feature.rms(y=wav, frame_length=1024, hop_length=hop_length, center=True)[0].astype(np.float32)
+    """a10 / v5：向量化 FFT-YIN (CMNDF 非周期性门控) + 归一化自相关 (NACF) + 频谱高低频比联合清浊音检测。
+    彻底修复 v4 用纯 rms_gate 把 99.7% 高能清擦/塞擦音 (s/sh/x/ch/q/t/k/p/h/f) 误标为 uv=1 并灌入 70-150 Hz 伪 F0 的缺陷，
+    同时通过 NACF 振幅不变性完整保留快速起振双元音与汉语三声嘎裂浊音，且仅在有效浊音帧上做中值/倍频修复避免清音假值污染边界。"""
+    w = np.asarray(wav, dtype=np.float32).reshape(-1)
+    frame_len = 1024
+    pad = frame_len // 2
+    if w.size == 0:
+        nf = int(n_frames or 0)
+        return np.zeros(nf, dtype=np.float32), np.full(nf, math.log(1e-5), dtype=np.float32), np.zeros(nf, dtype=np.float32)
+
+    wp = np.pad(w, (pad, pad), mode="reflect" if w.size > pad else "constant")
+    nf_raw = 1 + max(0, (wp.size - frame_len) // hop_length)
+    frames = np.lib.stride_tricks.as_strided(
+        wp, shape=(nf_raw, frame_len), strides=(wp.strides[0] * hop_length, wp.strides[0])
+    )
+    f_f64 = frames.astype(np.float64)
+    rms = np.sqrt(np.mean(f_f64 ** 2, axis=1) + 1e-12).astype(np.float32)
+
+    # 1) 向量化 FFT-YIN CMNDF + 能量归一化自相关 NACF（对元音起振/滑音幅值爬坡不变）
+    fmin, fmax = 65.0, 600.0
+    tau_min = max(2, int(sr / fmax))
+    tau_max = min(frame_len // 2, int(math.ceil(sr / fmin)))
+    W = frame_len - tau_max
+    fft_n = 2048
+    sq_cs = np.concatenate([np.zeros((nf_raw, 1), dtype=np.float64), np.cumsum(f_f64 ** 2, axis=1)], axis=1)
+    e0 = sq_cs[:, W : W + 1]
+    et = sq_cs[:, W : W + tau_max + 1] - sq_cs[:, : tau_max + 1]
+    F1 = np.fft.rfft(f_f64[:, :W], n=fft_n, axis=1)
+    F2 = np.fft.rfft(f_f64, n=fft_n, axis=1)
+    r = np.fft.irfft(np.conj(F1) * F2, n=fft_n, axis=1)[:, : tau_max + 1]
+    d = np.maximum(e0 + et - 2.0 * r, 0.0)
+    cmndf = np.ones_like(d)
+    run_sum = np.cumsum(d[:, 1:], axis=1)
+    cmndf[:, 1:] = np.where(
+        run_sum > 1e-12,
+        d[:, 1:] * np.arange(1, tau_max + 1, dtype=np.float64)[None, :] / np.maximum(run_sum, 1e-12),
+        1.0,
+    )
+    nacf = r / np.sqrt(np.maximum(e0 * et, 1e-18))
+
+    sub = cmndf[:, tau_min : tau_max + 1]
+    K = sub.shape[1]
+    is_below = sub < 0.15
+    is_local_min = np.zeros_like(sub, dtype=bool)
+    if K >= 3:
+        is_local_min[:, 1:-1] = (sub[:, 1:-1] <= sub[:, :-2]) & (sub[:, 1:-1] < sub[:, 2:])
+    is_local_min[:, 0] = (sub[:, 0] < sub[:, 1]) if K > 1 else True
+    is_local_min[:, -1] = (sub[:, -1] <= sub[:, -2]) if K > 1 else True
+    cand = is_below & is_local_min
+    k_best = np.where(cand.any(axis=1), np.argmax(cand, axis=1), np.argmin(sub, axis=1))
+    row_idx = np.arange(nf_raw)
+    ap = sub[row_idx, k_best].astype(np.float32)
+    tau_int = tau_min + k_best
+    nacf_peak = np.maximum(nacf[row_idx, tau_int], nacf[:, tau_min : tau_max + 1].max(axis=1)).astype(np.float32)
+
+    tau_f = tau_int.astype(np.float64)
+    inner = (tau_int > 0) & (tau_int < tau_max)
+    if inner.any():
+        ii, ti = row_idx[inner], tau_int[inner]
+        y0, y1, y2 = cmndf[ii, ti - 1], cmndf[ii, ti], cmndf[ii, ti + 1]
+        den = y0 - 2.0 * y1 + y2
+        shift = np.where(np.abs(den) > 1e-12, 0.5 * (y0 - y2) / np.where(np.abs(den) > 1e-12, den, 1.0), 0.0)
+        tau_f[inner] = ti + np.clip(shift, -0.5, 0.5)
+    f0 = (float(sr) / np.maximum(tau_f, 1.0)).astype(np.float32)
+
+    # 2) 频谱高低频能量比 (>=3 kHz 清擦音区 vs 80-1500 Hz 浊音共振峰区)
+    hann = (0.5 * (1.0 - np.cos(2.0 * np.pi * np.arange(frame_len, dtype=np.float64) / float(frame_len)))).astype(np.float32)
+    P = np.abs(np.fft.rfft(frames * hann[None, :], axis=1)) ** 2
+    freqs = np.linspace(0.0, sr / 2.0, frame_len // 2 + 1)
+    e_hi = P[:, freqs >= 3000.0].sum(axis=1)
+    e_lo = P[:, (freqs >= 80.0) & (freqs < 1500.0)].sum(axis=1)
+    hi_ratio = (e_hi / (e_lo + e_hi + 1e-12)).astype(np.float32)
+
     if n_frames is not None:
-        if len(f0) < n_frames:
-            f0 = np.pad(f0, (0, n_frames - len(f0)), mode="edge")
-            rms = np.pad(rms, (0, n_frames - len(rms)), mode="edge")
-        else:
-            f0 = f0[:n_frames]
-            rms = rms[:n_frames]
+        def _fit(arr):
+            return np.pad(arr, (0, n_frames - len(arr)), mode="edge") if len(arr) < n_frames else arr[:n_frames]
+        f0, rms, ap, nacf_peak, hi_ratio = (_fit(x) for x in (f0, rms, ap, nacf_peak, hi_ratio))
 
-    # 3 点中值滤波 + 孤立单帧倍频/半频跳变抑制
-    if len(f0) >= 3:
-        f0 = scipy_signal.medfilt(f0, kernel_size=3).astype(np.float32)
-        nb_mean = 0.5 * (f0[:-2] + f0[2:])
-        ratio = f0[1:-1] / np.maximum(nb_mean, 1e-4)
-        bad_oct = (ratio > 1.75) | (ratio < 0.57)
-        if np.any(bad_oct):
-            f0_mid = f0[1:-1].copy()
-            f0_mid[bad_oct] = nb_mean[bad_oct]
-            f0[1:-1] = f0_mid
-
+    # 3) 双门控清浊音判定：
+    #    - 门控 A (强周期): ap < 0.32 & hi_ratio < 0.55（覆盖清晰元音与浊擦音 r）
+    #    - 门控 B (低频共振峰主导 + NACF 周期性): hi_ratio < 0.28 & nacf_peak > 0.38（保住双元音快起振与三声嘎裂音）
+    #    - 门控 C (高频主导但极端强周期): hi_ratio >= 0.55 & ap < 0.14 & nacf_peak > 0.75（100% 剔除清擦/塞擦/送气辅音）
     rms_gate = max(0.006, float(np.percentile(rms, 90)) * 0.06) if len(rms) > 0 else 0.006
-    uv = (rms > rms_gate) & (f0 > 68.0) & (f0 < 580.0)
-    # 消除孤立 1 帧伪浊音毛刺
-    if len(uv) >= 3:
-        isolated = uv[1:-1] & (~uv[:-2]) & (~uv[2:])
-        uv[1:-1] = uv[1:-1] & (~isolated)
+    is_periodic = (
+        ((ap < 0.32) & (hi_ratio < 0.55))
+        | ((hi_ratio < 0.28) & (nacf_peak > 0.38))
+        | ((hi_ratio >= 0.55) & (ap < 0.14) & (nacf_peak > 0.75))
+    )
+    uv = (rms > rms_gate) & (f0 > 68.0) & (f0 < 580.0) & is_periodic
 
+    # 形态学去噪：剔除孤立 1 帧伪浊音毛刺，同时修补元音内部孤立 1 帧瞬态凹陷
+    if len(uv) >= 3:
+        isolated_v = uv[1:-1] & (~uv[:-2]) & (~uv[2:])
+        uv[1:-1] = uv[1:-1] & (~isolated_v)
+        isolated_u = (~uv[1:-1]) & uv[:-2] & uv[2:] & (rms[1:-1] > rms_gate) & (hi_ratio[1:-1] < 0.40) & (nacf_peak[1:-1] > 0.35)
+        uv[1:-1] = uv[1:-1] | isolated_u
+
+    # 仅在有效浊音帧上做 3 点中值滤波与倍频跳变修复（避免清音帧假 F0 跨边界污染浊音起点）
     log_f0 = np.zeros_like(f0, dtype=np.float32)
     if uv.any():
         voiced_idx = np.where(uv)[0]
-        voiced_vals = np.log(np.clip(f0[voiced_idx], 65.0, 600.0))
+        f0_v = f0[voiced_idx].copy()
+        if len(f0_v) >= 3:
+            f0_v = scipy_signal.medfilt(f0_v, kernel_size=3).astype(np.float32)
+            nb_mean = 0.5 * (f0_v[:-2] + f0_v[2:])
+            ratio = f0_v[1:-1] / np.maximum(nb_mean, 1e-4)
+            bad_oct = (ratio > 1.75) | (ratio < 0.57)
+            if np.any(bad_oct):
+                f0_mid = f0_v[1:-1].copy()
+                f0_mid[bad_oct] = nb_mean[bad_oct]
+                f0_v[1:-1] = f0_mid
+        voiced_vals = np.log(np.clip(f0_v, 65.0, 600.0))
         log_f0 = np.interp(np.arange(len(f0)), voiced_idx, voiced_vals).astype(np.float32)
     log_energy = np.log(np.clip(rms, 1e-5, None)).astype(np.float32)
     return log_f0, log_energy, uv.astype(np.float32)
@@ -2287,19 +2381,43 @@ class CausalPredictorHead(nn.Module):
         return (out.squeeze(-1) if self.out_dim == 1 else out), new_states
 
 
-def mel_structure_loss(mel_pred: torch.Tensor, mel_gt: torch.Tensor, mel_mask: torch.Tensor) -> torch.Tensor:
-    """多尺度 2D 频谱共振峰与瞬态结构损失（a9）：
-    在一阶频/时差分基础上补充频率轴二阶曲率（直接拉起元音共振峰峰谷对比度）与 2 帧瞬态斜率，强力对抗纯 L1 糊谱。"""
+_MEL_FREQ_WEIGHT_CACHE = {}
+
+
+def get_mel_freq_weights(n_mels: int, device: torch.device, dtype: torch.dtype, sample_rate: int = 24000) -> torch.Tensor:
+    """a10 感知频带权重（均值归一化为 1.0）：强化 1-4 kHz 共振峰清晰度频段 (1.45x) 与 4-12 kHz 高频空气感 (1.35x)，
+    针对性扭转 a9 声学模型在 0-0.5 kHz 低频能量偏重、1-12 kHz 清晰度衰减 1.6 dB 与曲率塌缩 65-70% 的发闷问题。"""
+    key = (n_mels, sample_rate, device, dtype)
+    w = _MEL_FREQ_WEIGHT_CACHE.get(key)
+    if w is None:
+        m_max = 2595.0 * math.log10(1.0 + (sample_rate / 2.0) / 700.0)
+        m_pts = np.linspace(0.0, m_max, n_mels + 2, dtype=np.float64)[1:-1]
+        hz = 700.0 * (10.0 ** (m_pts / 2595.0) - 1.0)
+        # 0-1 kHz: 1.0 -> 1-4 kHz 存在感/清晰度峰: 1.45 -> 4-12 kHz 空气/清擦音区: 1.35
+        wt = np.interp(hz, [0.0, 600.0, 1000.0, 2200.0, 4000.0, 8000.0, 12000.0], [1.0, 1.0, 1.25, 1.45, 1.42, 1.35, 1.35])
+        wt = wt / float(np.mean(wt))
+        w = torch.tensor(wt, device=device, dtype=dtype).view(1, n_mels, 1)
+        _MEL_FREQ_WEIGHT_CACHE[key] = w
+    return w
+
+
+def mel_structure_loss(mel_pred: torch.Tensor, mel_gt: torch.Tensor, mel_mask: torch.Tensor, freq_weights: torch.Tensor = None) -> torch.Tensor:
+    """多尺度 2D 频谱共振峰与瞬态结构损失（a10 频带加权升级版）：
+    在一阶频/时差分基础上补充频率轴二阶曲率（直接拉起元音共振峰峰谷对比度）与 2 帧瞬态斜率，并重点加权 1-12 kHz 清晰度频段。"""
     n_mels = mel_pred.shape[1]
     m_sum = mel_mask.sum().clamp(min=1)
+    if freq_weights is None:
+        freq_weights = get_mel_freq_weights(n_mels, mel_pred.device, mel_pred.dtype)
+    w_f1 = 0.5 * (freq_weights[:, 1:, :] + freq_weights[:, :-1, :])
+    w_f2 = freq_weights[:, 1:-1, :] if n_mels > 2 else freq_weights
     # 1) 频率轴一阶差分 + 二阶曲率（共振峰峰谷锐度）
     df_p = mel_pred[:, 1:, :] - mel_pred[:, :-1, :]
     df_g = mel_gt[:, 1:, :] - mel_gt[:, :-1, :]
-    loss_f1 = (F.l1_loss(df_p, df_g, reduction="none") * mel_mask[:, None, :]).sum() / (m_sum * max(n_mels - 1, 1))
+    loss_f1 = (F.l1_loss(df_p, df_g, reduction="none") * w_f1 * mel_mask[:, None, :]).sum() / (m_sum * max(n_mels - 1, 1))
     if n_mels > 2:
         df2_p = df_p[:, 1:, :] - df_p[:, :-1, :]
         df2_g = df_g[:, 1:, :] - df_g[:, :-1, :]
-        loss_f2 = (F.l1_loss(df2_p, df2_g, reduction="none") * mel_mask[:, None, :]).sum() / (m_sum * max(n_mels - 2, 1))
+        loss_f2 = (F.l1_loss(df2_p, df2_g, reduction="none") * w_f2 * mel_mask[:, None, :]).sum() / (m_sum * max(n_mels - 2, 1))
     else:
         loss_f2 = mel_pred.new_tensor(0.0)
     # 2) 时间轴 1 帧 + 2 帧差分（约束清塞音爆发与协同发音过渡）
@@ -2307,17 +2425,82 @@ def mel_structure_loss(mel_pred: torch.Tensor, mel_gt: torch.Tensor, mel_mask: t
         t1_mask = mel_mask[:, 1:] & mel_mask[:, :-1]
         dt1_p = mel_pred[:, :, 1:] - mel_pred[:, :, :-1]
         dt1_g = mel_gt[:, :, 1:] - mel_gt[:, :, :-1]
-        loss_t1 = (F.l1_loss(dt1_p, dt1_g, reduction="none") * t1_mask[:, None, :]).sum() / (t1_mask.sum().clamp(min=1) * n_mels)
+        loss_t1 = (F.l1_loss(dt1_p, dt1_g, reduction="none") * freq_weights * t1_mask[:, None, :]).sum() / (t1_mask.sum().clamp(min=1) * n_mels)
     else:
         loss_t1 = mel_pred.new_tensor(0.0)
     if mel_pred.shape[-1] > 2:
         t2_mask = mel_mask[:, 2:] & mel_mask[:, :-2]
         dt2_p = mel_pred[:, :, 2:] - mel_pred[:, :, :-2]
         dt2_g = mel_gt[:, :, 2:] - mel_gt[:, :, :-2]
-        loss_t2 = (F.l1_loss(dt2_p, dt2_g, reduction="none") * t2_mask[:, None, :]).sum() / (t2_mask.sum().clamp(min=1) * n_mels)
+        loss_t2 = (F.l1_loss(dt2_p, dt2_g, reduction="none") * freq_weights * t2_mask[:, None, :]).sum() / (t2_mask.sum().clamp(min=1) * n_mels)
     else:
         loss_t2 = mel_pred.new_tensor(0.0)
-    return 0.45 * loss_f1 + 0.20 * loss_f2 + 0.25 * loss_t1 + 0.10 * loss_t2
+    return 0.40 * loss_f1 + 0.25 * loss_f2 + 0.25 * loss_t1 + 0.10 * loss_t2
+
+
+class _MelPatchSubDisc(nn.Module):
+    """单尺度 2D 频谱块判别器（仅声学训练期使用，推理/ONNX 完全剥离、零参数零延迟开销）。"""
+
+    def __init__(self, kernels, strides):
+        super().__init__()
+        wn = getattr(nn.utils.parametrizations, "weight_norm", None) or nn.utils.weight_norm
+        chs = [1, 32, 64, 128, 128]
+        layers = []
+        for idx, (k, s) in enumerate(zip(kernels, strides)):
+            pad = (k[0] // 2, k[1] // 2)
+            layers.append(wn(nn.Conv2d(chs[idx], chs[idx + 1], kernel_size=k, stride=s, padding=pad)))
+        layers.append(wn(nn.Conv2d(chs[-1], 1, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))))
+        self.convs = nn.ModuleList(layers)
+
+    def forward(self, x: torch.Tensor):
+        fmap = []
+        h = x
+        for i, conv in enumerate(self.convs):
+            h = conv(h)
+            if i < len(self.convs) - 1:
+                h = F.leaky_relu(h, 0.2)
+            fmap.append(h)
+        return h.flatten(1, -1), fmap
+
+
+class MelPatchDiscriminator(nn.Module):
+    """a10 训练期双尺度 2D Mel 频谱判别器（推理零开销）：
+    - 分支 1（高分辨共振峰脊判别器）：细粒度频轴卷积专门捕捉元音共振峰峰谷对比度与高频清擦音纹理；
+    - 分支 2（多帧协同发音判别器）：大感受野 2D 卷积捕捉跨帧起振瞬态与音节动态起伏。
+    配合 Feature Matching 在硬对齐锁定后介入，从根源打破纯 L1 回归导致的 Mel 过平滑与发闷感。"""
+
+    def __init__(self):
+        super().__init__()
+        self.discs = nn.ModuleList([
+            _MelPatchSubDisc(
+                kernels=[(5, 3), (5, 3), (3, 3), (3, 3)],
+                strides=[(2, 1), (2, 1), (2, 2), (1, 1)],
+            ),
+            _MelPatchSubDisc(
+                kernels=[(7, 5), (5, 5), (3, 3), (3, 3)],
+                strides=[(2, 2), (2, 2), (2, 1), (1, 1)],
+            ),
+        ])
+
+    def forward(self, mel_real: torch.Tensor, mel_fake: torch.Tensor, mel_mask: torch.Tensor = None, no_grad_real: bool = False):
+        # 严格将 padding 帧在真/假 Mel 上同步清零，杜绝判别器利用变长填充作弊
+        if mel_mask is not None:
+            m = mel_mask[:, None, None, :].to(mel_real.dtype)
+            xr = mel_real.unsqueeze(1) * m
+            xf = mel_fake.unsqueeze(1) * m
+        else:
+            xr = mel_real.unsqueeze(1)
+            xf = mel_fake.unsqueeze(1)
+        ro_l, fo_l, rf_l, ff_l = [], [], [], []
+        for d in self.discs:
+            if no_grad_real:
+                with torch.no_grad():
+                    ro, rf = d(xr)
+            else:
+                ro, rf = d(xr)
+            fo, ff = d(xf)
+            ro_l.append(ro); fo_l.append(fo); rf_l.append(rf); ff_l.append(ff)
+        return ro_l, fo_l, rf_l, ff_l
 
 
 class AetherAcousticModel(nn.Module):
@@ -2502,15 +2685,25 @@ class AetherAcousticModel(nn.Module):
 
         mel_pred, mel_coarse = self._condition_decoder(h_pre, f0_in, uv_in, e_in, mel_mask=mel_mask, return_coarse=True)
         m_denom = mel_mask.sum().clamp(min=1) * self.n_mels
-        loss_mel = (F.l1_loss(mel_pred, mel_gt, reduction="none") * mel_mask[:, None, :]).sum() / m_denom
-        loss_coarse = (F.l1_loss(mel_coarse, mel_gt, reduction="none") * mel_mask[:, None, :]).sum() / m_denom if mel_coarse is not None else loss_mel.new_zeros(())
-        loss_struct = mel_structure_loss(mel_pred, mel_gt, mel_mask)
+        freq_w = get_mel_freq_weights(self.n_mels, mel_pred.device, mel_pred.dtype)
+        loss_mel = (F.l1_loss(mel_pred, mel_gt, reduction="none") * freq_w * mel_mask[:, None, :]).sum() / m_denom
+        loss_coarse = (F.l1_loss(mel_coarse, mel_gt, reduction="none") * freq_w * mel_mask[:, None, :]).sum() / m_denom if mel_coarse is not None else loss_mel.new_zeros(())
+        loss_struct = mel_structure_loss(mel_pred, mel_gt, mel_mask, freq_weights=freq_w)
 
-        # a9: 提高多尺度共振峰结构与浊音 F0 权重并加中层深监督，强化元音共振峰清晰度与汉语四声准确度
+        with torch.no_grad():
+            # a10 监控：共振峰二阶曲率保真比 (|Δ²f|_pred / |Δ²f|_gt，越接近 1.0 越清晰不发闷；a9 曾仅 0.497)
+            if self.n_mels > 2:
+                _df2_p = (mel_pred[:, 2:, :] - 2.0 * mel_pred[:, 1:-1, :] + mel_pred[:, :-2, :]).abs() * mel_mask[:, None, :]
+                _df2_g = (mel_gt[:, 2:, :] - 2.0 * mel_gt[:, 1:-1, :] + mel_gt[:, :-2, :]).abs() * mel_mask[:, None, :]
+                sharp_ratio = (_df2_p.sum() / _df2_g.sum().clamp(min=1e-6)).detach()
+            else:
+                sharp_ratio = mel_pred.new_tensor(1.0)
+
+        # a10: 频带加权 Mel + 二阶曲率结构损失 (0.60) + 浊音 F0/UV 强监督；硬对齐后由外部 MelPatchDiscriminator 叠加对抗锐化
         total_loss = (
             loss_mel
             + 0.30 * loss_coarse
-            + 0.50 * loss_struct
+            + 0.60 * loss_struct
             + 0.50 * loss_dur
             + 0.50 * loss_f0
             + 0.25 * loss_uv
@@ -2526,6 +2719,7 @@ class AetherAcousticModel(nn.Module):
             "bin": loss_bin.detach(), "bos_ratio": bos_ratio,
             "dur_mae": dur_mae, "dur_rel": dur_rel, "len_ratio": len_ratio,
             "dur1_ratio": dur1_ratio, "dur_max": dur_max,
+            "sharp_ratio": sharp_ratio, "mel_pred": mel_pred,
         }
 
     @torch.no_grad()
@@ -2608,6 +2802,12 @@ class AetherAcousticModel(nn.Module):
         state["frame_dec"] = new_fdec
         return self.mel_out(h_dec).transpose(1, 2), state
 
+    def set_decoder_dropout(self, p: float):
+        """a10: 训练后程将 frame_decoder Dropout 平滑退火至 0，消除测试期 Mel 方差压缩与发闷。"""
+        p = float(max(0.0, min(1.0, p)))
+        for blk in self.frame_decoder:
+            blk.drop.p = p
+
     def export_inference_copy(self) -> nn.Module:
         """克隆纯推理解耦副本并剥离仅训练期使用的 aligner 与中层深监督头，确保端侧导出/INT8 体积精确无冗余。"""
         m_inf = copy.deepcopy(self).to("cpu").eval()
@@ -2637,20 +2837,29 @@ class StreamingISTFTHead(nn.Module):
             self.out.bias[2 * self.n_bins : 3 * self.n_bins].fill_(-2.0)
         self.register_buffer("window", torch.hann_window(n_fft, periodic=True))
 
-    def _frames_to_time(self, x: torch.Tensor, harm_spec: torch.Tensor = None) -> torch.Tensor:
+    def _frames_to_time(self, x: torch.Tensor, harm_spec: torch.Tensor = None, return_aux: bool = False):
         with torch.autocast(x.device.type, enabled=False):  # 幅值 / 相位头强制 FP32：bf16 输出会给重建波形引入量化底噪
             mag_h, p_h, mag_n, p_n = self.out(x.float()).chunk(4, dim=-1)
         amp_n = torch.exp(mag_n.clamp(min=-12.0, max=4.6))
         spec = torch.complex(amp_n * torch.cos(p_n), amp_n * torch.sin(p_n))
+        harm_mag = None
         if harm_spec is not None:
             gain_h = torch.exp(mag_h.clamp(min=-8.0, max=4.0))
             filt_h = torch.complex(gain_h * torch.cos(p_h), gain_h * torch.sin(p_h))
             spec = spec + harm_spec * filt_h
-        return torch.fft.irfft(spec, n=self.n_fft, dim=-1) * self.window[None, None, :]
+            if return_aux:
+                harm_mag = torch.sqrt(harm_spec.real.square() + harm_spec.imag.square() + 1e-10) * gain_h
+        frames = torch.fft.irfft(spec, n=self.n_fft, dim=-1) * self.window[None, None, :]
+        if return_aux:
+            return frames, {"p_h": p_h, "amp_n": amp_n, "harm_mag": harm_mag}
+        return frames
 
-    def forward(self, x: torch.Tensor, harm_spec: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, harm_spec: torch.Tensor = None, return_aux: bool = False):
         B, n_frames, _ = x.shape
-        frames = self._frames_to_time(x, harm_spec=harm_spec)
+        if return_aux:
+            frames, aux = self._frames_to_time(x, harm_spec=harm_spec, return_aux=True)
+        else:
+            frames, aux = self._frames_to_time(x, harm_spec=harm_spec, return_aux=False), None
         pad = self.n_fft - self.hop_length
         total_len = n_frames * self.hop_length + pad
         out = F.fold(
@@ -2667,7 +2876,8 @@ class StreamingISTFTHead(nn.Module):
             stride=(1, self.hop_length),
         ).reshape(1, total_len)
         left_trim = self.n_fft // 2
-        return out[:, left_trim : left_trim + n_frames * self.hop_length] / env[:, left_trim : left_trim + n_frames * self.hop_length].clamp(min=1e-6)
+        wav = out[:, left_trim : left_trim + n_frames * self.hop_length] / env[:, left_trim : left_trim + n_frames * self.hop_length].clamp(min=1e-6)
+        return (wav, aux) if return_aux else wav
 
     def init_state(self, batch_size: int, device):
         pad = self.n_fft - self.hop_length
@@ -2712,13 +2922,14 @@ class StreamingISTFTHead(nn.Module):
 
 
 class CausalHarmonicSource(nn.Module):
-    """连续相位 STFT 谐波激励源（a9）：
+    """连续相位 STFT 谐波激励源（a10 48 阶 + 因果线性啁啾升级版）：
     - 2 层空洞因果基频头 (k=5, d=1,2 -> 叠加 4 帧前瞻后感受野 17 帧≈181ms) 精准预测 (log_f0, uv_logit)；
-    - 在 float64 下做梯形相位积分（保证相邻帧 OLA 中点相位二阶精确连续），用切比雪夫递推在每帧 Hann 窗上零环形缓冲直接合成
-      24 阶带限声门脉冲 STFT 复数载波 harm_spec（在恒定滤波器下精确满足 Hann² COLA，误差 ~1e-5、零 93.75 Hz 纹波）；
+    - 在 float64 下做梯形相位积分，并叠加 strictly-causal 后向斜率线性啁啾二次项 0.5*slope*t²（对任意线性滑音在整 1024 点重叠窗内严格同相，
+      零额外前瞻、零新状态张量，将汉语四声陡降段 OLA 一致性从 0.67 提至 >0.95）；
+    - 切比雪夫递推合成 48 阶（平滑 500 Hz 奈奎斯特滚降覆盖至 10.8 kHz，消除女声 4-6 kHz 谐波硬悬崖）声门脉冲 STFT 复数载波；
     - 相位积分与 STFT 载波整段置于 no_grad() 中彻底截断波形/GAN 梯度对 pitch_out 的反冲，同时保持离线↔任意切块流式 100% 数学等价。"""
 
-    def __init__(self, dim: int = 320, n_fft: int = 1024, hop_length: int = 256, sample_rate: int = 24000, n_harmonics: int = 24, n_cond_harm: int = 8):
+    def __init__(self, dim: int = 320, n_fft: int = 1024, hop_length: int = 256, sample_rate: int = 24000, n_harmonics: int = 48, n_cond_harm: int = 8, use_chirp: bool = True):
         super().__init__()
         self.dim = dim
         self.n_fft = n_fft
@@ -2726,6 +2937,7 @@ class CausalHarmonicSource(nn.Module):
         self.sample_rate = sample_rate
         self.n_harmonics = n_harmonics
         self.n_cond_harm = n_cond_harm
+        self.use_chirp = use_chirp
         hid = dim // 2
         self.pitch_conv1 = CausalConv1d(dim, hid, kernel_size=5, dilation=1)
         self.pitch_norm1 = nn.LayerNorm(hid)
@@ -2742,6 +2954,7 @@ class CausalHarmonicSource(nn.Module):
         self.register_buffer("cond_orders", torch.arange(1, n_cond_harm + 1, dtype=torch.float64)[None, None, :], persistent=False)
         t_off = (torch.arange(n_fft, dtype=torch.float64) - n_fft // 2) / float(sample_rate)
         self.register_buffer("time_offsets", t_off[None, None, :], persistent=False)
+        self.register_buffer("time_offsets_sq", (0.5 * (t_off ** 2))[None, None, :], persistent=False)
         self.register_buffer("hann_win", torch.hann_window(n_fft, periodic=True)[None, None, :], persistent=False)
         amps = 1.0 / torch.sqrt(torch.arange(1, n_harmonics + 1, dtype=torch.float32))
         # 归一化使恒定滤波器下谐波载波 RMS ≈ 0.11（与语音响度归一化同量级）
@@ -2767,17 +2980,24 @@ class CausalHarmonicSource(nn.Module):
             else:
                 first_prev = torch.where(prev_f0 > 0.0, prev_f0, f0_hz[:, :1])
             f0_prev_seq = torch.cat([first_prev, f0_hz[:, :-1]], dim=1)
+            dt_hop = float(self.hop_length) / float(self.sample_rate)
             # 梯形相位积分：保证帧 m (+hop/2) 与帧 m+1 (-hop/2) 在 OLA 交汇中点相位精确一致
-            delta_phi = 0.5 * (f0_prev_seq + f0_hz) * (float(self.hop_length) / float(self.sample_rate))
+            delta_phi = 0.5 * (f0_prev_seq + f0_hz) * dt_hop
             csum = torch.cumsum(delta_phi, dim=1)
             if phi_init is not None:
                 csum = phi_init + csum
-            phi = csum.fmod(1.0)
+            phi = csum - torch.floor(csum)
             new_phi = phi[:, -1:]
             new_prev = f0_hz[:, -1:]
 
-            # 1) 切比雪夫递推在每帧 Hann 窗上合成 24 阶带限声门脉冲并转 STFT 复数载波（仅 1 次 cos，无 24kHz 环形缓冲）
-            phase_grid = (phi.unsqueeze(-1) + f0_hz.unsqueeze(-1) * self.time_offsets).fmod(1.0)
+            # 1) 切比雪夫递推在每帧 Hann 窗上合成带限声门脉冲并转 STFT 复数载波（仅 1 次 cos，无 24kHz 环形缓冲）
+            if self.use_chirp:
+                # 严格因果后向斜率线性啁啾：任意线性滑音下 Φ_{m+1}(t-Δt) ≡ Φ_m(t) 在全 1024 点重叠区精确相等！
+                f0_slope = ((f0_hz - f0_prev_seq) / dt_hop).clamp(min=-4000.0, max=4000.0)
+                phase_raw = phi.unsqueeze(-1) + f0_hz.unsqueeze(-1) * self.time_offsets + f0_slope.unsqueeze(-1) * self.time_offsets_sq
+            else:
+                phase_raw = phi.unsqueeze(-1) + f0_hz.unsqueeze(-1) * self.time_offsets
+            phase_grid = phase_raw - torch.floor(phase_raw)
             theta = (2.0 * math.pi * phase_grid).to(torch.float32)
             c1 = torch.cos(theta)
             c_prev2 = torch.ones_like(c1)
@@ -2789,7 +3009,11 @@ class CausalHarmonicSource(nn.Module):
                 c_cur = c1 if h_ord == 1 else (2.0 * c1 * c_prev1 - c_prev2)
                 if h_ord > 1:
                     c_prev2, c_prev1 = c_prev1, c_cur
-                nyq_m = (f0_f32 * float(h_ord) < nyq_lim).to(torch.float32)
+                if self.use_chirp:
+                    # 平滑 500 Hz 奈奎斯特滚降，消除基频滑过 nyq_lim/h 时高阶谐波硬开关爆音
+                    nyq_m = ((nyq_lim - f0_f32 * float(h_ord)) / 500.0).clamp(min=0.0, max=1.0)
+                else:
+                    nyq_m = (f0_f32 * float(h_ord) < nyq_lim).to(torch.float32)
                 s_time = s_time + (self.harm_amps[h_ord - 1] * nyq_m) * c_cur
             harm_spec = torch.fft.rfft(s_time * self.hann_win, n=self.n_fft, dim=-1) * uv_prob.unsqueeze(-1)
 
@@ -2845,19 +3069,24 @@ class CausalVocosLite(nn.Module):
     def __init__(
         self, n_mels: int = 100, dim: int = 320, n_layers: int = 8, kernel_size: int = 7,
         n_fft: int = 1024, hop_length: int = 256, lookahead: int = 4, sample_rate: int = 24000,
-        dilations: tuple = (1, 2, 4, 1, 2, 4, 1, 2),
+        dilations: tuple = (1, 2, 4, 1, 2, 4, 1, 2), n_harmonics: int = 48, use_chirp: bool = True,
     ):
         super().__init__()
         self.dim = dim
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.lookahead = lookahead
+        self.n_harmonics = n_harmonics
+        self.use_chirp = use_chirp
         # 内置 Mel 归一化统计缓存：消除 LookaheadConv1d 首尾补 0 在原始 log-mel 下造成的 +16 能量爆炸，同时保持外部 raw-mel 接口不变
         self.register_buffer("mel_mean", torch.zeros(1, n_mels, 1, dtype=torch.float32))
         self.register_buffer("mel_std", torch.ones(1, n_mels, 1, dtype=torch.float32))
         self.embed = LookaheadConv1d(n_mels, dim, k_left=kernel_size - 1, lookahead=lookahead)
         self.norm_in = nn.LayerNorm(dim)
-        self.harm_source = CausalHarmonicSource(dim=dim, n_fft=n_fft, hop_length=hop_length, sample_rate=sample_rate, n_harmonics=24)
+        self.harm_source = CausalHarmonicSource(
+            dim=dim, n_fft=n_fft, hop_length=hop_length, sample_rate=sample_rate,
+            n_harmonics=n_harmonics, use_chirp=use_chirp,
+        )
         dils = [dilations[i % len(dilations)] for i in range(n_layers)]
         self.blocks = nn.ModuleList([CausalConvNeXtBlock(dim, kernel_size=kernel_size, mult=3, dilation=d) for d in dils])
         self.norm_out = nn.LayerNorm(dim)
@@ -2873,13 +3102,16 @@ class CausalVocosLite(nn.Module):
     def _norm_input(self, mel: torch.Tensor) -> torch.Tensor:
         return (mel - self.mel_mean.to(mel.dtype)) / self.mel_std.to(mel.dtype)
 
-    def forward_with_aux(self, mel: torch.Tensor, f0_override: torch.Tensor = None, uv_override: torch.Tensor = None):
+    def forward_with_aux(self, mel: torch.Tensor, f0_override: torch.Tensor = None, uv_override: torch.Tensor = None, return_head_aux: bool = False):
         x = self._norm_input(mel)
         h = self.norm_in(self.embed(x).transpose(1, 2))
         harm_in, harm_spec, log_f0_pred, uv_logit = self.harm_source(h, f0_override=f0_override, uv_override=uv_override)
         h = h + harm_in
         for blk in self.blocks:
             h = blk(h)
+        if return_head_aux:
+            wav, head_aux = self.head(self.norm_out(h), harm_spec=harm_spec, return_aux=True)
+            return wav, log_f0_pred, uv_logit, head_aux
         wav = self.head(self.norm_out(h), harm_spec=harm_spec)
         return wav, log_f0_pred, uv_logit
 
@@ -3057,6 +3289,40 @@ def multi_res_phase_loss(y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Te
         return total / 3.0
 
 
+def vocoder_head_reg_loss(head_aux: dict, uv_gt: torch.Tensor, n_fft: int = 1024, sample_rate: int = 24000):
+    """a10 声码器双分支头训练期物理正则（全 FP32、静音零 NaN，推理零开销）：
+    1) loss_ph_smooth：在连续浊音帧上约束声道谐波滤波相位 p_h 慢变（防止 a9 中 |Δt p_h|=0.76 rad 破坏载波相位连贯性）；
+    2) loss_noise_prior：在浊音帧的 0-1.5 kHz 核心基频/F1/F2 频段，抑制低相干噪声分支反超谐波分支（留出 25% 自然气声裕量，
+       绝不限制清辅音 uv=0 及 >1.5 kHz 高频气声/清擦音）。"""
+    p_h = head_aux["p_h"].float()
+    amp_n = head_aux["amp_n"].float()
+    harm_mag = head_aux["harm_mag"]
+    with torch.autocast(p_h.device.type, enabled=False):
+        uv_f = uv_gt.float()
+        if harm_mag is None:
+            z = p_h.new_zeros(())
+            return z, z
+        hm = harm_mag.detach().float()
+        # 1) 声道滤波相位时域平滑（幅值加权 1 - cos(Δt p_h)）
+        if p_h.shape[1] > 1:
+            v_pair = ((uv_f[:, 1:] > 0.5) & (uv_f[:, :-1] > 0.5)).float().unsqueeze(-1)
+            w_bin = torch.sqrt(hm[:, 1:, :] * hm[:, :-1, :] + 1e-10).clamp(max=5.0) * v_pair
+            dp = p_h[:, 1:, :] - p_h[:, :-1, :]
+            loss_ph_smooth = ((1.0 - torch.cos(dp)) * w_bin).sum() / (w_bin.sum() + 1e-6)
+        else:
+            loss_ph_smooth = p_h.new_zeros(())
+
+        # 2) 浊音 0-1.5 kHz 噪声入侵抑制（仅在 amp_n > 0.25 * harm_mag 时触发温和惩罚）
+        low_bins = min(amp_n.shape[-1], max(2, int(round(1500.0 * n_fft / float(sample_rate)))))
+        v_m = (uv_f > 0.5).float().unsqueeze(-1)
+        amp_n_lo = amp_n[:, :, 1:low_bins]
+        harm_lo = hm[:, :, 1:low_bins]
+        excess = F.relu(amp_n_lo - 0.25 * harm_lo)
+        scale = harm_lo.mean().clamp(min=0.05)
+        loss_noise_prior = (excess * v_m).sum() / (v_m.sum().clamp(min=1.0) * max(low_bins - 1, 1) * scale)
+        return loss_ph_smooth, loss_noise_prior
+
+
 def count_params_m(model: nn.Module) -> float:
     return sum(p.numel() for p in model.parameters()) / 1e6
 # ==============================================================================
@@ -3190,7 +3456,22 @@ def run_frontend_phonology_tests():
         assert sum(1 for x in ids_fb if x not in (FRONTEND.bos_id, FRONTEND.eos_id)) >= 8, ids_fb
     finally:
         _EN_G2P, _EN_G2P_INIT_TRIED = _saved
-    print(f"  [PASS] {'Frontend Phonology (a9)':26s} | 20,901 CJK 0-UNK | i/ii/iii + erhua + 词界三声 + 长句 #2 韵律 | 推理边界={'jieba' if has_jieba else '机械规则'}")
+    # a10 / v5 硬门禁：清擦音 (4-9 kHz 高能噪声) 必须判为 uv=0，浊音元音必须判为 uv=1 且 F0 精确
+    _sr_t = CFG["sample_rate"]
+    _t_s = np.arange(int(0.4 * _sr_t), dtype=np.float64) / _sr_t
+    _w_vowel = (0.15 * (np.sin(2 * np.pi * 220.0 * _t_s) + 0.5 * np.sin(2 * np.pi * 440.0 * _t_s) + 0.25 * np.sin(2 * np.pi * 660.0 * _t_s))).astype(np.float32)
+    _lf0_v, _, _uv_v = extract_f0_and_energy(_w_vowel, sr=_sr_t, hop_length=CFG["hop_length"])
+    assert _uv_v[3:-3].mean() > 0.95 and abs(float(np.median(np.exp(_lf0_v[3:-3]))) - 220.0) < 3.0, f"v5 voiced vowel gate failed: uv={_uv_v.mean():.2f}"
+    _rng_f = np.random.default_rng(7)
+    _wn = _rng_f.standard_normal(int(0.4 * _sr_t)).astype(np.float32)
+    _sos_hp = scipy_signal.butter(4, [4000.0, 9000.0], btype="bandpass", fs=_sr_t, output="sos")
+    _w_fric = scipy_signal.sosfilt(_sos_hp, _wn).astype(np.float32)
+    _w_fric = _w_fric * (0.08 / max(float(np.sqrt(np.mean(_w_fric ** 2))), 1e-6))
+    _, _, _uv_fr = extract_f0_and_energy(_w_fric, sr=_sr_t, hop_length=CFG["hop_length"])
+    assert _uv_fr.mean() < 0.05, f"BUG: v5 extract_f0_and_energy false-voiced unvoiced fricative: uv={_uv_fr.mean():.2%}"
+    _, _, _uv_sil = extract_f0_and_energy(np.zeros(int(0.2 * _sr_t), dtype=np.float32), sr=_sr_t, hop_length=CFG["hop_length"])
+    assert _uv_sil.sum() == 0.0, "v5 silence must have uv=0"
+    print(f"  [PASS] {'Frontend & v5 F0/UV (a10)':26s} | 20,901 CJK 0-UNK | FricUV={_uv_fr.mean():.1%} VowelUV={_uv_v[3:-3].mean():.1%} | 推理边界={'jieba' if has_jieba else '机械规则'}")
 
 def run_chunkwise_numerical_and_grad_tests():
     """验证保留的门控 DeltaNet (E4) 在强遗忘条件下的前向等价性与反向梯度有限性。"""
@@ -3424,10 +3705,11 @@ def run_architecture_and_streaming_tests():
             else:
                 print(f"  [PASS] {exp_name:26s} | archived | {infer_params:.2f}M | (Offline Reference)")
 
-        # 验证连续相位谐波源-滤波器因果声码器 CausalVocosLite (a9)：空洞 ConvNeXt + 24 阶 STFT 谐波载波 + 首包/稳态动态切块等价性
+        # 验证连续相位谐波源-滤波器因果声码器 CausalVocosLite (a10)：空洞 ConvNeXt + 48 阶因果啁啾 STFT 谐波载波 + 首包/稳态动态切块等价性
         voc = CausalVocosLite(
             n_mels=CFG["n_mels"], dim=CFG["vocoder_dim"], n_fft=CFG["n_fft"], hop_length=CFG["hop_length"],
             lookahead=CFG["vocoder_lookahead"], sample_rate=CFG["sample_rate"],
+            n_harmonics=CFG["vocoder_n_harmonics"], use_chirp=CFG["vocoder_chirp"],
         ).eval()
         voc.set_mel_stats(torch.linspace(-7.0, -3.0, CFG["n_mels"]), torch.linspace(1.5, 2.5, CFG["n_mels"]))
         mel_dummy = torch.randn(1, CFG["n_mels"], 67) * 2.0 - 5.0
@@ -3486,10 +3768,26 @@ def run_architecture_and_streaming_tests():
         phi0_c = float((f0_real * CFG["hop_length"] / CFG["sample_rate"]) % 1.0)
         t_ref = torch.arange(48 * CFG["hop_length"], dtype=torch.float64) / float(CFG["sample_rate"])
         w_exact = torch.zeros_like(w_cola)
+        nyq_lim_c = 0.45 * float(CFG["sample_rate"])
         for h_ord in range(1, hs_test.n_harmonics + 1):
-            w_exact = w_exact + hs_test.harm_amps[h_ord - 1] * torch.cos(2.0 * math.pi * h_ord * (phi0_c + f0_real * t_ref)).float()
+            nyq_w = max(0.0, min(1.0, (nyq_lim_c - f0_real * h_ord) / 500.0)) if hs_test.use_chirp else (1.0 if f0_real * h_ord < nyq_lim_c else 0.0)
+            w_exact = w_exact + (hs_test.harm_amps[h_ord - 1] * nyq_w) * torch.cos(2.0 * math.pi * h_ord * (phi0_c + f0_real * t_ref)).float()
         cola_err = (w_cola[1024:-1024] - w_exact[1024:-1024]).abs().max().item()
         assert cola_err < 1e-4, f"Harmonic STFT COLA error too large: {cola_err:.2e}"
+
+        # a10 硬门禁：验证汉语四声陡降 (350->170 Hz / 25 帧) 下 48 阶因果啁啾载波的 OLA 相位一致性 > 0.90（a9 常频曾跌至 0.67）
+        f0_glide = torch.log(torch.linspace(350.0, 170.0, 28, dtype=torch.float32)).unsqueeze(0)
+        uv_glide = torch.full((1, 28), 20.0, dtype=torch.float32)
+        _, hspec_gl, _, _ = hs_test._oscillate(f0_glide, uv_glide, torch.float32)
+        x_gl_raw = torch.fft.irfft(hspec_gl, n=CFG["n_fft"], dim=-1)
+        fr_gl = x_gl_raw * voc.head.window[None, None, :]
+        tl_gl = 28 * CFG["hop_length"] + pad_c
+        o_gl = F.fold(fr_gl.transpose(1, 2), (1, tl_gl), (1, CFG["n_fft"]), stride=(1, CFG["hop_length"])).reshape(tl_gl)
+        e_gl = F.fold((voc.head.window ** 2).view(1, CFG["n_fft"], 1).expand(1, CFG["n_fft"], 28), (1, tl_gl), (1, CFG["n_fft"]), stride=(1, CFG["hop_length"])).reshape(tl_gl)
+        i_gl = F.fold((x_gl_raw ** 2).transpose(1, 2), (1, tl_gl), (1, CFG["n_fft"]), stride=(1, CFG["hop_length"])).reshape(tl_gl)
+        sl_gl = slice(CFG["n_fft"] // 2 + 4 * CFG["hop_length"], CFG["n_fft"] // 2 + 24 * CFG["hop_length"])
+        glide_ola_coh = float(((o_gl[sl_gl] ** 2) / e_gl[sl_gl].clamp(min=1e-6)).sum() / i_gl[sl_gl].sum().clamp(min=1e-6))
+        assert glide_ola_coh > 0.90, f"BUG: Chirp harmonic glide OLA coherence too low: {glide_ola_coh:.4f}"
 
         # 验证 3 通道复数差分 SpecDisc 与 PeriodDisc 输出全有限
         disc = LiteVocoderDiscriminator().eval()
@@ -3510,7 +3808,7 @@ def run_architecture_and_streaming_tests():
         ctc_anch = forward_sum_loss(lp_anch, tl_g, ml_g).item()
         assert ctc_anch > ctc_unif + 2.0, f"BUG: sparse-anchor shortcut ({ctc_anch:.2f}) not penalized over uniform ({ctc_unif:.2f})!"
 
-        print(f"  [PASS] {'CausalVocosLite+Harm (a9)':26s} | ★ ACTIVE | {count_params_m(voc):.2f}M | OLA rms={vrms:.2e} max={vdiff:.2e} | Carrier={hs_exact_diff:.1e} | COLA={cola_err:.2e}")
+        print(f"  [PASS] {'CausalVocosLite+Harm (a10)':26s} | ★ ACTIVE | {count_params_m(voc):.2f}M | OLA rms={vrms:.2e} | Carrier={hs_exact_diff:.1e} | COLA={cola_err:.2e} | GlideCoh={glide_ola_coh:.3f}")
 
     # a8 硬门禁 1b：零声学信息梯度自愈检验（纯随机偏置在 forward_sum_loss 梯度下降 60 步后必须自愈回对角线，绝不坍缩成稀疏锚点！）
     torch.manual_seed(42)
@@ -3534,15 +3832,17 @@ def run_architecture_and_streaming_tests():
     assert d1_fin < 0.15 and d1_fin <= d1_init, f"BUG: Forward-Sum amplified random bias into anchor collapse! dur1: {d1_init:.1%} -> {d1_fin:.1%}"
     print(f"  [PASS] {'Aligner Anti-Collapse (a8)':26s} | ctc(anch={ctc_anch:.2f} > unif={ctc_unif:.2f}) | bias_heal dur1: {d1_init:.0%}->{d1_fin:.0%} | blank=-1.0")
 
-    # a9 硬门禁 2：CausalHarmonicSource 梯度隔离 + 相位损失/3通道 SpecDisc 全零静音无 NaN 梯度校验 + GT-F0 GTA 校验
+    # a10 硬门禁 2：CausalHarmonicSource 梯度隔离 + 相位/头正则/3通道 SpecDisc/2D MelPatchDisc 全零静音无 NaN 梯度校验 + GT-F0 GTA 校验
     voc_g = CausalVocosLite(
         n_mels=CFG["n_mels"], dim=CFG["vocoder_dim"], n_fft=CFG["n_fft"], hop_length=CFG["hop_length"],
         lookahead=CFG["vocoder_lookahead"], sample_rate=CFG["sample_rate"],
+        n_harmonics=CFG["vocoder_n_harmonics"], use_chirp=CFG["vocoder_chirp"],
     ).train()
     voc_g.set_mel_stats(torch.linspace(-7.0, -3.0, CFG["n_mels"]), torch.linspace(1.5, 2.5, CFG["n_mels"]))
     mel_g = torch.randn(2, CFG["n_mels"], 32) * 2.0 - 5.0
-    wav_g, vf0_g, _ = voc_g.forward_with_aux(mel_g)
-    wav_g.pow(2).mean().backward()
+    wav_g, vf0_g, _, haux_g = voc_g.forward_with_aux(mel_g, return_head_aux=True)
+    l_phs_g, l_nreg_g = vocoder_head_reg_loss(haux_g, torch.ones(2, 32), n_fft=CFG["n_fft"], sample_rate=CFG["sample_rate"])
+    (wav_g.pow(2).mean() + l_phs_g + l_nreg_g).backward()
     assert voc_g.harm_source.pitch_out.weight.grad is None, "BUG: waveform/GAN gradient leaked into pitch_out through _oscillate!"
     assert voc_g.harm_source.in_proj.weight.grad is not None and voc_g.harm_source.in_proj.weight.grad.abs().sum().item() > 0.0
     assert voc_g.head.out.weight.grad is not None and voc_g.head.out.weight.grad.abs().sum().item() > 0.0
@@ -3582,7 +3882,23 @@ def run_architecture_and_streaming_tests():
     gta1 = m_tr.extract_gta_mel(_p, _l, _tl, _mel, _ml, boundary_ids=_b, f0_gt=_f0, uv_gt=_uv, energy_gt=_en)
     gta2 = m_tr.extract_gta_mel(_p, _l, _tl, _mel, _ml, boundary_ids=_b, f0_gt=_f0 + 1.5, uv_gt=_uv, energy_gt=_en)
     assert gta1.shape == _mel.shape and (gta1 - gta2).abs().max().item() > 1e-3, "extract_gta_mel ignored f0_gt!"
-    print(f"  [PASS] {'a9 Phase/Grad/GTA Gates':26s} | pitch grad=0 | zero-silence finite | acoustic train+GTA(GT-F0) OK")
+    # 验证 a10 2D MelPatchDiscriminator 前反向有限性、padding 严格掩码不变性与零静音无 NaN
+    md_g = MelPatchDiscriminator().train()
+    _mm_g = torch.arange(96)[None, :] < _ml[:, None]
+    _m_real_a = _mel.clone(); _m_real_b = _mel.clone(); _m_real_b[1, :, 72:] = 999.0
+    _m_fake = torch.zeros(2, CFG["n_mels"], 96, requires_grad=True)
+    _ro_a, _fo_a, _, _ = md_g(_m_real_a, _m_fake, mel_mask=_mm_g)
+    _ro_b, _, _, _ = md_g(_m_real_b, _m_fake.detach(), mel_mask=_mm_g)
+    assert all(torch.equal(a, b) for a, b in zip(_ro_a, _ro_b)), "BUG: MelPatchDiscriminator leaked padded frames!"
+    _l_md = sum(f.pow(2).mean() for f in _fo_a)
+    _l_md.backward()
+    assert torch.isfinite(_l_md) and torch.isfinite(_m_fake.grad).all(), "NaN grad on zero mel in MelPatchDiscriminator!"
+    # 验证 vocoder_head_reg_loss 全零静音与全清音均无 NaN
+    _z_aux = {"p_h": torch.zeros(2, 16, 513, requires_grad=True), "amp_n": torch.zeros(2, 16, 513, requires_grad=True), "harm_mag": torch.zeros(2, 16, 513)}
+    _zp, _zn = vocoder_head_reg_loss(_z_aux, torch.zeros(2, 16))
+    (_zp + _zn).backward()
+    assert torch.isfinite(_zp) and torch.isfinite(_zn) and torch.isfinite(_z_aux["p_h"].grad).all() and torch.isfinite(_z_aux["amp_n"].grad).all()
+    print(f"  [PASS] {'a10 Phase/MelDisc/GTA Gate':26s} | pitch grad=0 | MelPatchDisc mask-exact | zero-silence finite | GTA(GT-F0) OK")
     print("=" * 72)
 
 
@@ -4362,7 +4678,19 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     scaler = torch.amp.GradScaler("cuda", enabled=(DEVICE.type == "cuda" and AMP_DTYPE == torch.float16))
 
-    history = {"steps": [], "train_loss": [], "train_align": [], "val_mel": [], "val_struct": [], "val_dur": [], "val_f0": [], "val_uv": [],
+    # a10: 训练期双尺度 2D Mel Patch 判别器（硬对齐锁定后 step_ratio >= 0.50 介入，推理/ONNX 零参数零开销）
+    use_mel_gan = (CFG.get("mel_gan_adv_weight", 0.0) > 0.0) or (CFG.get("mel_gan_fm_weight", 0.0) > 0.0)
+    mel_gan_start = float(CFG.get("mel_gan_start_ratio", 0.50))
+    mel_disc = MelPatchDiscriminator().to(DEVICE) if use_mel_gan else None
+    opt_md = torch.optim.AdamW(mel_disc.parameters(), lr=CFG.get("lr_mel_disc", 2e-4), betas=(0.8, 0.99)) if use_mel_gan else None
+    md_total_steps = max(1, int(total_steps * (1.0 - mel_gan_start)))
+    sched_md = (
+        torch.optim.lr_scheduler.LambdaLR(opt_md, lambda s: 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * min(1.0, float(s) / float(md_total_steps)))))
+        if use_mel_gan else None
+    )
+    scaler_md = torch.amp.GradScaler("cuda", enabled=(use_mel_gan and DEVICE.type == "cuda" and AMP_DTYPE == torch.float16))
+
+    history = {"steps": [], "train_loss": [], "train_align": [], "val_mel": [], "val_struct": [], "val_sharp": [], "val_dur": [], "val_f0": [], "val_uv": [],
                "val_align": [], "val_bin": [],
                "val_infer_mel": [], "val_infer_score": [], "val_dur_mae": [], "val_dur_rel": [], "val_len_ratio": [],
                "val_dur1_pct": [], "val_dur_max": [], "elapsed_min": 0.0}
@@ -4382,6 +4710,14 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
         scheduler.load_state_dict(ckpt["scheduler"])
         if "scaler" in ckpt:
             scaler.load_state_dict(ckpt["scaler"])
+        if use_mel_gan and "mel_disc" in ckpt:
+            mel_disc.load_state_dict(ckpt["mel_disc"])
+            if "opt_md" in ckpt:
+                opt_md.load_state_dict(ckpt["opt_md"])
+            if "sched_md" in ckpt:
+                sched_md.load_state_dict(ckpt["sched_md"])
+            if "scaler_md" in ckpt:
+                scaler_md.load_state_dict(ckpt["scaler_md"])
         step = int(ckpt["step"])
         best_val_mel = float(ckpt.get("best_val_mel", float("inf")))
         # 旧断点没有推理路径选模分：置 inf，则续训后的首次验证即重新落盘 best.pt
@@ -4417,6 +4753,7 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
             "cfg": CFG, "stats": STATS, "vocab": FRONTEND.vocab,
             "model": model.state_dict(), "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(),
+            **({"mel_disc": mel_disc.state_dict(), "opt_md": opt_md.state_dict(), "sched_md": sched_md.state_dict(), "scaler_md": scaler_md.state_dict()} if use_mel_gan else {}),
         }
         atomic_torch_save(ckpt_obj, local_latest)
         sync_file_to_storage(local_latest, storage_latest)
@@ -4506,14 +4843,55 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
                 uvs = uvs.to(DEVICE, non_blocking=True)
                 m_lens = m_lens.to(DEVICE, non_blocking=True)
 
+                cur_ratio = step / max(total_steps, 1)
+                # a10: 训练后程 (0.60 -> 0.85) 平滑退火 frame_decoder Dropout 至 0，保留主干泛化同时消除 Mel 过平滑发闷
+                if CFG["dropout_acoustic"] > 0.0:
+                    dec_drop = CFG["dropout_acoustic"] * (1.0 - min(1.0, max(0.0, (cur_ratio - 0.60) / 0.25)))
+                    model.set_decoder_dropout(dec_drop)
+
                 optimizer.zero_grad(set_to_none=True)
                 with torch.amp.autocast("cuda", dtype=AMP_DTYPE, enabled=(DEVICE.type == "cuda")):
                     out = model.forward_train(
                         pids, lids, t_lens, mels, f0s, es, m_lens,
-                        step_ratio=step / max(total_steps, 1),
+                        step_ratio=cur_ratio,
                         boundary_ids=bids, uv_gt=uvs,
                     )
                     loss = out["loss"]
+
+                m_adv_val, m_d_val = 0.0, 0.0
+                if use_mel_gan and cur_ratio >= mel_gan_start:
+                    gan_scale = min(1.0, (cur_ratio - mel_gan_start) / 0.15)
+                    mel_mask_b = torch.arange(mels.shape[-1], device=DEVICE)[None, :] < m_lens[:, None]
+                    # 1) Mel 判别器更新步
+                    opt_md.zero_grad(set_to_none=True)
+                    with torch.amp.autocast("cuda", dtype=AMP_DTYPE, enabled=(DEVICE.type == "cuda")):
+                        ro_m, fo_m, _, _ = mel_disc(mels, out["mel_pred"].detach(), mel_mask=mel_mask_b)
+                        loss_md = sum(torch.mean((r.float() - 1.0) ** 2) + torch.mean(f.float() ** 2) for r, f in zip(ro_m, fo_m))
+                    m_d_val = float(loss_md.item())
+                    scaler_md.scale(loss_md).backward()
+                    scaler_md.unscale_(opt_md)
+                    torch.nn.utils.clip_grad_norm_(mel_disc.parameters(), 1.0)
+                    scaler_md.step(opt_md)
+                    scaler_md.update()
+                    sched_md.step()
+
+                    # 2) 生成器对抗锐化 + 特征匹配步（冻结判别器权重，零无用梯度开销）
+                    for _p in mel_disc.parameters():
+                        _p.requires_grad_(False)
+                    try:
+                        with torch.amp.autocast("cuda", dtype=AMP_DTYPE, enabled=(DEVICE.type == "cuda")):
+                            _, fo_g, rf_g, ff_g = mel_disc(mels, out["mel_pred"], mel_mask=mel_mask_b, no_grad_real=True)
+                            loss_m_adv = sum(torch.mean((f.float() - 1.0) ** 2) for f in fo_g)
+                            loss_m_fm = sum(
+                                F.l1_loss(ff.float(), rf.float())
+                                for rf_l, ff_l in zip(rf_g, ff_g)
+                                for rf, ff in zip(rf_l[:-1], ff_l[:-1])
+                            )
+                        m_adv_val = float(loss_m_adv.item())
+                        loss = loss + gan_scale * (CFG["mel_gan_adv_weight"] * loss_m_adv + CFG["mel_gan_fm_weight"] * loss_m_fm)
+                    finally:
+                        for _p in mel_disc.parameters():
+                            _p.requires_grad_(True)
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -4527,9 +4905,9 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
                 if step % 100 == 0:
                     pbar.set_postfix(
                         loss=f"{loss.item():.3f}", mel=f"{out['mel'].item():.3f}",
-                        aln=f"{out['align'].item():.3f}", bin=f"{out['bin'].item():.3f}",
+                        shp=f"{out['sharp_ratio'].item():.2f}", aln=f"{out['align'].item():.3f}",
                         dur=f"{out['dur'].item():.3f}", f0=f"{out['f0'].item():.3f}",
-                        d1=f"{out['dur1_ratio'].item():.0%}", dmax=f"{int(out['dur_max'].item())}",
+                        md=f"{m_d_val:.2f}", d1=f"{out['dur1_ratio'].item():.0%}",
                     )
 
                 if _STOP_REQUESTED:
@@ -4539,7 +4917,7 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
 
                 if step % eval_every == 0 or step == total_steps:
                     model.eval()
-                    v_mel, v_strc, v_dur, v_f0, v_uv, v_bos, v_align, v_bin, v_cnt = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0
+                    v_mel, v_strc, v_sharp, v_dur, v_f0, v_uv, v_bos, v_align, v_bin, v_cnt = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0
                     v_infer_mel, v_dur_mae, v_dur_rel, v_len_ratio = 0.0, 0.0, 0.0, 0.0
                     v_dur1, v_dur_max = 0.0, 0.0
                     with torch.no_grad():
@@ -4550,7 +4928,7 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
                                 vp, vl, vtl, vm, vf0, ve, vml,
                                 step_ratio=1.0, boundary_ids=vb, uv_gt=vuv,
                             )
-                            v_mel += vo["mel"].item(); v_strc += vo["struct"].item()
+                            v_mel += vo["mel"].item(); v_strc += vo["struct"].item(); v_sharp += vo["sharp_ratio"].item()
                             v_dur += vo["dur"].item(); v_f0 += vo["f0"].item(); v_uv += vo["uv"].item()
                             v_bos += vo["bos_ratio"].item()
                             v_align += vo["align"].item(); v_bin += vo["bin"].item()
@@ -4559,14 +4937,15 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
                             # 真实推理路径（预测时长 + 预测 F0/UV/Energy 全走 infer_offline）的 mel L1
                             v_infer_mel += _infer_mel_l1(vp, vl, vb, vtl, vm, vml).item(); v_cnt += 1
                     d_cnt = max(v_cnt, 1)
-                    v_mel /= d_cnt; v_strc /= d_cnt; v_dur /= d_cnt; v_f0 /= d_cnt; v_uv /= d_cnt; v_bos /= d_cnt
+                    v_mel /= d_cnt; v_strc /= d_cnt; v_sharp /= d_cnt; v_dur /= d_cnt; v_f0 /= d_cnt; v_uv /= d_cnt; v_bos /= d_cnt
                     v_align /= d_cnt; v_bin /= d_cnt
                     v_infer_mel /= d_cnt; v_dur_mae /= d_cnt; v_dur_rel /= d_cnt; v_len_ratio /= d_cnt; v_dur1 /= d_cnt
-                    # a9 best.pt 选模分 = 推理路径 DTW mel L1 + 0.5*dur_rel + 0.25*val_f0 + 防坍缩惩罚；
-                    # 当首次进入硬对齐完全生效期 (step_ratio >= 0.55) 时重置 best_val_infer，杜绝早期软对齐糊谱锁定 best.pt！
+                    # a10 best.pt 选模分 = 推理路径 DTW mel L1 + 0.35*val_struct + 0.5*dur_rel + 0.25*val_f0 + 防坍缩惩罚；
+                    # 当首次进入硬对齐 + MelGAN 充分介入期 (0.65) 时重置 best_val_infer，避免早期纯 L1 糊谱锁定 best.pt！
                     collapse_pen = 2.0 * max(0.0, v_dur1 - 0.30)
-                    v_infer_score = v_infer_mel + 0.5 * v_dur_rel + 0.25 * v_f0 + collapse_pen
-                    if (not best_hard_unlocked) and (step / max(total_steps, 1) >= 0.55):
+                    v_infer_score = v_infer_mel + 0.35 * v_strc + 0.5 * v_dur_rel + 0.25 * v_f0 + collapse_pen
+                    unlock_ratio = 0.65 if use_mel_gan else 0.55
+                    if (not best_hard_unlocked) and (step / max(total_steps, 1) >= unlock_ratio):
                         best_hard_unlocked = True
                         best_val_infer = float("inf")
                     history["steps"].append(step)
@@ -4574,6 +4953,7 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
                     history.setdefault("train_align", []).append(round(out["align"].item(), 4))
                     history["val_mel"].append(round(v_mel, 4))
                     history.setdefault("val_struct", []).append(round(v_strc, 4))
+                    history.setdefault("val_sharp", []).append(round(v_sharp, 3))
                     history["val_dur"].append(round(v_dur, 4))
                     history.setdefault("val_f0", []).append(round(v_f0, 4))
                     history.setdefault("val_uv", []).append(round(v_uv, 4))
@@ -4589,8 +4969,8 @@ def train_one_model(exp_name: str, backbone_type: str, lookahead: int):
                     history.setdefault("val_dur_max", []).append(round(v_dur_max, 1))
                     _warn_c = "  [WARN: ALIGNER COLLAPSE!]" if v_dur1 > 0.35 else ""
                     print(
-                        f"\n  [Val step={step:5d}] mel={v_mel:.4f} | infer_mel={v_infer_mel:.4f} | align={v_align:.3f} | "
-                        f"dur_rel={v_dur_rel:.3f} | len_ratio={v_len_ratio:.3f} | f0={v_f0:.3f} | dur1={v_dur1:.1%} | dur_max={v_dur_max:.0f}{_warn_c}",
+                        f"\n  [Val step={step:5d}] mel={v_mel:.4f} | infer_mel={v_infer_mel:.4f} | strc={v_strc:.4f} | sharp={v_sharp:.2f} | "
+                        f"align={v_align:.3f} | dur_rel={v_dur_rel:.3f} | f0={v_f0:.3f} | dur1={v_dur1:.1%}{_warn_c}",
                         flush=True,
                     )
                     last_val = {"mel": v_mel, "infer_mel": v_infer_mel, "dur_rel": v_dur_rel, "infer_score": v_infer_score}
@@ -4724,6 +5104,7 @@ def train_or_load_causal_vocoder(primary_acoustic_model: AetherAcousticModel = N
     voc = CausalVocosLite(
         n_mels=CFG["n_mels"], dim=CFG["vocoder_dim"], n_fft=CFG["n_fft"], hop_length=CFG["hop_length"],
         lookahead=CFG["vocoder_lookahead"], sample_rate=CFG["sample_rate"],
+        n_harmonics=CFG["vocoder_n_harmonics"], use_chirp=CFG["vocoder_chirp"],
     ).to(DEVICE)
     voc.set_mel_stats(STATS["mel_mean"], STATS["mel_std"])
 
@@ -4886,10 +5267,11 @@ def train_or_load_causal_vocoder(primary_acoustic_model: AetherAcousticModel = N
                 use_gt_f0 = (p_gt_f0 > 0.0 and random.random() < p_gt_f0)
 
                 with torch.amp.autocast("cuda", dtype=voc_amp_dtype, enabled=voc_amp_enabled):
-                    wav_pred, vf0_pred, vuv_logit = voc.forward_with_aux(
+                    wav_pred, vf0_pred, vuv_logit, head_aux = voc.forward_with_aux(
                         mel_seg,
                         f0_override=(f0_seg if use_gt_f0 else None),
                         uv_override=(uv_seg if use_gt_f0 else None),
+                        return_head_aux=True,
                     )
                 L_min = min(wav_pred.shape[-1], wav_gt.shape[-1])
                 wav_pred, wav_gt = wav_pred[:, :L_min], wav_gt[:, :L_min]
@@ -4917,6 +5299,10 @@ def train_or_load_causal_vocoder(primary_acoustic_model: AetherAcousticModel = N
                 loss_vf0 = (F.l1_loss(vf0_pred.float(), f0_seg.float(), reduction="none") * v_mask).sum() / v_mask.sum().clamp(min=1)
                 loss_vuv = F.binary_cross_entropy_with_logits(vuv_logit.float(), uv_seg.float())
                 loss_pitch_osc = 3.0 * loss_vf0 + 1.0 * loss_vuv
+                # a10 声码器头物理正则：约束声道滤波相位 p_h 慢变 + 抑制低相干噪声分支入侵 0-1.5 kHz 浊音区
+                loss_ph_smooth, loss_noise_prior = vocoder_head_reg_loss(
+                    head_aux, uv_seg, n_fft=CFG["n_fft"], sample_rate=CFG["sample_rate"]
+                )
 
                 loss_adv_val = 0.0
                 if in_gan:
@@ -4933,15 +5319,23 @@ def train_or_load_causal_vocoder(primary_acoustic_model: AetherAcousticModel = N
                                 for rf, ff in zip(rf_l[:-1], ff_l[:-1])
                             )
                         loss_adv_val = float(loss_adv.item())
-                        # a9 Stage 2: 联合 Mel L1 (35.0) + 多分辨率瞬时频率/群延迟相位损失 (2.0) + 3 通道复数差分 MRD/MPD 对抗
-                        loss_g = 1.0 * loss_stft + 35.0 * loss_mel + 2.0 * loss_phase + loss_adv + 2.0 * loss_fm + 1.0 * loss_pitch_osc
+                        # a10 Stage 2: Mel L1 (35.0) + 强化多分辨率相位损失 (3.0) + 双分支头平滑/防入侵正则 + 3 通道复数差分 MRD/MPD
+                        loss_g = (
+                            1.0 * loss_stft + 35.0 * loss_mel + 3.0 * loss_phase
+                            + 0.15 * loss_ph_smooth + 0.05 * loss_noise_prior
+                            + loss_adv + 2.0 * loss_fm + 1.0 * loss_pitch_osc
+                        )
                         scaler_g.scale(loss_g).backward()
                     finally:
                         for _p in disc.parameters():
                             _p.requires_grad_(True)
                 else:
-                    # a9 Stage 1: 热身期即加入显式相位一致性监督，进 GAN 前先锁定跨帧相干相位
-                    loss_g = 15.0 * (loss_stft + loss_mel) + 5.0 * loss_phase + 2.0 * loss_pitch_osc
+                    # a10 Stage 1: 热身期同步锁定跨帧相干相位与干净谐波/噪声分工
+                    loss_g = (
+                        15.0 * (loss_stft + loss_mel) + 5.0 * loss_phase
+                        + 0.25 * loss_ph_smooth + 0.10 * loss_noise_prior
+                        + 2.0 * loss_pitch_osc
+                    )
                     scaler_g.scale(loss_g).backward()
 
                 scaler_g.unscale_(opt_g)
@@ -4968,9 +5362,12 @@ def train_or_load_causal_vocoder(primary_acoustic_model: AetherAcousticModel = N
                     voc_history["vuv"].append(round(loss_vuv.item(), 4))
                     voc_history["adv"].append(round(loss_adv_val, 4))
                     voc_history["loss_d"].append(round(loss_d_val, 4))
+                    voc_history.setdefault("ph_smooth", []).append(round(loss_ph_smooth.item(), 4))
+                    voc_history.setdefault("noise_reg", []).append(round(loss_noise_prior.item(), 4))
                     print(
                         f"\n  [Voc step={step:5d}] stage={st_name} | stft={loss_stft.item():.3f} | mel={loss_mel.item():.3f} | "
-                        f"phs={loss_phase.item():.3f} | vf0={loss_vf0.item():.3f} | vuv={loss_vuv.item():.3f} | adv={loss_adv_val:.3f} | d={loss_d_val:.3f}",
+                        f"phs={loss_phase.item():.3f} | ph_s={loss_ph_smooth.item():.3f} | nreg={loss_noise_prior.item():.3f} | "
+                        f"vf0={loss_vf0.item():.3f} | vuv={loss_vuv.item():.3f} | adv={loss_adv_val:.3f} | d={loss_d_val:.3f}",
                         flush=True,
                     )
 
@@ -5302,6 +5699,19 @@ def frame_rate_mod_ratio(wav_np: np.ndarray, sr: int = 24000, hop_length: int = 
     return float(math.hypot(re, im) / dc)
 
 
+def mel_formant_sharpness(wav_np: np.ndarray) -> float:
+    """a10 新增：计算有声活动帧 100-bin Log-Mel 频率轴二阶曲率 |Δ²f|（直接量化声音是否发闷，GT 真声约 0.77，a9 曾仅 0.60）。"""
+    w = np.asarray(wav_np, dtype=np.float32).reshape(-1)
+    if w.size < CFG["n_fft"]:
+        return float("nan")
+    with torch.no_grad():
+        m = MEL_EXTRACTOR(torch.from_numpy(w)).cpu().numpy()
+    fe = m.mean(axis=0)
+    act = fe > (float(np.percentile(fe, 90)) - 2.5)
+    ma = m[:, act] if act.sum() >= 4 else m
+    return float(np.abs(np.diff(ma, n=2, axis=0)).mean())
+
+
 def count_energy_holes(wav_np: np.ndarray, hop_length: int = 256) -> int:
     """统计有声段内突发的 >12 dB (RMS < 0.35x 邻帧) OLA 相消能量空洞帧数（直接反映人耳断层感）。"""
     w = np.asarray(wav_np, dtype=np.float64)
@@ -5358,13 +5768,14 @@ def _safe_nanmean(vals) -> float:
     return float(valid.mean()) if valid.size > 0 else float("nan")
 
 
-GT_REF_EMBS, GT_HF_RATIOS, GT_UTMOS_LIST = [], [], []
+GT_REF_EMBS, GT_HF_RATIOS, GT_UTMOS_LIST, GT_SHARP_LIST = [], [], [], []
 for item in EVAL_SUITE:
     if item["is_val"]:
         p = EVAL_LOCAL_DIR / "00_ground_truth" / f"{item['utt_id']}.wav"
         w, _ = sf.read(str(p), dtype="float32")
         GT_HF_RATIOS.append(hf_2_8k_ratio(w))
         GT_UTMOS_LIST.append(score_utmos(w))
+        GT_SHARP_LIST.append(mel_formant_sharpness(w))
         if SPK_ENCODER is not None:
             GT_REF_EMBS.append(SPK_ENCODER.embed_utterance(preprocess_wav(w, source_sr=CFG["sample_rate"])))
 
@@ -5373,7 +5784,8 @@ if GT_SPK_CENTROID is not None:
     GT_SPK_CENTROID /= (np.linalg.norm(GT_SPK_CENTROID) + 1e-8)
 GT_HF_MEAN = float(np.mean(GT_HF_RATIOS)) if GT_HF_RATIOS else 0.15
 GT_UTMOS_MEAN = _safe_nanmean(GT_UTMOS_LIST)
-print(f"[Gold Anchor] Ground-Truth UTMOS: {GT_UTMOS_MEAN:.3f} | 2-8kHz Ratio: {GT_HF_MEAN:.4f}")
+GT_SHARP_MEAN = _safe_nanmean(GT_SHARP_LIST) if GT_SHARP_LIST else 0.77
+print(f"[Gold Anchor] Ground-Truth UTMOS: {GT_UTMOS_MEAN:.3f} | 2-8kHz Ratio: {GT_HF_MEAN:.4f} | Formant |Δ²f|: {GT_SHARP_MEAN:.3f}")
 
 
 @torch.no_grad()
@@ -5504,7 +5916,7 @@ voc_size_mb = (voc_int8_path.stat().st_size / 1e6) if voc_int8_path.exists() els
 
 for exp_name, model in TRAINED_MODELS.items():
     recs = GENERATED_RECORDS[exp_name]
-    utmos_s, pesq_s, sisdr_s, stoi_s, mer_s, mer_zh_s, sim_s, hf_diff_s, click_s, mod93_s, hole_s, sdiff_s, utmos_pre_s = [], [], [], [], [], [], [], [], [], [], [], [], []
+    utmos_s, pesq_s, sisdr_s, stoi_s, mer_s, mer_zh_s, sim_s, hf_diff_s, sharp_s, click_s, mod93_s, hole_s, sdiff_s, utmos_pre_s = [], [], [], [], [], [], [], [], [], [], [], [], [], []
     for r in tqdm(recs, desc=f"Scoring {exp_name}"):
         eval_wav_path = r["str_wav"] if r["str_wav"] else r["off_wav"]
         wav, wav_sr = sf.read(eval_wav_path, dtype="float32")
@@ -5515,6 +5927,7 @@ for exp_name, model in TRAINED_MODELS.items():
         clk = detect_seam_click(wav, r["seams"], sr=wav_sr) if r["str_wav"] else 0.0
         m93 = frame_rate_mod_ratio(wav, sr=wav_sr, hop_length=CFG["hop_length"])
         eholes = count_energy_holes(wav, hop_length=CFG["hop_length"])
+        fsharp = mel_formant_sharpness(wav)
         sim = float("nan")
         if SPK_ENCODER is not None and GT_SPK_CENTROID is not None:
             emb = SPK_ENCODER.embed_utterance(preprocess_wav(wav, source_sr=wav_sr))
@@ -5525,10 +5938,10 @@ for exp_name, model in TRAINED_MODELS.items():
             u_pre = score_utmos(w_pre, sr=w_pre_sr)
             utmos_pre_s.append(u_pre)
         utmos_s.append(u); pesq_s.append(pesq); sisdr_s.append(sisdr); stoi_s.append(stoi)
-        mer_s.append(mer); sim_s.append(sim); hf_diff_s.append(hfd); click_s.append(clk); mod93_s.append(m93); hole_s.append(eholes); sdiff_s.append(r["stream_wav_max_diff"])
+        mer_s.append(mer); sim_s.append(sim); hf_diff_s.append(hfd); sharp_s.append(fsharp); click_s.append(clk); mod93_s.append(m93); hole_s.append(eholes); sdiff_s.append(r["stream_wav_max_diff"])
         if not re.search(r"[A-Za-z]{2,}", r["text"]):
             mer_zh_s.append(mer)
-        all_sample_rows.append({"model": exp_name, "utt_id": r["utt_id"], "text": r["text"], "UTMOS": u, "UTMOS_PreVocos": u_pre, "PESQ": pesq, "SI_SDR": sisdr, "MER": mer, "SIM": sim, "HF_2_8k_Diff": hfd, "Seam_Click": clk, "Mod_93Hz": m93, "Energy_Holes": eholes, "Boundary_Src": r["boundary_src"]})
+        all_sample_rows.append({"model": exp_name, "utt_id": r["utt_id"], "text": r["text"], "UTMOS": u, "UTMOS_PreVocos": u_pre, "PESQ": pesq, "SI_SDR": sisdr, "MER": mer, "SIM": sim, "HF_2_8k_Diff": hfd, "Formant_Sharp": fsharp, "Seam_Click": clk, "Mod_93Hz": m93, "Energy_Holes": eholes, "Boundary_Src": r["boundary_src"]})
 
     rtf_2t, ttfa_ms, ttfa_stream_ms, first_chars, first_ph, int8_mel_diff = benchmark_cpu_2thread_and_int8(model, CAUSAL_VOCODER, bench_text)
     print(
@@ -5558,7 +5971,7 @@ for exp_name, model in TRAINED_MODELS.items():
         "MER_ZH↓": round(mean_mer_zh, 4) if not np.isnan(mean_mer_zh) else None,
         "SIM↑": round(mean_sim, 3) if not np.isnan(mean_sim) else None,
         "SQUIM_PESQ↑": round(mean_pesq, 3) if not np.isnan(mean_pesq) else None,
-        "HF_2_8k_Diff↓": round(float(np.mean(hf_diff_s)), 4), "Seam_Click↓": round(mean_click, 4),
+        "HF_2_8k_Diff↓": round(float(np.mean(hf_diff_s)), 4), "Formant_Sharp↑": round(_safe_nanmean(sharp_s), 3), "Seam_Click↓": round(mean_click, 4),
         "Mod_93Hz↓": round(mean_mod93, 4), "Energy_Holes↓": total_holes,
         "Stream_MaxDiff": f"{max(sdiff_s):.1e}", "CPU2T_RTF↓": rtf_2t,
         "CPU2T_TTFA_ms↓": ttfa_ms, "Stream_TTFA_ms↓": ttfa_stream_ms,

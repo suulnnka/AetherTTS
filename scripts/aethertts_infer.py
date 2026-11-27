@@ -216,11 +216,16 @@ class AetherTTS:
 
         self.vocoder_path = find_vocoder_ckpt(root, ck, vocoder_ckpt)
         voc_sd = _torch_load(self.vocoder_path)
+        voc_arch = voc_sd.get("arch_tag") if isinstance(voc_sd, dict) else None
         if "voc" in voc_sd:  # latest.pt 是含优化器 / 判别器状态的训练断点
             voc_sd = voc_sd["voc"]
+        is_legacy_a9 = (voc_arch == "a9") or (self.arch_tag == "a9") or ("_a9" in self.vocoder_path.parent.name.lower() and "_a10" not in self.vocoder_path.parent.name.lower())
+        n_harm = 24 if is_legacy_a9 else int(cfg.get("vocoder_n_harmonics", 48))
+        use_chirp = False if is_legacy_a9 else bool(cfg.get("vocoder_chirp", True))
         self.vocoder = lib.CausalVocosLite(
             n_mels=cfg["n_mels"], dim=cfg["vocoder_dim"], n_fft=cfg["n_fft"], hop_length=cfg["hop_length"],
             lookahead=cfg["vocoder_lookahead"], sample_rate=cfg["sample_rate"],
+            n_harmonics=n_harm, use_chirp=use_chirp,
         )
         self.vocoder.load_state_dict(voc_sd)  # 含 mel_mean / mel_std 缓冲
 

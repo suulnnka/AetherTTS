@@ -22,7 +22,7 @@ LIB_PATH = REPO_ROOT / "scripts" / "aethertts_lib.py"
 
 LIB_HEADER = '''#!/usr/bin/env python3
 """
-AetherTTS Phase 1 (a9) — 纯模型与前端基础设施定义库（import 零副作用）。
+AetherTTS Phase 1 (a10) — 纯模型与前端基础设施定义库（import 零副作用）。
 
 由 scripts/sync_phase1_script.py 从 notebooks/AetherTTS_Colab_Phase1_Experiment.ipynb
 的 Cell 3 与 Cell 5 确定性生成（请勿手改本文件，修改 Notebook 后运行 sync_phase1_script.py 即可同步）。
@@ -68,6 +68,8 @@ CFG = {
     "stream_mel_chunk": 16,
     "dropout_acoustic": float(os.environ.get("AETHER_DROPOUT", "0.1")),
     "vocoder_dim": int(os.environ.get("AETHER_VOCODER_DIM", "320")),
+    "vocoder_n_harmonics": int(os.environ.get("AETHER_VOCODER_HARMONICS", "48")),
+    "vocoder_chirp": True,
     "frame_lookahead": int(os.environ.get("AETHER_FRAME_LOOKAHEAD", "2")),
     "vocoder_lookahead": _VOC_LA_DEFAULT,
     "profile": os.environ.get("AETHER_PROFILE", "standard_phase1"),
@@ -77,38 +79,41 @@ CFG = {
 
 HEADER = '''#!/usr/bin/env python3
 """
-AetherTTS Phase 1 (a9) — 独立 Python 运行器（无需 Notebook / 无 exec-cell）。
+AetherTTS Phase 1 (a10) — 独立 Python 运行器（无需 Notebook / 无 exec-cell）。
 
 由 scripts/sync_phase1_script.py 从 notebooks/AetherTTS_Colab_Phase1_Experiment.ipynb
 确定性 1:1 生成（请勿手改本文件，修改 Notebook 后运行 sync_phase1_script.py 即可同步）。
 
 默认聚焦唯一主力路线 E3_chunk_attn_C4_L8（5 层深双向分块前瞻 ChunkLookaheadBackbone + 局部窗口相对 RoPE +
-防坍缩单调对齐 + 共享帧前瞻与多尺度空洞 F0/UV/帧解码器 + 连续相位谐波源-滤波器 CausalVocosLite + 相位一致性损失 + GT-F0 对齐 GTA 闭环精调），
+防坍缩单调对齐 + v5 真清浊音特征 + 训练期 2D MelPatchDiscriminator 锐化 + 48 阶因果线性啁啾谐波源 CausalVocosLite + 相位/防入侵正则 + GT-F0 对齐 GTA 闭环），
 同时保留 E0/E1/E2/E4 代码供归档对照（可通过 --models 显式指定）。
 
 用法：
     python scripts/aethertts_phase1.py --profile full_quality --dataset bznsyp --root ./aethertts_exp
-    python scripts/aethertts_phase1.py --selftest          # 验证前端零 UNK + 防坍缩对齐 + 长流式局部 RoPE + 谐波 STFT COLA + 相位损失/声码器流式 + autocast 精度门禁
+    python scripts/aethertts_phase1.py --selftest          # 验证前端/v5清浊音 + 防坍缩对齐 + 长流式局部 RoPE + 48阶啁啾COLA + MelPatchDisc/相位正则 + autocast 精度门禁
     python scripts/aethertts_phase1.py --profile-steps 20  # 打印单步训练耗时分解后退出
 """
 import argparse
 
-_AP = argparse.ArgumentParser(description="AetherTTS Phase 1 (a9) standalone runner (synced from notebook).")
+_AP = argparse.ArgumentParser(description="AetherTTS Phase 1 (a10) standalone runner (synced from notebook).")
 _AP.add_argument("--root", default="./aethertts_exp", help="Local directory for datasets, checkpoints, samples, reports.")
 _AP.add_argument("--profile", default="standard_phase1", choices=["quick_smoke", "standard_phase1", "full_quality"])
 _AP.add_argument("--dataset", default="bznsyp", choices=["bznsyp", "ljspeech", "custom_bilingual"])
 _AP.add_argument("--vocoder", default="both", choices=["both", "pretrained_vocos", "causal_vocos_lite"])
 _AP.add_argument("--models", default="", help="Optional comma-separated model override (default: only E3_chunk_attn_C4_L8).")
 _AP.add_argument("--frame-lookahead", type=int, default=None, help="声学 frame_pre 共享帧级右前瞻帧数（默认 2 帧；0 表示关闭）.")
-_AP.add_argument("--vocoder-lookahead", type=int, default=None, help="CausalVocosLite 集中式右前瞻帧数（a9 默认 4 帧，覆盖完整 1024 点 iSTFT 右半窗）.")
-_AP.add_argument("--vocoder-dim", type=int, default=None, help="CausalVocosLite 通道宽度（a9 默认 320）.")
-_AP.add_argument("--dropout", type=float, default=None, help="声学模型 Dropout 比例（a9 默认 0.1）.")
+_AP.add_argument("--vocoder-lookahead", type=int, default=None, help="CausalVocosLite 集中式右前瞻帧数（默认 4 帧，覆盖完整 1024 点 iSTFT 右半窗）.")
+_AP.add_argument("--vocoder-dim", type=int, default=None, help="CausalVocosLite 通道宽度（默认 320）.")
+_AP.add_argument("--vocoder-harmonics", type=int, default=None, help="CausalHarmonicSource 谐波阶数（a10 默认 48，覆盖至 10.8 kHz）.")
+_AP.add_argument("--dropout", type=float, default=None, help="声学模型 Dropout 比例（默认 0.1，后程对 frame_decoder 退火至 0）.")
+_AP.add_argument("--mel-gan-adv", type=float, default=None, help="声学训练期 2D MelPatchDiscriminator LSGAN 权重（a10 默认 0.05；0 关闭）.")
+_AP.add_argument("--mel-gan-fm", type=float, default=None, help="声学训练期 2D MelPatchDiscriminator Feature Matching 权重（a10 默认 0.50）.")
 _AP.add_argument("--batch-size", type=int, default=None, help="可选覆写声学训练 batch_size（如 RTX 4090 覆写为 64）.")
-_AP.add_argument("--gta-prob", type=float, default=None, help="声码器 Stage 2 末 25% 混入 GT-F0 对齐 GTA 预测 Mel 的概率（a9 默认 0.25；0 表示关闭）.")
+_AP.add_argument("--gta-prob", type=float, default=None, help="声码器 Stage 2 末 25% 混入 GT-F0 对齐 GTA 预测 Mel 的概率（默认 0.25；0 表示关闭）.")
 _AP.add_argument("--backup-steps", type=int, default=1000)
 _AP.add_argument("--backup-minutes", type=float, default=8.0)
 _AP.add_argument("--skip-pip", action="store_true")
-_AP.add_argument("--selftest", action="store_true", help="Run frontend/aligner/long-streaming/vocoder gates, then exit.")
+_AP.add_argument("--selftest", action="store_true", help="Run frontend/v5-uv/aligner/long-streaming/vocoder/mel-disc gates, then exit.")
 _AP.add_argument("--profile-steps", type=int, default=0, help="If >0, time N training steps component-wise, print breakdown, then exit.")
 _ARGS = _AP.parse_args()
 
@@ -129,8 +134,14 @@ if _ARGS.vocoder_lookahead is not None:
     _os.environ["AETHER_VOCODER_LOOKAHEAD"] = str(_ARGS.vocoder_lookahead)
 if _ARGS.vocoder_dim is not None:
     _os.environ["AETHER_VOCODER_DIM"] = str(_ARGS.vocoder_dim)
+if _ARGS.vocoder_harmonics is not None:
+    _os.environ["AETHER_VOCODER_HARMONICS"] = str(_ARGS.vocoder_harmonics)
 if _ARGS.dropout is not None:
     _os.environ["AETHER_DROPOUT"] = str(_ARGS.dropout)
+if _ARGS.mel_gan_adv is not None:
+    _os.environ["AETHER_MEL_GAN_ADV"] = str(_ARGS.mel_gan_adv)
+if _ARGS.mel_gan_fm is not None:
+    _os.environ["AETHER_MEL_GAN_FM"] = str(_ARGS.mel_gan_fm)
 if _ARGS.batch_size is not None:
     _os.environ["AETHER_BATCH_SIZE"] = str(_ARGS.batch_size)
 if _ARGS.gta_prob is not None:

@@ -44,7 +44,8 @@ def find_checkpoint(root: Path, model_name: str, profile: str, dataset: str, exp
         return p
     runs_dir = root / "runs"
     cands = (
-        sorted(runs_dir.glob(f"{model_name}_{dataset}_{profile}_a9*"))
+        sorted(runs_dir.glob(f"{model_name}_{dataset}_{profile}_a10*"))
+        or sorted(runs_dir.glob(f"{model_name}_{dataset}_{profile}_a9*"))
         or sorted(runs_dir.glob(f"{model_name}_{dataset}_{profile}_a8*"))
         or sorted(runs_dir.glob(f"{model_name}_{dataset}_{profile}_a7*"))
         or sorted(runs_dir.glob(f"{model_name}_{dataset}_{profile}_a6*"))
@@ -66,7 +67,8 @@ def find_vocoder_ckpt(root: Path, profile: str, dataset: str, explicit: str = ""
     if not voc_dir.exists():
         return None
     cands = (
-        sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_a9*"))
+        sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_a10*"))
+        or sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_a9*"))
         or sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_a8*"))
         or sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_a7*"))
         or sorted(voc_dir.glob(f"causal_vocos_lite_{dataset}_{profile}_a6*"))
@@ -85,11 +87,14 @@ def find_manifest(root: Path, dataset: str, max_hours: float = None, explicit: s
         return p / "manifest.json" if p.is_dir() else p
     cache_dir = root / "cache"
     if max_hours is not None:
-        for ver in ("v4", "v3", "v2"):
+        for ver in ("v5", "v4", "v3", "v2"):
             exact = cache_dir / f"{dataset}_{ver}_max{max_hours}h" / "manifest.json"
             if exact.exists():
                 return exact
-    cands = sorted(cache_dir.glob(f"{dataset}_v4_max*h/manifest.json")) if cache_dir.exists() else []
+    cands = (
+        sorted(cache_dir.glob(f"{dataset}_v5_max*h/manifest.json"))
+        or sorted(cache_dir.glob(f"{dataset}_v4_max*h/manifest.json"))
+    ) if cache_dir.exists() else []
     if not cands and cache_dir.exists():
         cands = sorted(cache_dir.glob(f"{dataset}_*_max*h/manifest.json")) or sorted(cache_dir.glob("*/manifest.json"))
     if not cands:
@@ -658,6 +663,9 @@ def main():
     causal_voc = None
     voc_ckpt = find_vocoder_ckpt(root, args.profile, args.dataset, args.vocoder_ckpt)
     if voc_ckpt is not None:
+        is_legacy_a9 = (ckpt.get("arch_tag") == "a9") or ("_a9" in voc_ckpt.parent.name.lower() and "_a10" not in voc_ckpt.parent.name.lower())
+        n_harm = 24 if is_legacy_a9 else int(cfg.get("vocoder_n_harmonics", 48))
+        use_chirp = False if is_legacy_a9 else bool(cfg.get("vocoder_chirp", True))
         causal_voc = lib.CausalVocosLite(
             n_mels=int(cfg.get("n_mels", 100)),
             dim=int(cfg.get("vocoder_dim", 320)),
@@ -665,10 +673,12 @@ def main():
             hop_length=int(cfg.get("hop_length", 256)),
             lookahead=int(cfg.get("vocoder_lookahead", 4)),
             sample_rate=int(cfg.get("sample_rate", 24000)),
+            n_harmonics=n_harm,
+            use_chirp=use_chirp,
         ).to(device)
         causal_voc.load_state_dict(torch.load(voc_ckpt, map_location=device, weights_only=True), strict=True)
         causal_voc.eval()
-        print(f"[Load] 谐波源因果声码器: {voc_ckpt}")
+        print(f"[Load] 谐波源因果声码器: {voc_ckpt} (H={n_harm}, chirp={use_chirp})")
 
     pretrained_vocos = None
     try:

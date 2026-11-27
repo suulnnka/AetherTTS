@@ -61,11 +61,11 @@ LLM Token 流 ("帮我查一下明天的 Weather 怎么样？")
 > - 解码器内部通道数从 Kokoro 的 `1024 / 512` 裁剪到 `256 / 128`（~3.9M 参数）后，每秒音频计算量可压到 **~3.4 GFLOPs/s**（较原版 Kokoro 降 15×），在双核 Cortex-A76 上可轻松跑到 **RTF 0.04–0.08**。
 > - 小模型（~10M）几乎没有冗余通道，**权重 INT8 基本无损**，但不可强行压到 INT4（声码器底噪与机械感会显著恶化）。
 
-> **实现层修订（`a5→a9` 唯一主力 `E3` 定型与音质闭环升级，2026-11）**
+> **实现层修订（`a5→a10` 唯一主力 `E3` 定型与音质闭环升级，2026-11）**
 > - **唯一主力主干定型（`ChunkLookaheadBackbone`, `C=4, L=8, W=48`）**：锁定 `E3_chunk_attn_C4_L8` 为唯一默认路线；KV Cache 存储**未旋转 K** 并在固定 `[0 .. W+M)` 局部窗口施加相对 RoPE，流式与离线统一使用 `F.scaled_dot_product_attention`；训练期走层主序 `unfold + SDPA` 零循环全并行，全链路引入 `dropout=0.1` 根治小语料过拟合。
-> - **共享帧前瞻 `frame_pre` + 多尺度空洞韵律/帧解码器（`a9`）**：将 2 帧右前瞻 `CentralizedLookaheadBlock` 前移至 `f0_uv_predictor` / `energy_predictor` 之前（零额外延迟，消除音素边界阶跃断层）；韵律头升级为多尺度空洞因果深度可分离残差块（RF 33 帧 ≈ 352 ms + 2 帧前瞻）；`frame_decoder` 升级为 6 层空洞因果 ConvNeXt（`d=(1,2,4,1,2,4)`，RF 60 帧 ≈ 640 ms）+ 中层深监督（推理剥离零开销）+ 二阶频谱曲率结构损失，声学推理总参 `5.15M`。
-> - **连续相位谐波源-滤波器双分支 `CausalVocosLite`（`a9`，`6.35M`，端到端 `11.50M`）**：`dim=320`、`lookahead=4` 帧（42.7 ms 覆盖完整 1024 点 iSTFT 右半窗）、8 层多尺度空洞因果 ConvNeXt（RF 102 帧 ≈ 1.09 s）；2 层空洞基频头 + `float64` 梯形相位积分 + 24 阶切比雪夫带限声门脉冲 STFT 复数载波（满足精确 Hann² COLA 误差 `3.07e-06`、零 24 kHz 环形缓冲、严格梯度隔离）+ 清音/气声独立噪声分支；新增全 FP32 多分辨率瞬时频率 (Δₜφ) + 群延迟 (Δ_fφ) 相位一致性损失与 3 通道复数差分 `SpecDisc`；`extract_gta_mel` 强制以真声 `f0_gt/uv_gt/energy_gt` 导谱，仅在 Stage 2 末 25% 低学习率阶段温和微调，彻底消除 GTA 基频错配电音。
-> - **动态双档低延迟流式调度**：首包攒够 `max(6, voc_LA + 4) = 8` 帧（85 ms）即在首个文本块内立刻吐出首段 PCM（零额外 LLM 等待），稳态自动切回 `16` 帧（171 ms）高吞吐块；评测合成关闭 TF32 消除相位分叉（流式↔离线 RMS 误差 `~1.4e-5`）。详见 [`06_phase1_a8_forensics_and_a9_upgrade.md`](06_phase1_a8_forensics_and_a9_upgrade.md)。
+> - **共享帧前瞻 `frame_pre` + 训练期 2D Mel 判别器锐化（`a9→a10`）**：将 2 帧右前瞻 `CentralizedLookaheadBlock` 前移至 `f0_uv_predictor` / `energy_predictor` 之前（零额外延迟）；韵律头为多尺度空洞因果深度可分离残差块（RF 33 帧 ≈ 352 ms + 2 帧前瞻）；`frame_decoder` 为 6 层空洞因果 ConvNeXt（`d=(1,2,4,1,2,4)`，RF 60 帧 ≈ 640 ms）+ 中层深监督 + 1–12 kHz 频带加权二阶曲率结构损失；`a10` 新增**仅训练期挂载的双尺度 2D `MelPatchDiscriminator`（+ Feature Matching）**与后程 `frame_decoder` Dropout 退火，推理端仍保持 **`5.15M` 零额外参数/延迟**。
+> - **48 阶因果线性啁啾谐波源-滤波器 `CausalVocosLite`（`a10`，`6.35M`，端到端 `11.50M`）**：`dim=320`、`lookahead=4` 帧（42.7 ms 覆盖完整 1024 点 iSTFT 右半窗）、8 层多尺度空洞因果 ConvNeXt（RF 102 帧 ≈ 1.09 s）；2 层空洞基频头 + `float64` 梯形相位积分 + **因果后向斜率线性啁啾二次相位 + 48 阶平滑 500 Hz 奈奎斯特滚降切比雪夫载波**（覆盖至 `10.8 kHz`，四声陡降 OLA 一致性 `0.67 → 0.999`）+ 滤波相位 `p_h` 时域平滑与浊音 `0–1.5 kHz` 噪声入侵抑制正则 + 3 通道复数差分 `SpecDisc` + GT-F0 对齐末段 GTA 微调；配套 `v5` FFT-YIN CMNDF + NACF + 频谱高低频比真清浊音特征缓存。
+> - **动态双档低延迟流式调度 & `QUInt8 per-channel` 离群保护 INT8**：首包 `8` 帧（85 ms）即在首个文本块内出声，稳态切回 `16` 帧（171 ms）；三段式 ONNX 导出默认启用 `QUInt8` + `per_channel=True`（规避非 VNNI AVX2 `U8S8` 16-bit 饱和溢出）+ 敏感微层及声码器高离群 Post-GELU `pw2` 保护。详见 [`07_phase1_a9_forensics_and_a10_upgrade.md`](07_phase1_a9_forensics_and_a10_upgrade.md)。
 
 ---
 

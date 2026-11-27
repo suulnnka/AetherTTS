@@ -66,6 +66,7 @@ def find_acoustic_ckpt(root: Path, model_name: str, profile: str, dataset: str, 
     cands = []
     if runs_dir.exists():
         for pat in (
+            f"{model_name}_{dataset}_{profile}_a10*",
             f"{model_name}_{dataset}_{profile}_a9*",
             f"{model_name}_{dataset}_{profile}_*",
             f"{model_name}_{dataset}_*",
@@ -95,6 +96,7 @@ def find_vocoder_ckpt(root: Path, profile: str, dataset: str, explicit: str = ""
         return None
     cands = []
     for pat in (
+        f"causal_vocos_lite_{dataset}_{profile}_a10*",
         f"causal_vocos_lite_{dataset}_{profile}_a9*",
         f"causal_vocos_lite_{dataset}_{profile}_*",
         f"causal_vocos_lite_{dataset}_*",
@@ -151,6 +153,20 @@ def load_vocoder_model(voc_ckpt_path: Path, cfg: dict):
     lookahead = embed_k - kernel_size
     n_layers = sum(1 for k in sd if k.startswith("blocks.") and k.endswith(".norm.weight")) or 8
 
+    # 自动识别 a9 (24 阶常频) vs a10 (48 阶因果线性啁啾)，保证旧权重 100% 兼容导出
+    arch_hint = (raw.get("arch_tag") if isinstance(raw, dict) else None) or ""
+    dir_hint = voc_ckpt_path.parent.name.lower()
+    is_legacy_a9 = (arch_hint == "a9") or ("_a9" in dir_hint and "_a10" not in dir_hint)
+    if "vocoder_n_harmonics" in cfg and not is_legacy_a9:
+        n_harmonics = int(cfg["vocoder_n_harmonics"])
+        use_chirp = bool(cfg.get("vocoder_chirp", True))
+    elif is_legacy_a9:
+        n_harmonics = 24
+        use_chirp = False
+    else:
+        n_harmonics = int(cfg.get("vocoder_n_harmonics", 48))
+        use_chirp = bool(cfg.get("vocoder_chirp", True))
+
     voc = lib.CausalVocosLite(
         n_mels=n_mels,
         dim=dim,
@@ -160,6 +176,8 @@ def load_vocoder_model(voc_ckpt_path: Path, cfg: dict):
         hop_length=int(cfg.get("hop_length", 256)),
         lookahead=lookahead,
         sample_rate=int(cfg.get("sample_rate", 24000)),
+        n_harmonics=n_harmonics,
+        use_chirp=use_chirp,
     )
     voc.load_state_dict(sd, strict=True)
     return voc.float().eval()
@@ -452,7 +470,7 @@ def _harmonic_oscillate_onnx(
     phi_init: torch.Tensor = None,
     prev_f0: torch.Tensor = None,
 ):
-    """连续相位 24 阶切比雪夫 STFT 谐波激励源的纯实数 ONNX 等价实现（float64 梯形积分）。"""
+    """连续相位切比雪夫 STFT 谐波激励源的纯实数 ONNX 等价实现（a9 24 阶常频 / a10 48 阶因果线性啁啾，float64 梯形积分）。"""
     f0_in = log_f0_pred.float()
     uv_prob = torch.sigmoid(uv_logit.float())
     f0_hz = torch.exp(f0_in.clamp(min=math.log(55.0), max=math.log(620.0))).double()
@@ -462,7 +480,8 @@ def _harmonic_oscillate_onnx(
         first_prev = torch.where(prev_f0 > 0.0, prev_f0, f0_hz[:, :1])
     f0_prev_seq = torch.cat([first_prev, f0_hz[:, :-1]], dim=1)
 
-    delta_phi = 0.5 * (f0_prev_seq + f0_hz) * (float(harm.hop_length) / float(harm.sample_rate))
+    dt_hop = float(harm.hop_length) / float(harm.sample_rate)
+    delta_phi = 0.5 * (f0_prev_seq + f0_hz) * dt_hop
     csum = torch.cumsum(delta_phi, dim=1)
     if phi_init is not None:
         csum = phi_init + csum
@@ -471,7 +490,12 @@ def _harmonic_oscillate_onnx(
     new_phi = phi[:, -1:]
     new_prev = f0_hz[:, -1:]
 
-    phase_raw = phi.unsqueeze(-1) + f0_hz.unsqueeze(-1) * harm.time_offsets
+    use_chirp = bool(getattr(harm, "use_chirp", False))
+    if use_chirp:
+        f0_slope = ((f0_hz - f0_prev_seq) / dt_hop).clamp(min=-4000.0, max=4000.0)
+        phase_raw = phi.unsqueeze(-1) + f0_hz.unsqueeze(-1) * harm.time_offsets + f0_slope.unsqueeze(-1) * harm.time_offsets_sq
+    else:
+        phase_raw = phi.unsqueeze(-1) + f0_hz.unsqueeze(-1) * harm.time_offsets
     phase_grid = phase_raw - torch.floor(phase_raw)
     theta = (2.0 * math.pi * phase_grid).to(torch.float32)
     c1 = torch.cos(theta)
@@ -484,7 +508,10 @@ def _harmonic_oscillate_onnx(
         c_cur = c1 if h_ord == 1 else (2.0 * c1 * c_prev1 - c_prev2)
         if h_ord > 1:
             c_prev2, c_prev1 = c_prev1, c_cur
-        nyq_m = (f0_f32 * float(h_ord) < nyq_lim).to(torch.float32)
+        if use_chirp:
+            nyq_m = ((nyq_lim - f0_f32 * float(h_ord)) / 500.0).clamp(min=0.0, max=1.0)
+        else:
+            nyq_m = (f0_f32 * float(h_ord) < nyq_lim).to(torch.float32)
         s_time = s_time + (harm.harm_amps[h_ord - 1] * nyq_m) * c_cur
 
     harm_re, harm_im = fft.rfft(s_time * harm.hann_win)
@@ -876,26 +903,35 @@ def _export_onnx(
     print(f"  [Export] {out_path.name:20s} | opset={eff_opset} | {size_mb:6.2f} MB -> {out_path}")
 
 
-def quantize_onnx_int8(src_path: Path) -> Path:
+def quantize_onnx_int8(src_path: Path, int8_profile: str = "balanced") -> Path:
     import onnx
     from onnxruntime.quantization import QuantType, quantize_dynamic
 
     dst_path = src_path.with_name(src_path.stem + ".int8.onnx")
 
-    # 严格遵守 AetherTTS 精度策略：
-    # - 仅量化主干 Linear (MatMul) 权重；
-    # - 保护非权重 MatMul（Cooley-Tukey FFT 与 Attention Q@K/A@V）及敏感输出头
-    #   （声码器 pitch_out / iSTFT out，声学 mel_out / dur/f0/energy proj）维持 FP32/FP64。
+    # a10 精度保护策略（基于 a9 INT8 激活离群值与 AVX2 U8S8 饱和溢出实测审计）：
+    # - 强制启用 per_channel=True 权重逐通道量化 + weight_type=QuantType.QUInt8（U8U8）：
+    #   实测在无 AVX-512 VNNI 的主流 AVX2 CPU 上，QInt8(U8S8, reduce_range=False) 会触发 vpmaddubsw 16-bit 累加饱和溢出，
+    #   导致 vocoder_SNR 从 47.0 dB 暴跌至 25.6 dB、声学时长漂移；改用 QUInt8 后零溢出、零额外体积、全平台（x86/ARM64）安全；
+    # - 保护非权重 MatMul（Cooley-Tukey FFT 与 Attention Q@K/A@V）、敏感输出头（pitch_out / iSTFT out / mel_out / proj）
+    #   及极小但高敏感的条件嵌入层（harm_source.in_proj / f0_emb / uv_emb / energy_emb / frame_phase_proj，合计 <40 KB）；
+    # - balanced 档（默认）额外保护声码器 Post-GELU pw2 极端离群层（a9 实测 Crest 高达 39.7x、激活 SNR 跌至 27.1 dB），
+    #   彻底消除 INT8 导致的 UTMOS 掉分与颗粒电音；compact 档则仍量化 pw2 以换取最小磁盘体积。
     model_proto = onnx.load(str(src_path))
     inits = {t.name for t in model_proto.graph.initializer}
-    sensitive_tokens = ("pitch_out", "/out/", "mel_out", "/proj/", "/proj_1/")
+    sensitive_tokens = (
+        "pitch_out", "/out/", "mel_out", "/proj/", "/proj_1/",
+        "in_proj", "f0_emb", "uv_emb", "energy_emb", "frame_phase_proj",
+    )
+    is_vocoder_graph = "vocoder" in src_path.stem.lower()
     exclude = []
     for node in model_proto.graph.node:
         if node.op_type not in ("MatMul", "Gemm"):
             continue
         has_init = any(inp in inits for inp in node.input)
         is_sensitive = any(tok in node.name for tok in sensitive_tokens)
-        if (not has_init) or is_sensitive:
+        is_voc_outlier_pw2 = (int8_profile == "balanced") and is_vocoder_graph and ("/pw2" in node.name)
+        if (not has_init) or is_sensitive or is_voc_outlier_pw2:
             exclude.append(node.name)
 
     quantize_dynamic(
@@ -903,10 +939,11 @@ def quantize_onnx_int8(src_path: Path) -> Path:
         model_output=str(dst_path),
         op_types_to_quantize=["MatMul"],
         nodes_to_exclude=exclude,
-        weight_type=QuantType.QInt8,
+        per_channel=True,
+        weight_type=QuantType.QUInt8,
     )
     size_mb = dst_path.stat().st_size / (1024 * 1024)
-    print(f"  [INT8]   {dst_path.name:22s} | {size_mb:6.2f} MB (FP32 保护节点={len(exclude):2d}) -> {dst_path}")
+    print(f"  [INT8]   {dst_path.name:22s} | {size_mb:6.2f} MB (profile={int8_profile}, QUInt8 per_channel, FP32保护={len(exclude):2d}) -> {dst_path}")
     return dst_path
 
 
@@ -1036,6 +1073,34 @@ def verify_exports(
             assert len(wav_stream) == len(wav_pt), f"流式波形长度不一致: {len(wav_stream)} vs {len(wav_pt)}"
             assert rms_err < 2e-3, f"三段流式端到端波形 RMS 偏差过大: {rms_err}"
 
+        # 4) 若已生成 INT8 模型，额外输出 INT8 vs FP32 漂移审计（同 Mel 声码器 SNR + 流式声学 Mel MAE）
+        if (out_dir / "text_step.int8.onnx").exists() and (out_dir / "frame_step.int8.onnx").exists():
+            has_voc_q = has_voc_stream and (out_dir / "vocoder_step.int8.onnx").exists()
+            eng_q = AetherONNXStreamingEngine(out_dir, use_int8=True, use_vocoder=has_voc_q, num_threads=2)
+            wav_q, mel_q, st_q = eng_q.synthesize_ids(pids, lids, bids, speed=1.0)
+            ml_min = min(mel_stream.shape[-1], mel_q.shape[-1])
+            mel_q_mae = float(np.mean(np.abs(mel_stream[:, :, :ml_min] - mel_q[:, :, :ml_min])))
+            voc_snr_str = ""
+            if has_voc_q:
+                # 喂同一份 FP32 Mel 给 FP32/INT8 声码器以纯净测量声码器量化信噪比
+                vc = meta["streaming"]["vocoder"]
+                v_kl, v_la = vc["k_left"], vc["lookahead"]
+                mel_pad = np.concatenate([np.repeat(mel_mean, v_kl, axis=2), mel_stream, np.repeat(mel_mean, v_la, axis=2)], axis=2)
+                _, _, vst_fp = engine._init_states()
+                _, _, vst_q = eng_q._init_states()
+                tf_fp, _ = engine._run_vocoder_step(mel_pad, vst_fp)
+                tf_q, _ = eng_q._run_vocoder_step(mel_pad, vst_q)
+                sig_p = float(np.mean(tf_fp ** 2))
+                err_p = float(np.mean((tf_fp - tf_q) ** 2))
+                voc_snr = 10.0 * math.log10(sig_p / max(err_p, 1e-12))
+                voc_snr_str = f" | vocoder_SNR={voc_snr:.1f}dB"
+            print(
+                f"  [PASS] INT8 三段流式审计 | F={mel_stream.shape[-1]}/{mel_q.shape[-1]}, mel_MAE={mel_q_mae:.4f}{voc_snr_str} "
+                f"| TTFA={st_q['ttfa_ms']:.1f}ms, RTF={st_q['rtf']:.3f}"
+            )
+            if has_voc_q:
+                assert voc_snr >= 30.0, f"INT8 声码器信噪比过低 ({voc_snr:.1f} dB < 30.0 dB)，疑似发生量化溢出或离群失真"
+
     print("=" * 76)
     print("[Verify] 全部 ONNX 数值一致性校验通过！")
 
@@ -1053,12 +1118,18 @@ def main():
     ap.add_argument("--vocoder-ckpt", default="", help="手动指定声码器 checkpoint 路径 (final.pt / latest.pt)")
     ap.add_argument("--no-acoustic", action="store_true", help="跳过声学模型导出")
     ap.add_argument("--no-vocoder", action="store_true", help="跳过声码器导出")
-    ap.add_argument("--dummy", action="store_true", help="使用随机初始化的 a9 模型导出（用于无权重环境冒烟测试）")
+    ap.add_argument("--dummy", action="store_true", help="使用随机初始化的 a10 模型导出（用于无权重环境冒烟测试）")
     ap.add_argument("--mode", default="both", choices=["offline", "streaming", "both"], help="导出模式（默认 both）")
     ap.add_argument("--out-dir", default="./onnx_export", help="ONNX 输出目录")
     ap.add_argument("--opset", type=int, default=None, help="指定 ONNX opset（默认 legacy=17, dynamo=18）")
     ap.add_argument("--exporter", default="auto", choices=["auto", "legacy", "dynamo"], help="PyTorch ONNX 导出后端")
     ap.add_argument("--quantize-int8", action="store_true", help="额外生成权重 INT8 动态量化版本 (*.int8.onnx)")
+    ap.add_argument(
+        "--int8-profile",
+        default="balanced",
+        choices=["balanced", "compact"],
+        help="INT8 精度策略：balanced（默认，per-channel + 保护声码器高离群 Post-GELU pw2 层与敏感微层）；compact（最小体积，仍开启 per-channel 与敏感微层保护）",
+    )
     ap.add_argument("--skip-verify", action="store_true", help="跳过导出后的 ONNX Runtime 数值等价校验")
     args = ap.parse_args()
 
@@ -1075,7 +1146,7 @@ def main():
     vocab = list(lib.FRONTEND.vocab)
 
     if args.dummy:
-        print("[Load] --dummy 模式：初始化随机权重 AetherTTS a9 声学模型与 CausalVocosLite")
+        print("[Load] --dummy 模式：初始化随机权重 AetherTTS a10 声学模型与 CausalVocosLite (48h chirp)")
         if not args.no_acoustic:
             acoustic_model = lib.AetherAcousticModel(
                 vocab_size=len(vocab),
@@ -1097,6 +1168,8 @@ def main():
                 hop_length=cfg["hop_length"],
                 lookahead=cfg["vocoder_lookahead"],
                 sample_rate=cfg["sample_rate"],
+                n_harmonics=int(cfg.get("vocoder_n_harmonics", 48)),
+                use_chirp=bool(cfg.get("vocoder_chirp", True)),
             ).float().eval()
             vocoder_model.set_mel_stats(np.full(cfg["n_mels"], -4.5, dtype=np.float32), np.full(cfg["n_mels"], 2.2, dtype=np.float32))
         stats = {
@@ -1119,8 +1192,8 @@ def main():
             else:
                 vocoder_model = load_vocoder_model(voc_path, cfg)
                 print(
-                    f"[Load] 声码器权重: {voc_path} | dim={vocoder_model.dim}, lookahead={vocoder_model.lookahead} "
-                    f"| params={lib.count_params_m(vocoder_model):.2f}M"
+                    f"[Load] 声码器权重: {voc_path} | dim={vocoder_model.dim}, lookahead={vocoder_model.lookahead}, "
+                    f"H={vocoder_model.n_harmonics}, chirp={vocoder_model.use_chirp} | params={lib.count_params_m(vocoder_model):.2f}M"
                 )
 
     if acoustic_model is None and vocoder_model is None:
@@ -1371,9 +1444,9 @@ def main():
 
     # 可选动态 INT8 量化
     if args.quantize_int8:
-        print("\n[Stage] 生成权重动态 INT8 量化模型 (*.int8.onnx)...")
+        print(f"\n[Stage] 生成权重动态 INT8 量化模型 (*.int8.onnx, profile={args.int8_profile}, QUInt8 per_channel)...")
         for f in exported_files:
-            quantize_onnx_int8(f)
+            quantize_onnx_int8(f, int8_profile=args.int8_profile)
 
     # 数值等价校验
     if not args.skip_verify:
