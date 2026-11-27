@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AetherTTS 语音合成</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23161b26'/%3E%3Cg fill='%235b9dff'%3E%3Crect x='6' y='13' width='3' height='6' rx='1.5'/%3E%3Crect x='11' y='9' width='3' height='14' rx='1.5'/%3E%3Crect x='16' y='5' width='3' height='22' rx='1.5'/%3E%3Crect x='21' y='10' width='3' height='12' rx='1.5'/%3E%3Crect x='26' y='13' width='3' height='6' rx='1.5'/%3E%3C/g%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #0e1117; --panel: #161b26; --panel-2: #1c2230; --line: #27303f;
+    --text: #e9edf5; --muted: #8d97ab; --accent: #5b9dff; --accent-2: #8b5cf6;
+    --ok: #3ecf8e; --err: #ff6b6b; --warn: #f5b350;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; }
+  body {
+    background: radial-gradient(1100px 520px at 85% -10%, rgba(91, 157, 255, .16), transparent 60%), var(--bg);
+    color: var(--text);
+    font: 15px/1.65 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  }
+  .app { max-width: 780px; margin: 0 auto; padding: 40px 20px 72px; }
+  h1 {
+    display: inline-block; margin: 0; font-size: 30px; font-weight: 700; letter-spacing: .02em;
+    background: linear-gradient(92deg, var(--accent), var(--accent-2));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .sub { margin: 6px 0 22px; color: var(--muted); font-size: 13.5px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+    padding: 16px; box-shadow: 0 10px 30px rgba(0, 0, 0, .25);
+  }
+  textarea {
+    width: 100%; min-height: 132px; resize: vertical; display: block;
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 12px;
+    padding: 12px 14px; font: inherit; font-size: 16px; line-height: 1.7; outline: none;
+  }
+  textarea:focus { border-color: var(--accent); }
+  textarea::placeholder { color: var(--muted); opacity: .7; }
+  .bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+  .actions { display: inline-flex; gap: 10px; margin-left: auto; }
+  .speed { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13.5px; white-space: nowrap; }
+  .speed output { color: var(--text); min-width: 2.4em; font-variant-numeric: tabular-nums; }
+  .speed input { width: 90px; accent-color: var(--accent); }
+  .opt { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13.5px; white-space: nowrap; }
+  .opt[hidden] { display: none; }
+  .opt select {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 8px;
+    padding: 5px 8px; font: inherit; font-size: 13.5px; cursor: pointer;
+  }
+  .opt select:focus { outline: none; border-color: var(--accent); }
+  .count { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  button {
+    font: inherit; font-weight: 600; border-radius: 10px; padding: 8px 20px; cursor: pointer;
+    border: 1px solid transparent; transition: filter .15s, opacity .15s, border-color .15s;
+  }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  .primary { background: linear-gradient(92deg, var(--accent), var(--accent-2)); color: #fff; }
+  .primary:not(:disabled):hover { filter: brightness(1.12); }
+  .ghost { background: transparent; color: var(--text); border-color: var(--line); }
+  .ghost:not(:disabled):hover { border-color: var(--muted); }
+  .mini { padding: 3px 10px; font-size: 12.5px; font-weight: 500; }
+  .status { display: flex; align-items: center; gap: 10px; margin-top: 12px; min-height: 20px; font-size: 13.5px; }
+  .meter { display: inline-flex; align-items: flex-end; gap: 3px; height: 14px; width: 20px; flex: none; }
+  .meter i { width: 3px; height: 30%; border-radius: 2px; background: var(--muted); transition: height .1s; }
+  .meter.on i { background: var(--accent); animation: bounce .9s ease-in-out infinite; }
+  .meter.on i:nth-child(2) { animation-delay: .15s; }
+  .meter.on i:nth-child(3) { animation-delay: .3s; }
+  .meter.on i:nth-child(4) { animation-delay: .45s; }
+  @keyframes bounce { 0%, 100% { height: 30%; } 50% { height: 100%; } }
+  .s-idle { color: var(--muted); } .s-busy { color: var(--text); } .s-ok { color: var(--ok); }
+  .s-error { color: var(--err); } .s-warn { color: var(--warn); }
+  h2 {
+    display: flex; align-items: center; justify-content: space-between; margin: 26px 0 10px;
+    font-size: 14px; font-weight: 600; color: var(--muted);
+  }
+  #list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+  .item {
+    background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    border-radius: 12px; padding: 12px 14px; display: grid; grid-template-columns: 1fr auto;
+    gap: 6px 12px; align-items: center; animation: enter .25s ease;
+  }
+  @keyframes enter { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+  .h-text { grid-column: 1 / -1; white-space: pre-wrap; word-break: break-word; max-height: 3.4em; overflow: hidden; }
+  .item canvas { grid-column: 1 / -1; width: 100%; height: 38px; display: block; }
+  .h-meta { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  .h-actions { display: flex; gap: 8px; }
+  .empty { color: var(--muted); text-align: center; padding: 18px; border: 1px dashed var(--line); border-radius: 12px; font-size: 13.5px; }
+  @media (prefers-reduced-motion: reduce) { .meter.on i { animation: none; height: 100%; } .item { animation: none; } }
+</style>
+</head>
+<body>
+<main class="app">
+  <header>
+    <h1>AetherTTS</h1>
+    <p class="sub">输入文本并发送，服务器会边合成边推流，浏览器自动播放 · <span id="model-info">连接中…</span></p>
+  </header>
+
+  <section class="card">
+    <textarea id="text" rows="4" placeholder="输入要合成的文本（Enter 发送，Shift + Enter 换行）"></textarea>
+    <div class="bar">
+      <label class="opt" id="opt-backend" hidden>后端
+        <select id="backend"></select>
+      </label>
+      <label class="opt" id="opt-precision" hidden>精度
+        <select id="precision"></select>
+      </label>
+      <label class="speed">语速
+        <input id="speed" type="range" min="0.5" max="2" step="0.1" value="1">
+        <output id="speed-val">1.0</output>×
+      </label>
+      <span id="count" class="count">0 / 500</span>
+      <span class="actions">
+        <button id="stop" class="ghost" disabled>停止</button>
+        <button id="send" class="primary">发送</button>
+      </span>
+    </div>
+    <div class="status">
+      <span id="meter" class="meter" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+      <span id="status" class="s-idle" role="status" aria-live="polite">就绪</span>
+    </div>
+  </section>
+
+  <h2>合成记录 <button id="clear" class="ghost mini" hidden>清空</button></h2>
+  <ul id="list"><li class="empty">还没有合成记录</li></ul>
+</main>
+
+<script>
+(() => {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  const ui = {
+    text: $('text'), send: $('send'), stop: $('stop'), status: $('status'), meter: $('meter'),
+    speed: $('speed'), speedVal: $('speed-val'), count: $('count'), list: $('list'),
+    info: $('model-info'), clear: $('clear'),
+    optBackend: $('opt-backend'), optPrecision: $('opt-precision'), backend: $('backend'), precision: $('precision'),
+  };
+  const LEAD = 0.03;       // 排期提前量 (s)
+  const PREBUF = 0.10;     // 起播前先攒的音频量 (s)，吸收网络抖动
+  const HISTORY_MAX = 50;
+
+  let sampleRate = 24000, maxChars = 500;
+  let ctx = null;            // AudioContext：在「发送」的点击手势里创建并 resume，浏览器才允许自动播放
+  let timelineEnd = 0;       // 已排期音频的结束时刻（AudioContext 时间轴）
+  let queue = [];            // 待处理任务：发送后按顺序合成、播放
+  let active = null;         // 正在合成 / 播放的任务
+  const sources = new Set(); // 已排期的音频源，「停止」时统一 stop
+  const history = [];
+  let notice = { text: '就绪', type: 'idle' };
+  let lastLen = -1;
+  let options = null;         // /api/info 给出的可选后端与精度；null 表示当前服务不支持选择
+
+  // ---------- 状态显示 ----------
+  function setStatus(text, type) {
+    if (notice.text === text && notice.type === type) return;
+    notice = { text, type };
+    ui.status.textContent = text;
+    ui.status.className = 's-' + type;
+  }
+  function updateCount() {  // input 事件与 tick 都会调用：脚本直接改 value 时计数也能同步
+    const n = ui.text.value.length;
+    if (n === lastLen) return;
+    lastLen = n;
+    ui.count.textContent = `${n} / ${maxChars}`;
+  }
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // ---------- 音频 ----------
+  function ensureAudio() {
+    try {
+      if (!ctx) ctx = new AudioContext({ sampleRate });
+      if (ctx.state !== 'running') ctx.resume().catch(() => {});
+    } catch (e) {
+      setStatus(`当前浏览器不支持 Web Audio：${e.message}`, 'error');
+      return false;
+    }
+    return true;
+  }
+
+  function schedule(pcm) {  // 接在时间轴末尾排期一段音频，返回其结束时刻
+    const buf = ctx.createBuffer(1, pcm.length, sampleRate);
+    buf.copyToChannel(pcm, 0);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    timelineEnd = Math.max(ctx.currentTime + LEAD, timelineEnd);
+    src.start(timelineEnd);
+    timelineEnd += buf.duration;
+    sources.add(src);
+    src.onended = () => sources.delete(src);
+    return timelineEnd;
+  }
+
+  async function speak(job) {
+    job.phase = 'fetch';
+    const t0 = performance.now();
+    const resp = await fetch('/api/tts', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ text: job.text, speed: job.speed }, job.selection)), signal: job.ctrl.signal,
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => null);
+      throw new Error((err && err.error) || `服务器返回 HTTP ${resp.status}`);
+    }
+    job.ttfb = performance.now() - t0;
+
+    const reader = resp.body.getReader();
+    const parts = [];
+    let carry = new Uint8Array(0), pending = [], buffered = 0, received = 0;
+    const flush = () => {  // 起播：把攒下的块一次性排期
+      for (const p of pending) schedule(p);
+      pending = []; buffered = 0;
+      job.phase = 'play';
+    };
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const bytes = carry.length ? merge(carry, value) : value;
+      const n = bytes.length & ~1;          // s16le：按 2 字节对齐，奇数尾字节留到下一块
+      carry = bytes.subarray(n);
+      if (!n) continue;
+      const view = new DataView(bytes.buffer, bytes.byteOffset, n);
+      const pcm = new Float32Array(n / 2);
+      for (let i = 0; i < pcm.length; i++) pcm[i] = view.getInt16(i * 2, true) / 32768;
+      parts.push(pcm);
+      received += pcm.length;
+      job.received = received / sampleRate;
+      if (job.phase === 'fetch') {
+        pending.push(pcm);
+        buffered += pcm.length / sampleRate;
+        if (buffered >= PREBUF) flush();
+      } else {
+        schedule(pcm);
+      }
+    }
+    flush();
+    job.endAt = timelineEnd;
+    addHistory(job, parts.length === 1 ? parts[0] : mergeFloat(parts));
+    while (!job.cancelled && ctx.currentTime < job.endAt - 0.03) await sleep(40);
+  }
+
+  function merge(a, b) {
+    const out = new Uint8Array(a.length + b.length);
+    out.set(a); out.set(b, a.length);
+    return out;
+  }
+  function mergeFloat(list) {
+    let n = 0;
+    for (const p of list) n += p.length;
+    const out = new Float32Array(n);
+    let o = 0;
+    for (const p of list) { out.set(p, o); o += p.length; }
+    return out;
+  }
+
+  function pump() {
+    if (active || !queue.length) return;
+    const job = queue.shift();
+    active = job;
+    speak(job).then(
+      () => { if (!job.cancelled) setStatus(`播放完成 · ${job.received.toFixed(2)} s 音频 · 首包 ${job.ttfb.toFixed(0)} ms`, 'ok'); },
+      (e) => { if (!job.cancelled) setStatus(`出错：${e.name === 'AbortError' ? '请求被中断' : e.message}`, 'error'); },
+    ).finally(() => {
+      active = null;
+      ui.stop.disabled = !queue.length && sources.size === 0;
+      pump();
+    });
+  }
+
+  function stopAll() {
+    queue.length = 0;
+    if (active) { active.cancelled = true; active.ctrl.abort(); }
+    for (const s of sources) { try { s.stop(); } catch (_) { /* 尚未 start 的源不能 stop，忽略 */ } }
+    sources.clear();
+    if (ctx) timelineEnd = ctx.currentTime;
+    setStatus('已停止', 'idle');
+    ui.stop.disabled = true;
+  }
+
+  function send() {
+    const text = ui.text.value.trim();
+    if (!text) { setStatus('请先输入文本', 'error'); ui.text.focus(); return; }
+    if (!ensureAudio()) return;
+    const sel = selection();
+    queue.push({
+      text, speed: parseFloat(ui.speed.value), ctrl: new AbortController(), received: 0,
+      selection: sel && { backend: sel.backend, precision: sel.precision }, label: sel && sel.label,
+    });
+    ui.stop.disabled = false;
+    pump();
+  }
+
+  // ---------- 后端 / 精度选择（服务支持时才显示） ----------
+  function setupOptions(opts) {
+    options = opts;
+    ui.backend.replaceChildren(...opts.backends.map((b) => Object.assign(document.createElement('option'), { value: b.id, textContent: b.label })));
+    ui.backend.value = opts.default.backend;
+    ui.backend.addEventListener('change', () => syncPrecision());
+    syncPrecision(opts.default.precision);
+    ui.optBackend.hidden = opts.backends.length < 2;                      // 只有一种选择时不必显示
+    ui.optPrecision.hidden = !opts.backends.some((b) => b.precisions.length > 1);
+  }
+  function syncPrecision(selected) {
+    const cur = options.backends.find((b) => b.id === ui.backend.value);
+    const keep = selected || ui.precision.value;
+    ui.precision.replaceChildren(...cur.precisions.map((p) => Object.assign(document.createElement('option'), { value: p, textContent: p.toUpperCase() })));
+    ui.precision.value = cur.precisions.includes(keep) ? keep : cur.precisions[0];
+  }
+  function selection() {  // 当前下拉框选中的组合；服务不支持选择时返回 null
+    if (!options) return null;
+    const b = options.backends.find((x) => x.id === ui.backend.value);
+    return { backend: b.id, precision: ui.precision.value, label: `${ui.precision.value.toUpperCase()} · ${b.label}` };
+  }
+
+  function tick() {  // 忙碌期间的滚动状态 + 电平条 + 字数
+    updateCount();
+    const playing = ctx && timelineEnd > ctx.currentTime + 0.03;
+    ui.meter.classList.toggle('on', !!playing);
+    if (ctx && ctx.state !== 'running') {
+      setStatus('浏览器暂未放行自动播放，点击页面任意位置即可继续', 'warn');
+      return;
+    }
+    if (active && !active.cancelled) {
+      const q = queue.length ? ` · 排队 ${queue.length} 句` : '';
+      if (active.phase === 'fetch') {
+        setStatus(active.ttfb === undefined ? `合成中…${q}` : `合成中… 首包 ${active.ttfb.toFixed(0)} ms${q}`, 'busy');
+      } else {
+        setStatus(active.endAt === undefined ? `播放中… 已接收 ${active.received.toFixed(2)} s${q}` : `播放中… 共 ${active.received.toFixed(2)} s${q}`, 'busy');
+      }
+    } else if (queue.length) {
+      setStatus(`排队 ${queue.length} 句`, 'busy');
+    }
+  }
+
+  // ---------- 合成记录 ----------
+  let accent = '';
+  function drawWave(canvas, pcm) {
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.max(1, Math.round(canvas.clientWidth * dpr)), h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+    if (canvas.width !== w) canvas.width = w;
+    if (canvas.height !== h) canvas.height = h;
+    accent = accent || getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#5b9dff';
+    const g = canvas.getContext('2d');
+    g.clearRect(0, 0, w, h);
+    const step = pcm.length / w, mid = h / 2, amp = h / 2 - dpr;
+    g.fillStyle = accent;
+    for (let x = 0; x < w; x++) {
+      const s = Math.floor(x * step), e = Math.max(s + 1, Math.floor((x + 1) * step));
+      let lo = 1, hi = -1;
+      for (let i = s; i < e && i < pcm.length; i++) { const v = pcm[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+      const y0 = mid - Math.max(hi, 0) * amp, y1 = mid - Math.min(lo, 0) * amp;
+      g.fillRect(x, y0, 1, Math.max(1, y1 - y0));
+    }
+  }
+
+  function wavBlob(pcm) {
+    const buf = new ArrayBuffer(44 + pcm.length * 2), v = new DataView(buf);
+    const str = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    str(0, 'RIFF'); v.setUint32(4, 36 + pcm.length * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, sampleRate, true); v.setUint32(28, sampleRate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    str(36, 'data'); v.setUint32(40, pcm.length * 2, true);
+    for (let i = 0; i < pcm.length; i++) v.setInt16(44 + i * 2, Math.max(-32768, Math.min(32767, Math.round(pcm[i] * 32767))), true);
+    return new Blob([buf], { type: 'audio/wav' });
+  }
+
+  function addHistory(job, pcm) {
+    const item = { text: job.text, pcm, seconds: pcm.length / sampleRate, ttfb: job.ttfb, speed: job.speed, label: job.label };
+    history.push(item);
+    const placeholder = ui.list.querySelector('.empty');
+    if (placeholder) placeholder.remove();
+
+    const li = document.createElement('li');
+    li.className = 'item';
+    const text = document.createElement('div');
+    text.className = 'h-text';
+    text.textContent = item.text;
+    text.title = item.text;
+    const wave = document.createElement('canvas');
+    const meta = document.createElement('div');
+    meta.className = 'h-meta';
+    meta.textContent = `${item.seconds.toFixed(2)} s · 首包 ${item.ttfb.toFixed(0)} ms · 语速 ${item.speed.toFixed(1)}×${item.label ? ` · ${item.label}` : ''}`;
+    const actions = document.createElement('div');
+    actions.className = 'h-actions';
+    const replay = document.createElement('button');
+    replay.className = 'ghost mini';
+    replay.textContent = '重播';
+    replay.onclick = () => { if (ensureAudio()) schedule(item.pcm); };
+    const download = document.createElement('button');
+    download.className = 'ghost mini';
+    download.textContent = '下载';
+    download.onclick = () => {
+      const url = URL.createObjectURL(wavBlob(item.pcm));
+      const a = Object.assign(document.createElement('a'), { href: url, download: `aethertts_${String(history.length).padStart(2, '0')}.wav` });
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    };
+    actions.append(replay, download);
+    li.append(text, wave, meta, actions);
+    ui.list.prepend(li);
+    requestAnimationFrame(() => drawWave(wave, item.pcm));
+
+    while (history.length > HISTORY_MAX) { history.shift(); ui.list.lastElementChild.remove(); }
+    ui.clear.hidden = false;
+  }
+
+  // ---------- 事件 ----------
+  ui.send.onclick = send;
+  ui.stop.onclick = stopAll;
+  ui.text.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }  // 中文输入法选词回车不发送
+  });
+  ui.text.addEventListener('input', updateCount);
+  ui.speed.addEventListener('input', () => { ui.speedVal.textContent = Number(ui.speed.value).toFixed(1); });
+  ui.clear.onclick = () => {
+    history.length = 0;
+    ui.list.replaceChildren(Object.assign(document.createElement('li'), { className: 'empty', textContent: '还没有合成记录' }));
+    ui.clear.hidden = true;
+  };
+  document.addEventListener('pointerdown', () => {  // 浏览器拦截自动播放时，点一下页面即可恢复
+    if (ctx && ctx.state !== 'running') ctx.resume().catch(() => {});
+  }, true);
+  let resizeTimer = 0;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      ui.list.querySelectorAll('.item').forEach((li, i) => drawWave(li.querySelector('canvas'), history[history.length - 1 - i].pcm));
+    }, 150);
+  });
+  setInterval(tick, 80);
+
+  fetch('/api/info').then((r) => r.json()).then((info) => {
+    sampleRate = info.sample_rate;
+    maxChars = info.max_chars;
+    ui.text.maxLength = maxChars;
+    lastLen = -1;
+    updateCount();
+    if (info.speed_range) { ui.speed.min = info.speed_range[0]; ui.speed.max = info.speed_range[1]; }
+    if (info.options) setupOptions(info.options);
+    ui.info.textContent = [
+      info.arch_tag || 'AetherTTS', info.backend, info.device,
+      `${sampleRate / 1000} kHz`, `单次 ≤ ${maxChars} 字`,
+    ].filter(Boolean).join(' · ');
+  }).catch(() => {
+    ui.info.textContent = '未连接';
+    setStatus('连不上服务器，请确认 aethertts_server.py 已启动', 'error');
+  });
+  ui.text.focus();
+})();
+</script>
+</body>
+</html>

@@ -27,6 +27,8 @@ outputs/
 *.ckpt
 *.safetensors
 *.onnx
+# 仅随仓库分发 int8 流式 (三段式) ONNX, 供 scripts/aethertts_server_onnx.py 直接加载
+!onnx_export/*_step*.int8.onnx
 *.mnn
 *.ncnn.bin
 *.gguf
